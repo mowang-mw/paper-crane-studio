@@ -1,0 +1,105 @@
+{
+  "fixture_version": "script.v1",
+  "project": {
+    "project_id": "paper-crane-night-flight",
+    "title": "纸鹤的夜航",
+    "language": "zh-CN",
+    "target_duration_seconds": 28,
+    "aspect_ratio": "16:9"
+  },
+  "provider": {
+    "provider_id": "mock",
+    "implementation_id": "deterministic-ffmpeg-mock-v1",
+    "source_type": "DETERMINISTIC_FALLBACK"
+  },
+  "shots": [
+    {
+      "shot_id": "shot_01",
+      "sequence_no": 1,
+      "title": "雨夜窗边",
+      "visual_description": "夜色中的窗边，少女阿澄在桌前折出一只纸鹤。",
+      "subtitle_text": "停电的雨夜，阿澄折下最后一道纸痕。",
+      "subtitle_file": "subtitles/shot_01.txt",
+      "duration_seconds": 7,
+      "provider_id": "mock",
+      "source_type": "DETERMINISTIC_FALLBACK",
+      "generation_parameters": {
+        "seed": 4101,
+        "background_color": "0x0d1730",
+        "composition_template": "rainy_window",
+        "scene_label": "RAINY WINDOW",
+        "motion": "PUSH_IN",
+        "audio_frequency_hz": 261.63,
+        "width": 1280,
+        "height": 720,
+        "fps": 24
+      }
+    },
+    {
+      "shot_id": "shot_02",
+      "sequence_no": 2,
+      "title": "微光起飞",
+      "visual_description": "纸鹤发出微光，从打开的窗户飞入深蓝夜空。",
+      "subtitle_text": "一束微光，让纸做的翅膀醒了过来。",
+      "subtitle_file": "subtitles/shot_02.txt",
+      "duration_seconds": 7,
+      "provider_id": "mock",
+      "source_type": "DETERMINISTIC_FALLBACK",
+      "generation_parameters": {
+        "seed": 4102,
+        "background_color": "0x0b2840",
+        "composition_template": "glowing_flight",
+        "scene_label": "GLOWING FLIGHT",
+        "motion": "PULL_OUT",
+        "audio_frequency_hz": 329.63,
+        "width": 1280,
+        "height": 720,
+        "fps": 24
+      }
+    },
+    {
+      "shot_id": "shot_03",
+      "sequence_no": 3,
+      "title": "越过灯火",
+      "visual_description": "纸鹤穿过屋顶、灯火和低垂云层，向夜色深处前行。",
+      "subtitle_text": "它越过沉睡的屋顶，寻找夜色尽头的礼物。",
+      "subtitle_file": "subtitles/shot_03.txt",
+      "duration_seconds": 7,
+      "provider_id": "mock",
+      "source_type": "DETERMINISTIC_FALLBACK",
+      "generation_parameters": {
+        "seed": 4103,
+        "background_color": "0x17173d",
+        "composition_template": "rooftop_clouds",
+        "scene_label": "ROOFTOPS AND CLOUDS",
+        "motion": "PAN_RIGHT",
+        "audio_frequency_hz": 392.0,
+        "width": 1280,
+        "height": 720,
+        "fps": 24
+      }
+    },
+    {
+      "shot_id": "shot_04",
+      "sequence_no": 4,
+      "title": "黎明远航",
+      "visual_description": "黎明染亮远方，纸鹤飞向晨光，阿澄在窗边安静注视。",
+      "subtitle_text": "天亮以前，一片银杏把远方带回了窗边。",
+      "subtitle_file": "subtitles/shot_04.txt",
+      "duration_seconds": 7,
+      "provider_id": "mock",
+      "source_type": "DETERMINISTIC_FALLBACK",
+      "generation_parameters": {
+        "seed": 4104,
+        "background_color": "0x75435f",
+        "composition_template": "dawn_horizon",
+        "scene_label": "DAWN HORIZON",
+        "motion": "PUSH_IN_FADE",
+        "audio_frequency_hz": 523.25,
+        "width": 1280,
+        "height": 720,
+        "fps": 24
+      }
+    }
+  ]
+}

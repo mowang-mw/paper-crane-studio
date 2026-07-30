@@ -23,7 +23,7 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 
 ## 当前阶段
 
-当前为需求分析、技术调研、架构设计和开发计划阶段。仓库中尚无前后端业务工程、依赖安装、模型权重或 Docker 容器；本文档中的真实模型均是候选方案，不代表已经安装、接通或在本机验证。
+**M0 + M1 已完成并实测通过。** 仓库现已包含最小可复用 Python 媒体模块、固定 fixture、生成脚本和验证脚本；可在无网络、无 API Key、无模型权重的条件下生成《纸鹤的夜航》Mock 短片。当前仍未创建 React、FastAPI、数据库或完整后台任务系统，也未接入任何真实模型。
 
 调研基线日期为 ****。模型许可、远程 API 型号、价格、额度和地区可用性会变化，在实际接入或公开展示前必须再次核实。
 
@@ -39,6 +39,41 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 | FFmpeg | Conda 环境内 8.0 | 本轮只读预检确认 libx264/libopenh264/h264_nvenc、AAC、drawtext、zoompan、concat、xfade；未发现 subtitles/ass（构建未启用 libass）。基础 PATH 不可见，须激活 `anime-platform` 或配置已验证绝对路径 |
 | 可用模型服务 | 当前无独立文本、图像、视频或语音 API | 全 Mock 离线链路是无条件基线 |
 
+
+## M1 本地运行
+
+在 PowerShell 中进入项目目录并激活既有环境：
+
+```powershell
+conda activate anime-platform
+python --version
+where.exe ffmpeg
+where.exe ffprobe
+```
+
+运行 M0、生成 M1 和验证 M1：
+
+```powershell
+python scripts\media_smoke_test.py
+python scripts\generate_m1_short.py
+python scripts\verify_m1_output.py
+```
+
+若当前终端没有加载 Conda 激活脚本，可使用不修改全局 PATH 的等价命令：
+
+```powershell
+conda run -n anime-platform python scripts\media_smoke_test.py
+conda run -n anime-platform python scripts\generate_m1_short.py
+conda run -n anime-platform python scripts\verify_m1_output.py
+```
+
+主要输出位于：
+
+- `data/generated/m0/smoke_test.mp4`
+- `data/generated/m1/paper_crane_night_flight.mp4`
+- `data/generated/m1/manifest.json`
+
+`data/` 已由 `.gitignore` 忽略。当前画面是确定性的几何 Mock 构图，音频是标准库生成的 Mock 提示音，镜头运动、H.264/AAC 编码、拼接和中文字幕烧录由 FFmpeg 完成；它们均不代表真实图像、视频或 TTS 模型能力。
 
 ## 当前范围内的 MVP 概述
 
