@@ -6,11 +6,12 @@ import json
 import math
 import os
 import platform
+import re
 import struct
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .ffmpeg import (
     MediaToolError,
@@ -220,8 +221,15 @@ def _composition_filters(template: str) -> list[str]:
         raise MediaToolError(f"未知 Mock 构图模板：{template}") from exc
 
 
-def _motion_filter(motion: str, frame_count: int) -> str:
-    common = f"d=1:s={WIDTH}x{HEIGHT}:fps={FPS}"
+def _motion_filter(
+    motion: str,
+    frame_count: int,
+    *,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+) -> str:
+    common = f"d=1:s={width}x{height}:fps={fps}"
     if motion == "PUSH_IN":
         return (
             "zoompan=z='min(1.06,1+on*0.00036)':"
@@ -251,20 +259,30 @@ def _create_shot(
     *,
     tools: MediaTools,
     font: Path,
-    fixture_root: Path,
+    subtitle_path: Path,
     shot: dict[str, Any],
     output_path: Path,
     command_log: list[str],
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
 ) -> dict[str, Any]:
     duration = float(shot["duration_seconds"])
     parameters = shot["generation_parameters"]
-    frame_count = int(round(duration * FPS))
-    subtitle_path = fixture_root / str(shot["subtitle_file"])
+    frame_count = int(round(duration * fps))
     audio_path = output_path.with_suffix(".wav")
     generate_mock_wav(audio_path, duration, float(parameters["audio_frequency_hz"]))
 
     filters = _composition_filters(str(parameters["composition_template"]))
-    filters.append(_motion_filter(str(parameters["motion"]), frame_count))
+    filters.append(
+        _motion_filter(
+            str(parameters["motion"]),
+            frame_count,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+    )
     filters.append(_label_filter(font, f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}", 30, 30))
     filters.append(_label_filter(font, "MOCK VISUAL / FFMPEG MOTION", 84, 20))
     filters.append(_subtitle_filter(font, subtitle_path))
@@ -275,7 +293,7 @@ def _create_shot(
     temporary = _atomic_media_target(output_path)
     source = (
         f"color=c={parameters['background_color']}:"
-        f"s={CANVAS_WIDTH}x{CANVAS_HEIGHT}:r={FPS}:d={duration:.3f}"
+        f"s={width + 64}x{height + 36}:r={fps}:d={duration:.3f}"
     )
     run_command(
         [
@@ -301,7 +319,7 @@ def _create_shot(
             "-t",
             f"{duration:.3f}",
             "-r",
-            str(FPS),
+            str(fps),
             "-c:v",
             "libx264",
             "-preset",
@@ -359,6 +377,304 @@ def _write_srt(shots: list[dict[str, Any]], target: Path) -> None:
         )
         start = end
     target.write_text("\n".join(lines), encoding="utf-8")
+
+
+_DEFAULT_SHOT_PARAMETERS: tuple[dict[str, Any], ...] = (
+    {
+        "seed": 4101,
+        "background_color": "0x0d1730",
+        "composition_template": "rainy_window",
+        "scene_label": "RAINY WINDOW",
+        "motion": "PUSH_IN",
+        "audio_frequency_hz": 261.63,
+    },
+    {
+        "seed": 4102,
+        "background_color": "0x0b2840",
+        "composition_template": "glowing_flight",
+        "scene_label": "GLOWING FLIGHT",
+        "motion": "PULL_OUT",
+        "audio_frequency_hz": 329.63,
+    },
+    {
+        "seed": 4103,
+        "background_color": "0x17173d",
+        "composition_template": "rooftop_clouds",
+        "scene_label": "ROOFTOPS AND CLOUDS",
+        "motion": "PAN_RIGHT",
+        "audio_frequency_hz": 392.0,
+    },
+    {
+        "seed": 4104,
+        "background_color": "0x75435f",
+        "composition_template": "dawn_horizon",
+        "scene_label": "DAWN HORIZON",
+        "motion": "PUSH_IN_FADE",
+        "audio_frequency_hz": 523.25,
+    },
+)
+
+
+def _safe_file_stem(value: str, fallback: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
+    return stem or fallback
+
+
+def _normalize_project_shots(
+    shots: list[dict[str, Any]],
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    provider_id: str,
+) -> list[dict[str, Any]]:
+    if len(shots) != 4:
+        raise MediaToolError(f"M2 Mock 短片必须包含 4 个镜头，实际 {len(shots)}")
+    if width < 320 or height < 180 or fps < 1:
+        raise MediaToolError("媒体参数无效：分辨率至少 320x180，帧率至少 1 fps")
+
+    normalized: list[dict[str, Any]] = []
+    for index, original in enumerate(shots, start=1):
+        required = {"shot_id", "title", "visual_description", "duration_seconds"}
+        missing = sorted(required - set(original))
+        if missing:
+            raise MediaToolError(f"第 {index} 个镜头缺少字段：{missing}")
+        sequence_no = int(original.get("sequence_no", original.get("shot_index", index)))
+        if sequence_no != index:
+            raise MediaToolError(
+                f"镜头顺序必须连续且从 1 开始；第 {index} 项为 {sequence_no}"
+            )
+        duration = float(original["duration_seconds"])
+        if duration <= 0:
+            raise MediaToolError(f"镜头 {original['shot_id']} 时长必须大于 0")
+        subtitle_text = str(
+            original.get("subtitle_text", original.get("narration", ""))
+        ).strip()
+        if not subtitle_text:
+            raise MediaToolError(f"镜头 {original['shot_id']} 缺少字幕或旁白")
+
+        parameters = dict(_DEFAULT_SHOT_PARAMETERS[index - 1])
+        supplied_parameters = original.get("generation_parameters", {})
+        if not isinstance(supplied_parameters, dict):
+            raise MediaToolError(f"镜头 {original['shot_id']} 的生成参数必须是对象")
+        parameters.update(supplied_parameters)
+        parameters.update({"width": width, "height": height, "fps": fps})
+        normalized.append(
+            {
+                **original,
+                "sequence_no": sequence_no,
+                "subtitle_text": subtitle_text,
+                "duration_seconds": duration,
+                "provider_id": str(original.get("provider_id", provider_id)),
+                "source_type": str(
+                    original.get("source_type", "DETERMINISTIC_FALLBACK")
+                ),
+                "generation_parameters": parameters,
+            }
+        )
+
+    total_duration = sum(float(shot["duration_seconds"]) for shot in normalized)
+    if not 20.0 <= total_duration <= 40.0:
+        raise MediaToolError(
+            f"M2 短片计划总时长必须在 20—40 秒内，实际 {total_duration:.3f} 秒"
+        )
+    return normalized
+
+
+def render_mock_project_short(
+    *,
+    root: Path,
+    project_id: str,
+    project_title: str,
+    shots: list[dict[str, Any]],
+    output_dir: Path,
+    output_filename: str | None = None,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+    font_path: Path | None = None,
+    provider_id: str = "mock",
+    generation_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """用 M1 的同一 FFmpeg 链路渲染一个隔离的项目导出。
+
+    调用方应为每个 GenerationJob 提供独立 output_dir。函数只写该目录下的
+    派生文件，使用临时文件完成最终 MP4 和 manifest 的原子替换。
+    """
+
+    root = root.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shot_dir = output_dir / "shots"
+    subtitle_dir = output_dir / "subtitles"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_shots = _normalize_project_shots(
+        shots,
+        width=width,
+        height=height,
+        fps=fps,
+        provider_id=provider_id,
+    )
+    tools = resolve_media_tools()
+    font = (font_path or find_chinese_font()).resolve()
+    if not font.is_file():
+        raise MediaToolError(f"配置的中文字体不存在：{font}")
+
+    requested_name = output_filename or f"{_safe_file_stem(project_id, 'mock_export')}.mp4"
+    if Path(requested_name).name != requested_name or Path(requested_name).suffix.lower() != ".mp4":
+        raise MediaToolError("output_filename 必须是当前目录下的 .mp4 文件名")
+
+    command_log: list[str] = []
+    shot_outputs: list[dict[str, Any]] = []
+    for index, shot in enumerate(normalized_shots, start=1):
+        shot_stem = _safe_file_stem(str(shot["shot_id"]), f"shot_{index:02d}")
+        subtitle_path = subtitle_dir / f"{shot_stem}.txt"
+        subtitle_path.write_text(str(shot["subtitle_text"]).strip() + "\n", encoding="utf-8")
+        generated = _create_shot(
+            tools=tools,
+            font=font,
+            subtitle_path=subtitle_path,
+            shot=shot,
+            output_path=shot_dir / f"{shot_stem}.mp4",
+            command_log=command_log,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        generated["subtitle_path"] = subtitle_path
+        shot_outputs.append(generated)
+        if progress_callback:
+            progress_callback(10 + index * 15)
+
+    concat_path = output_dir / "shots.ffconcat"
+    concat_lines = ["ffconcat version 1.0"]
+    for generated in shot_outputs:
+        path_text = generated["video_path"].resolve().as_posix().replace("'", r"'\''")
+        concat_lines.append(f"file '{path_text}'")
+    concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+    output_path = output_dir / requested_name
+    temporary = _atomic_media_target(output_path)
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            temporary,
+        ],
+        timeout_seconds=180,
+        command_log=command_log,
+    )
+    planned_duration = sum(
+        float(shot["duration_seconds"]) for shot in normalized_shots
+    )
+    validation = verify_media(
+        tools,
+        temporary,
+        min_duration=max(20.0, planned_duration - 0.50),
+        max_duration=min(40.0, planned_duration + 0.50),
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    if progress_callback:
+        progress_callback(90)
+
+    subtitle_sidecar = output_dir / "subtitles.srt"
+    _write_srt(normalized_shots, subtitle_sidecar)
+    digest = sha256_file(output_path)
+    shot_manifest: list[dict[str, Any]] = []
+    for shot, generated in zip(normalized_shots, shot_outputs, strict=True):
+        shot_manifest.append(
+            {
+                "shot_id": shot["shot_id"],
+                "sequence_no": shot["sequence_no"],
+                "title": shot["title"],
+                "visual_description": shot["visual_description"],
+                "duration_seconds": shot["duration_seconds"],
+                "subtitle": shot["subtitle_text"],
+                "provider_id": shot["provider_id"],
+                "source_type": shot["source_type"],
+                "generation_parameters": shot["generation_parameters"],
+                "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
+                "clip_path": _repo_relative(root, generated["video_path"]),
+                "audio_path": _repo_relative(root, generated["audio_path"]),
+                "audio_sha256": sha256_file(generated["audio_path"]),
+                "clip_sha256": generated["sha256"],
+                "clip_validation": generated["validation"],
+            }
+        )
+
+    manifest = {
+        "manifest_version": "m2.mock-export.v1",
+        "project": {"id": project_id, "title": project_title},
+        "generation_context": generation_context or {},
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
+        "media_spec": {
+            "resolution": f"{width}x{height}",
+            "frame_rate": fps,
+            "planned_duration_seconds": planned_duration,
+            "actual_duration_seconds": validation["duration_seconds"],
+        },
+        "pipeline": {
+            "provider_id": provider_id,
+            "source_type": "DETERMINISTIC_FALLBACK",
+            "visual_method": "FFmpeg color/drawbox/drawtext/zoompan/fade filters",
+            "audio_method": "Python standard-library deterministic PCM WAV -> FFmpeg AAC",
+            "subtitle_method": "FFmpeg drawtext + independent UTF-8 textfile",
+            "chinese_font_path": str(font),
+            "network_required": False,
+            "api_key_required": False,
+            "model_weights_required": False,
+        },
+        "shot_count": len(shot_manifest),
+        "shots": shot_manifest,
+        "output": {
+            "file_path": _repo_relative(root, output_path),
+            "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
+            "file_size_bytes": output_path.stat().st_size,
+            "sha256": digest,
+        },
+        "ffprobe_validation": validation,
+        "safe_command_log": command_log,
+    }
+    manifest_path = output_dir / "manifest.json"
+    _atomic_json(manifest_path, manifest)
+    if progress_callback:
+        progress_callback(95)
+    return {
+        "status": "PASS",
+        "output_path": str(output_path),
+        "manifest_path": str(manifest_path),
+        "subtitle_path": str(subtitle_sidecar),
+        "font_path": str(font),
+        "sha256": digest,
+        "validation": validation,
+        "shots": shot_outputs,
+        "manifest": manifest,
+    }
 
 
 def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, Any]:
@@ -456,83 +772,30 @@ def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, A
 def generate_m1_short(root: Path, output_dir: Path | None = None) -> dict[str, Any]:
     root = root.resolve()
     output_dir = (output_dir or root / "data" / "generated" / "m1").resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    shot_dir = output_dir / "shots"
-    shot_dir.mkdir(parents=True, exist_ok=True)
-
     fixture_path = root / "fixtures" / "paper-crane" / "script.v1.json"
     fixture = load_script_fixture(fixture_path)
-    fixture_root = fixture_path.parent
-    tools = resolve_media_tools()
-    font = find_chinese_font()
-    command_log: list[str] = []
-    shot_outputs: list[dict[str, Any]] = []
-
-    for shot in fixture["shots"]:
-        output_path = shot_dir / f"{shot['shot_id']}.mp4"
-        generated = _create_shot(
-            tools=tools,
-            font=font,
-            fixture_root=fixture_root,
-            shot=shot,
-            output_path=output_path,
-            command_log=command_log,
-        )
-        shot_outputs.append(generated)
-
-    concat_path = output_dir / "shots.ffconcat"
-    concat_lines = ["ffconcat version 1.0"]
-    for generated in shot_outputs:
-        path_text = generated["video_path"].resolve().as_posix().replace("'", r"'\''")
-        concat_lines.append(f"file '{path_text}'")
-    concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
-
-    output_path = output_dir / "paper_crane_night_flight.mp4"
-    temporary = _atomic_media_target(output_path)
-    run_command(
-        [
-            tools.ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_path,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            temporary,
-        ],
-        timeout_seconds=180,
-        command_log=command_log,
+    rendered = render_mock_project_short(
+        root=root,
+        project_id=str(fixture["project"]["project_id"]),
+        project_title=str(fixture["project"]["title"]),
+        shots=fixture["shots"],
+        output_dir=output_dir,
+        output_filename="paper_crane_night_flight.mp4",
     )
-    validation = verify_media(
-        tools,
-        temporary,
-        min_duration=20.0,
-        max_duration=40.0,
-        command_log=command_log,
-    )
+    output_path = Path(rendered["output_path"])
+    validation = rendered["validation"]
     if abs(float(validation["duration_seconds"]) - 28.0) > 0.50:
         raise MediaToolError(
             "M1 总时长偏离计划超过 0.5 秒："
             f"实际 {validation['duration_seconds']} 秒"
         )
-    os.replace(temporary, output_path)
-
-    subtitle_sidecar = output_dir / "subtitles.srt"
-    _write_srt(fixture["shots"], subtitle_sidecar)
-    digest = sha256_file(output_path)
-    versions = runtime_summary(tools)
+    subtitle_sidecar = Path(rendered["subtitle_path"])
+    digest = str(rendered["sha256"])
+    versions = dict(rendered["manifest"]["runtime"])
+    versions.pop("operating_system", None)
+    font = Path(rendered["font_path"])
+    command_log = list(rendered["manifest"]["safe_command_log"])
+    shot_outputs = rendered["shots"]
     shot_manifest: list[dict[str, Any]] = []
     for shot, generated in zip(fixture["shots"], shot_outputs, strict=True):
         shot_manifest.append(
