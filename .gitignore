@@ -13,6 +13,7 @@ coverage.xml
 
 # Python 环境和构建产物
 .venv/
+/.venv-comfyui/
 venv/
 env/
 .conda/
@@ -67,6 +68,7 @@ credentials*.json
 # 模型权重、检查点和推理缓存
 /models/
 /models/text/
+/tools/ComfyUI/
 /tools/llama.cpp/
 /checkpoints/
 /model-cache/
