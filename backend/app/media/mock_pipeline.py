@@ -7,6 +7,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import struct
 import wave
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from typing import Any, Callable
 from .ffmpeg import (
     MediaToolError,
     MediaTools,
+    decode_media_fully,
     ffmpeg_filter_path,
     find_chinese_font,
     resolve_media_tools,
@@ -24,6 +26,7 @@ from .ffmpeg import (
     sha256_file,
     verify_media,
 )
+from .subtitles import BurnedSubtitle, prepare_burned_subtitle
 
 
 WIDTH = 1280
@@ -147,17 +150,6 @@ def load_script_fixture(fixture_path: Path) -> dict[str, Any]:
     return payload
 
 
-def _subtitle_filter(font: Path, text_file: Path) -> str:
-    return (
-        "drawtext="
-        f"fontfile={ffmpeg_filter_path(font)}:"
-        f"textfile={ffmpeg_filter_path(text_file)}:"
-        "fontcolor=white:fontsize=38:line_spacing=10:"
-        "x=(w-text_w)/2:y=h-text_h-58:"
-        "box=1:boxcolor=black@0.58:boxborderw=16"
-    )
-
-
 def _label_filter(font: Path, text: str, y: int, fontsize: int = 30) -> str:
     safe_text = text.replace("\\", r"\\").replace("'", r"\'").replace(":", r"\:")
     return (
@@ -259,7 +251,7 @@ def _create_shot(
     *,
     tools: MediaTools,
     font: Path,
-    subtitle_path: Path,
+    subtitle: BurnedSubtitle,
     shot: dict[str, Any],
     output_path: Path,
     command_log: list[str],
@@ -283,9 +275,16 @@ def _create_shot(
             fps=fps,
         )
     )
-    filters.append(_label_filter(font, f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}", 30, 30))
+    filters.append(
+        _label_filter(
+            font,
+            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
+            30,
+            30,
+        )
+    )
     filters.append(_label_filter(font, "MOCK VISUAL / FFMPEG MOTION", 84, 20))
-    filters.append(_subtitle_filter(font, subtitle_path))
+    filters.append(subtitle.filter_expression)
     fade_out_start = max(0.0, duration - 0.35)
     filters.append(f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.3f}:d=0.35")
     filters.append("format=yuv420p")
@@ -349,6 +348,9 @@ def _create_shot(
         temporary,
         min_duration=duration - 0.20,
         max_duration=duration + 0.20,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
         command_log=command_log,
     )
     os.replace(temporary, output_path)
@@ -357,6 +359,12 @@ def _create_shot(
         "audio_path": audio_path,
         "validation": validation,
         "sha256": sha256_file(output_path),
+        "narration": subtitle.narration,
+        "rendered_subtitle_text": subtitle.rendered_text,
+        "subtitle_path": subtitle.text_path,
+        "subtitle_filter": subtitle.filter_expression,
+        "subtitle_font_path": subtitle.font_path,
+        "subtitle_rendering": "burned_in",
     }
 
 
@@ -376,7 +384,7 @@ def _write_srt(shots: list[dict[str, Any]], target: Path) -> None:
             [str(index), f"{stamp(start)} --> {stamp(end)}", shot["subtitle_text"], ""]
         )
         start = end
-    target.write_text("\n".join(lines), encoding="utf-8")
+    target.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
 _DEFAULT_SHOT_PARAMETERS: tuple[dict[str, Any], ...] = (
@@ -412,6 +420,14 @@ _DEFAULT_SHOT_PARAMETERS: tuple[dict[str, Any], ...] = (
         "motion": "PUSH_IN_FADE",
         "audio_frequency_hz": 523.25,
     },
+    {
+        "seed": 4105,
+        "background_color": "0x31506b",
+        "composition_template": "dawn_horizon",
+        "scene_label": "STORY EPILOGUE",
+        "motion": "PULL_OUT",
+        "audio_frequency_hz": 659.25,
+    },
 )
 
 
@@ -428,8 +444,8 @@ def _normalize_project_shots(
     fps: int,
     provider_id: str,
 ) -> list[dict[str, Any]]:
-    if len(shots) != 4:
-        raise MediaToolError(f"M2 Mock 短片必须包含 4 个镜头，实际 {len(shots)}")
+    if not 3 <= len(shots) <= 5:
+        raise MediaToolError(f"Mock 短片必须包含 3—5 个镜头，实际 {len(shots)}")
     if width < 320 or height < 180 or fps < 1:
         raise MediaToolError("媒体参数无效：分辨率至少 320x180，帧率至少 1 fps")
 
@@ -531,12 +547,17 @@ def render_mock_project_short(
     shot_outputs: list[dict[str, Any]] = []
     for index, shot in enumerate(normalized_shots, start=1):
         shot_stem = _safe_file_stem(str(shot["shot_id"]), f"shot_{index:02d}")
-        subtitle_path = subtitle_dir / f"{shot_stem}.txt"
-        subtitle_path.write_text(str(shot["subtitle_text"]).strip() + "\n", encoding="utf-8")
+        subtitle = prepare_burned_subtitle(
+            narration=str(shot["subtitle_text"]),
+            text_path=subtitle_dir / f"{shot_stem}.txt",
+            width=width,
+            height=height,
+            font_path=font,
+        )
         generated = _create_shot(
             tools=tools,
             font=font,
-            subtitle_path=subtitle_path,
+            subtitle=subtitle,
             shot=shot,
             output_path=shot_dir / f"{shot_stem}.mp4",
             command_log=command_log,
@@ -544,7 +565,6 @@ def render_mock_project_short(
             height=height,
             fps=fps,
         )
-        generated["subtitle_path"] = subtitle_path
         shot_outputs.append(generated)
         if progress_callback:
             progress_callback(10 + index * 15)
@@ -590,8 +610,7 @@ def render_mock_project_short(
     validation = verify_media(
         tools,
         temporary,
-        min_duration=max(20.0, planned_duration - 0.50),
-        max_duration=min(40.0, planned_duration + 0.50),
+        planned_duration_seconds=planned_duration,
         expected_width=width,
         expected_height=height,
         expected_fps=float(fps),
@@ -614,10 +633,17 @@ def render_mock_project_short(
                 "visual_description": shot["visual_description"],
                 "duration_seconds": shot["duration_seconds"],
                 "subtitle": shot["subtitle_text"],
+                "narration": shot["subtitle_text"],
                 "provider_id": shot["provider_id"],
+                "script_provider_id": shot.get("script_provider_id", provider_id),
                 "source_type": shot["source_type"],
                 "generation_parameters": shot["generation_parameters"],
                 "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
+                "subtitle_text_path": _repo_relative(root, generated["subtitle_path"]),
+                "rendered_subtitle_text": generated["rendered_subtitle_text"],
+                "font_path": str(generated["subtitle_font_path"]),
+                "subtitle_rendering": generated["subtitle_rendering"],
+                "subtitle_filter": generated["subtitle_filter"],
                 "clip_path": _repo_relative(root, generated["video_path"]),
                 "audio_path": _repo_relative(root, generated["audio_path"]),
                 "audio_sha256": sha256_file(generated["audio_path"]),
@@ -626,24 +652,56 @@ def render_mock_project_short(
             }
         )
 
+    context = generation_context or {}
+    provider_trace = context.get("providers", {})
+    if not isinstance(provider_trace, dict):
+        provider_trace = {}
+    script_provider = str(provider_trace.get("script_provider", provider_id))
+    image_provider = str(provider_trace.get("image_provider", "mock"))
+    audio_provider = str(provider_trace.get("audio_provider", "mock"))
+    video_source_type = str(
+        provider_trace.get("video_source_type", "DETERMINISTIC_FALLBACK")
+    )
+    script_validation_warnings = context.get(
+        "script_validation_warnings",
+        {"unused_scene_ids": [], "unused_character_ids": []},
+    )
+    if not isinstance(script_validation_warnings, dict):
+        raise MediaToolError("generation_context.script_validation_warnings 必须是对象")
     manifest = {
-        "manifest_version": "m2.mock-export.v1",
+        "manifest_version": "m3.mixed-provider-export.v1",
         "project": {"id": project_id, "title": project_title},
-        "generation_context": generation_context or {},
+        "generation_context": context,
+        "script_provider": script_provider,
+        "image_provider": image_provider,
+        "audio_provider": audio_provider,
+        "video_source_type": video_source_type,
+        "script_validation_warnings": script_validation_warnings,
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
         "media_spec": {
             "resolution": f"{width}x{height}",
             "frame_rate": fps,
             "planned_duration_seconds": planned_duration,
-            "actual_duration_seconds": validation["duration_seconds"],
+            "encoded_duration_seconds": validation["encoded_duration_seconds"],
+            "actual_duration_seconds": validation["encoded_duration_seconds"],
+            "duration_delta_seconds": validation["duration_delta_seconds"],
+            "duration_tolerance_seconds": validation[
+                "duration_tolerance_seconds"
+            ],
+            "duration_validation": validation["duration_validation"],
         },
         "pipeline": {
             "provider_id": provider_id,
             "source_type": "DETERMINISTIC_FALLBACK",
+            "script_provider": script_provider,
+            "image_provider": image_provider,
+            "audio_provider": audio_provider,
+            "video_source_type": video_source_type,
             "visual_method": "FFmpeg color/drawbox/drawtext/zoompan/fade filters",
             "audio_method": "Python standard-library deterministic PCM WAV -> FFmpeg AAC",
             "subtitle_method": "FFmpeg drawtext + independent UTF-8 textfile",
+            "subtitle_rendering": "burned_in",
             "chinese_font_path": str(font),
             "network_required": False,
             "api_key_required": False,
@@ -677,6 +735,226 @@ def render_mock_project_short(
     }
 
 
+def resume_mock_project_short(
+    *,
+    root: Path,
+    project_id: str,
+    project_title: str,
+    shots: list[dict[str, Any]],
+    output_dir: Path,
+    source_media_path: Path,
+    output_filename: str | None = None,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+    font_path: Path | None = None,
+    provider_id: str = "mock",
+    generation_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """复用 MEDIA_RENDER 失败时已编码完成的 MP4，只解码、探测和登记。"""
+
+    root = root.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source = source_media_path.resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise MediaToolError(f"MEDIA_RENDER 恢复源 MP4 不存在或为空：{source}")
+
+    normalized_shots = _normalize_project_shots(
+        shots,
+        width=width,
+        height=height,
+        fps=fps,
+        provider_id=provider_id,
+    )
+    planned_duration = sum(
+        float(shot["duration_seconds"]) for shot in normalized_shots
+    )
+    requested_name = output_filename or f"{_safe_file_stem(project_id, 'mock_export')}.mp4"
+    if Path(requested_name).name != requested_name or Path(requested_name).suffix.lower() != ".mp4":
+        raise MediaToolError("output_filename 必须是当前目录下的 .mp4 文件名")
+
+    tools = resolve_media_tools()
+    font = (font_path or find_chinese_font()).resolve()
+    if not font.is_file():
+        raise MediaToolError(f"配置的中文字体不存在：{font}")
+    command_log: list[str] = []
+    output_path = output_dir / requested_name
+    temporary = _atomic_media_target(output_path)
+    if temporary.resolve() == source:
+        raise MediaToolError("恢复目标临时文件不得覆盖源 MP4")
+    shutil.copyfile(source, temporary)
+    validation = verify_media(
+        tools,
+        temporary,
+        planned_duration_seconds=planned_duration,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    full_decode = decode_media_fully(
+        tools,
+        temporary,
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    if progress_callback:
+        progress_callback(90)
+
+    source_dir = source.parent
+    subtitle_dir = output_dir / "subtitles"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    shot_manifest: list[dict[str, Any]] = []
+    for index, shot in enumerate(normalized_shots, start=1):
+        shot_stem = _safe_file_stem(str(shot["shot_id"]), f"shot_{index:02d}")
+        source_clip = source_dir / "shots" / f"{shot_stem}.mp4"
+        source_audio = source_dir / "shots" / f"{shot_stem}.wav"
+        if not source_clip.is_file() or source_clip.stat().st_size <= 0:
+            raise MediaToolError(f"MEDIA_RENDER 恢复缺少镜头文件：{source_clip}")
+        if not source_audio.is_file() or source_audio.stat().st_size <= 0:
+            raise MediaToolError(f"MEDIA_RENDER 恢复缺少音频文件：{source_audio}")
+        subtitle = prepare_burned_subtitle(
+            narration=str(shot["subtitle_text"]),
+            text_path=subtitle_dir / f"{shot_stem}.txt",
+            width=width,
+            height=height,
+            font_path=font,
+        )
+        clip_duration = float(shot["duration_seconds"])
+        clip_validation = verify_media(
+            tools,
+            source_clip,
+            min_duration=clip_duration - 0.20,
+            max_duration=clip_duration + 0.20,
+            expected_width=width,
+            expected_height=height,
+            expected_fps=float(fps),
+            command_log=command_log,
+        )
+        shot_manifest.append(
+            {
+                "shot_id": shot["shot_id"],
+                "sequence_no": shot["sequence_no"],
+                "title": shot["title"],
+                "visual_description": shot["visual_description"],
+                "duration_seconds": shot["duration_seconds"],
+                "subtitle": shot["subtitle_text"],
+                "narration": shot["subtitle_text"],
+                "provider_id": shot["provider_id"],
+                "script_provider_id": shot.get("script_provider_id", provider_id),
+                "source_type": shot["source_type"],
+                "generation_parameters": shot["generation_parameters"],
+                "subtitle_file": _repo_relative(root, subtitle.text_path),
+                "subtitle_text_path": _repo_relative(root, subtitle.text_path),
+                "rendered_subtitle_text": subtitle.rendered_text,
+                "font_path": str(font),
+                "subtitle_rendering": "burned_in",
+                "subtitle_filter": subtitle.filter_expression,
+                "clip_path": _repo_relative(root, source_clip),
+                "audio_path": _repo_relative(root, source_audio),
+                "audio_sha256": sha256_file(source_audio),
+                "clip_sha256": sha256_file(source_clip),
+                "clip_validation": clip_validation,
+            }
+        )
+
+    subtitle_sidecar = output_dir / "subtitles.srt"
+    _write_srt(normalized_shots, subtitle_sidecar)
+    digest = sha256_file(output_path)
+    context = dict(generation_context or {})
+    provider_trace = context.get("providers", {})
+    if not isinstance(provider_trace, dict):
+        provider_trace = {}
+    script_provider = str(provider_trace.get("script_provider", provider_id))
+    image_provider = str(provider_trace.get("image_provider", "mock"))
+    audio_provider = str(provider_trace.get("audio_provider", "mock"))
+    video_source_type = str(
+        provider_trace.get("video_source_type", "DETERMINISTIC_FALLBACK")
+    )
+    script_validation_warnings = context.get(
+        "script_validation_warnings",
+        {"unused_scene_ids": [], "unused_character_ids": []},
+    )
+    manifest = {
+        "manifest_version": "m3.mixed-provider-export.v1",
+        "project": {"id": project_id, "title": project_title},
+        "generation_context": context,
+        "script_provider": script_provider,
+        "image_provider": image_provider,
+        "audio_provider": audio_provider,
+        "video_source_type": video_source_type,
+        "script_validation_warnings": script_validation_warnings,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
+        "media_spec": {
+            "resolution": f"{width}x{height}",
+            "frame_rate": fps,
+            "planned_duration_seconds": validation["planned_duration_seconds"],
+            "encoded_duration_seconds": validation["encoded_duration_seconds"],
+            "actual_duration_seconds": validation["encoded_duration_seconds"],
+            "duration_delta_seconds": validation["duration_delta_seconds"],
+            "duration_tolerance_seconds": validation[
+                "duration_tolerance_seconds"
+            ],
+            "duration_validation": validation["duration_validation"],
+        },
+        "pipeline": {
+            "provider_id": provider_id,
+            "source_type": "DETERMINISTIC_FALLBACK",
+            "script_provider": script_provider,
+            "image_provider": image_provider,
+            "audio_provider": audio_provider,
+            "video_source_type": video_source_type,
+            "visual_method": "复用已编码的 FFmpeg Mock 媒体",
+            "audio_method": "复用已编码的 AAC 音频流",
+            "subtitle_method": "复用已烧录画面并重建 UTF-8 LF 字幕追溯文件",
+            "subtitle_rendering": "burned_in",
+            "chinese_font_path": str(font),
+            "network_required": False,
+            "api_key_required": False,
+            "model_weights_required": False,
+        },
+        "recovery": {
+            "resumed_from_stage": "MEDIA_RENDER",
+            "source_media_path": _repo_relative(root, source),
+            "source_media_sha256": sha256_file(source),
+            "media_reused": True,
+            "reencoded": False,
+            "full_decode": full_decode,
+        },
+        "shot_count": len(shot_manifest),
+        "shots": shot_manifest,
+        "output": {
+            "file_path": _repo_relative(root, output_path),
+            "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
+            "file_size_bytes": output_path.stat().st_size,
+            "sha256": digest,
+        },
+        "ffprobe_validation": validation,
+        "safe_command_log": command_log,
+    }
+    manifest_path = output_dir / "manifest.json"
+    _atomic_json(manifest_path, manifest)
+    if progress_callback:
+        progress_callback(95)
+    return {
+        "status": "PASS",
+        "output_path": str(output_path),
+        "manifest_path": str(manifest_path),
+        "subtitle_path": str(subtitle_sidecar),
+        "font_path": str(font),
+        "sha256": digest,
+        "validation": validation,
+        "shots": [],
+        "manifest": manifest,
+        "media_reused": True,
+        "reencoded": False,
+        "source_media_path": str(source),
+    }
+
+
 def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, Any]:
     root = root.resolve()
     output_dir = (output_dir or root / "data" / "generated" / "m0").resolve()
@@ -686,6 +964,13 @@ def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, A
     subtitle_path = root / "fixtures" / "paper-crane" / "subtitles" / "m0.txt"
     if not subtitle_path.is_file():
         raise MediaToolError(f"找不到 M0 字幕文件：{subtitle_path}")
+    subtitle = prepare_burned_subtitle(
+        narration=subtitle_path.read_text(encoding="utf-8"),
+        text_path=output_dir / "subtitles" / "m0.txt",
+        width=WIDTH,
+        height=HEIGHT,
+        font_path=font,
+    )
 
     audio_path = output_dir / "mock_audio.wav"
     output_path = output_dir / "smoke_test.mp4"
@@ -696,7 +981,7 @@ def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, A
         "drawbox=x=410:y=185:w=460:h=245:color=0xa9d9ff@0.18:t=fill",
         "drawbox=x=410:y=185:w=460:h=245:color=0xcbe9ff@0.75:t=7",
         _label_filter(font, "M0 MEDIA SMOKE TEST", 42, 28),
-        _subtitle_filter(font, subtitle_path),
+        subtitle.filter_expression,
         "fade=t=in:st=0:d=0.25,fade=t=out:st=4.75:d=0.25",
         "format=yuv420p",
     ]
@@ -761,6 +1046,11 @@ def generate_m0_smoke(root: Path, output_dir: Path | None = None) -> dict[str, A
         "status": "PASS",
         "output_path": str(output_path),
         "font_path": str(font),
+        "narration": subtitle.narration,
+        "subtitle_text_path": str(subtitle.text_path),
+        "rendered_subtitle_text": subtitle.rendered_text,
+        "subtitle_rendering": "burned_in",
+        "subtitle_filter": subtitle.filter_expression,
         "sha256": sha256_file(output_path),
         "validation": validation,
         "commands": command_log,
@@ -806,7 +1096,15 @@ def generate_m1_short(root: Path, output_dir: Path | None = None) -> dict[str, A
                 "visual_description": shot["visual_description"],
                 "duration_seconds": shot["duration_seconds"],
                 "subtitle": shot["subtitle_text"],
+                "narration": shot["subtitle_text"],
                 "subtitle_file": shot["subtitle_file"],
+                "subtitle_text_path": _repo_relative(
+                    root, generated["subtitle_path"]
+                ),
+                "rendered_subtitle_text": generated["rendered_subtitle_text"],
+                "font_path": str(generated["subtitle_font_path"]),
+                "subtitle_rendering": generated["subtitle_rendering"],
+                "subtitle_filter": generated["subtitle_filter"],
                 "provider_id": "mock",
                 "source_type": "DETERMINISTIC_FALLBACK",
                 "generation_parameters": shot["generation_parameters"],
@@ -830,7 +1128,13 @@ def generate_m1_short(root: Path, output_dir: Path | None = None) -> dict[str, A
             "resolution": f"{WIDTH}x{HEIGHT}",
             "frame_rate": FPS,
             "planned_duration_seconds": 28.0,
-            "actual_duration_seconds": validation["duration_seconds"],
+            "encoded_duration_seconds": validation["encoded_duration_seconds"],
+            "actual_duration_seconds": validation["encoded_duration_seconds"],
+            "duration_delta_seconds": validation["duration_delta_seconds"],
+            "duration_tolerance_seconds": validation[
+                "duration_tolerance_seconds"
+            ],
+            "duration_validation": validation["duration_validation"],
         },
         "pipeline": {
             "provider_id": "mock",
@@ -838,6 +1142,7 @@ def generate_m1_short(root: Path, output_dir: Path | None = None) -> dict[str, A
             "visual_method": "FFmpeg color/drawbox/drawtext/zoompan/fade filters",
             "audio_method": "Python standard-library deterministic PCM WAV -> FFmpeg AAC",
             "subtitle_method": "FFmpeg drawtext + independent UTF-8 textfile",
+            "subtitle_rendering": "burned_in",
             "chinese_font_path": str(font),
             "network_required": False,
             "api_key_required": False,

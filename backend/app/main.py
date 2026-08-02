@@ -21,9 +21,9 @@ def create_app(
     database.create_schema()
 
     app = FastAPI(
-        title="AnimeFlow M2 API",
-        version="0.2.0",
-        description="本地单用户、Mock Provider + FFmpeg 最小纵向链路",
+        title="AnimeFlow M3 API",
+        version="0.3.0",
+        description="本地 Qwen/Mock ScriptProvider + Mock 媒体 + FFmpeg 纵向链路",
     )
     app.state.settings = settings
     app.state.database = database

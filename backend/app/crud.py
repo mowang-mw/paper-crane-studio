@@ -188,6 +188,19 @@ def retry_failed_job(session: Session, failed_job: GenerationJob) -> GenerationJ
         raise ValueError("原任务所属项目不存在")
     request_json = dict(failed_job.request_json or {})
     request_json["retry_of_job_id"] = failed_job.id
+    result_json = failed_job.result_json or {}
+    generation_error = (
+        result_json.get("generation_error")
+        if isinstance(result_json, dict)
+        else None
+    )
+    if (
+        isinstance(generation_error, dict)
+        and generation_error.get("stage") == "MEDIA_RENDER"
+    ):
+        # Worker 必须从来源 Job 的严格 ScriptV1 与已有媒体继续；
+        # 追溯缺失时明确失败，绝不退回 ScriptProvider。
+        request_json["resumed_from_stage"] = "MEDIA_RENDER"
     return create_job(
         session,
         project=project,

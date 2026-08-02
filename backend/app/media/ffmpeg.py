@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -34,6 +35,11 @@ FONT_CANDIDATES = (
     Path(r"C:\Windows\Fonts\msyhbd.ttc"),
     Path(r"C:\Windows\Fonts\simhei.ttf"),
 )
+
+AAC_FRAME_SAMPLES = 1024
+MEDIA_DURATION_EPSILON_SECONDS = 0.010
+SCRIPT_DURATION_MIN_SECONDS = 20.0
+SCRIPT_DURATION_MAX_SECONDS = 40.0
 
 
 def _resolve_executable(command: str, env_name: str) -> Path:
@@ -191,6 +197,82 @@ def _parse_frame_rate(stream: dict) -> float:
     raise MediaToolError("ffprobe 未返回可解析的视频帧率")
 
 
+def media_duration_tolerance_seconds(
+    *,
+    video_fps: float,
+    audio_sample_rate: int,
+    audio_frame_samples: int = AAC_FRAME_SAMPLES,
+    small_epsilon_seconds: float = MEDIA_DURATION_EPSILON_SECONDS,
+) -> float:
+    """计算视频帧、AAC 采样帧和容器舍入共同允许的最小容差。"""
+
+    if not math.isfinite(video_fps) or video_fps <= 0:
+        raise MediaToolError("媒体时长容差要求 video_fps 大于 0")
+    if audio_sample_rate <= 0:
+        raise MediaToolError("媒体时长容差要求 audio_sample_rate 大于 0")
+    if audio_frame_samples <= 0:
+        raise MediaToolError("媒体时长容差要求 audio_frame_samples 大于 0")
+    if not math.isfinite(small_epsilon_seconds) or small_epsilon_seconds < 0:
+        raise MediaToolError("媒体时长容差的 small_epsilon_seconds 不得为负")
+    return max(
+        1.0 / video_fps,
+        audio_frame_samples / audio_sample_rate,
+    ) + small_epsilon_seconds
+
+
+def validate_planned_encoded_duration(
+    *,
+    planned_duration_seconds: float,
+    encoded_duration_seconds: float,
+    video_fps: float,
+    audio_sample_rate: int,
+    audio_frame_samples: int = AAC_FRAME_SAMPLES,
+    small_epsilon_seconds: float = MEDIA_DURATION_EPSILON_SECONDS,
+) -> dict[str, float | str]:
+    """先执行 20—40 秒业务校验，再执行有物理依据的媒体量化校验。"""
+
+    planned = float(planned_duration_seconds)
+    encoded = float(encoded_duration_seconds)
+    if not math.isfinite(planned) or not math.isfinite(encoded):
+        raise MediaToolError("计划时长和编码时长必须是有限数值")
+    if not SCRIPT_DURATION_MIN_SECONDS <= planned <= SCRIPT_DURATION_MAX_SECONDS:
+        raise MediaToolError(
+            "剧本计划时长越界：要求 20.000—40.000 秒，"
+            f"实际 {planned:.6f} 秒"
+        )
+
+    tolerance = media_duration_tolerance_seconds(
+        video_fps=video_fps,
+        audio_sample_rate=audio_sample_rate,
+        audio_frame_samples=audio_frame_samples,
+        small_epsilon_seconds=small_epsilon_seconds,
+    )
+    delta = encoded - planned
+    if abs(delta) > tolerance:
+        raise MediaToolError(
+            "编码时长超出媒体帧量化容差："
+            f"计划 {planned:.6f} 秒，编码 {encoded:.6f} 秒，"
+            f"差值 {delta:+.6f} 秒，允许 ±{tolerance:.6f} 秒"
+        )
+    validation = (
+        "passed_exactly"
+        if math.isclose(planned, encoded, rel_tol=0.0, abs_tol=1e-6)
+        else "passed_with_media_tolerance"
+    )
+    return {
+        "planned_duration_seconds": round(planned, 6),
+        "encoded_duration_seconds": round(encoded, 6),
+        "duration_delta_seconds": round(delta, 6),
+        "duration_tolerance_seconds": round(tolerance, 6),
+        "duration_validation": validation,
+        "video_frame_duration_seconds": round(1.0 / video_fps, 6),
+        "audio_frame_duration_seconds": round(
+            audio_frame_samples / audio_sample_rate,
+            6,
+        ),
+    }
+
+
 def verify_media(
     tools: MediaTools,
     media_path: Path,
@@ -198,8 +280,9 @@ def verify_media(
     expected_width: int = 1280,
     expected_height: int = 720,
     expected_fps: float = 24.0,
-    min_duration: float,
-    max_duration: float,
+    min_duration: float | None = None,
+    max_duration: float | None = None,
+    planned_duration_seconds: float | None = None,
     expected_video_codec: str = "h264",
     expected_audio_codec: str = "aac",
     command_log: list[str] | None = None,
@@ -244,11 +327,29 @@ def verify_media(
         duration = float(format_data.get("duration"))
     except (TypeError, ValueError) as exc:
         raise MediaToolError("ffprobe 未返回可解析的容器时长") from exc
-    if not min_duration <= duration <= max_duration:
-        raise MediaToolError(
-            f"时长不符：要求 {min_duration:.3f}—{max_duration:.3f} 秒，"
-            f"实际 {duration:.6f} 秒"
+    try:
+        audio_sample_rate = int(audio["sample_rate"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MediaToolError("ffprobe 未返回可解析的音频采样率") from exc
+
+    duration_trace: dict[str, float | str] = {}
+    if planned_duration_seconds is not None:
+        if min_duration is not None or max_duration is not None:
+            raise MediaToolError("计划时长校验不能与 min/max_duration 同时使用")
+        duration_trace = validate_planned_encoded_duration(
+            planned_duration_seconds=planned_duration_seconds,
+            encoded_duration_seconds=duration,
+            video_fps=fps,
+            audio_sample_rate=audio_sample_rate,
         )
+    else:
+        if min_duration is None or max_duration is None:
+            raise MediaToolError("必须提供 planned_duration_seconds 或完整时长区间")
+        if not min_duration <= duration <= max_duration:
+            raise MediaToolError(
+                f"时长不符：要求 {min_duration:.3f}—{max_duration:.3f} 秒，"
+                f"实际 {duration:.6f} 秒"
+            )
 
     pixel_format = video.get("pix_fmt")
     if pixel_format != "yuv420p":
@@ -266,9 +367,10 @@ def verify_media(
         "height": video.get("height"),
         "frame_rate": round(fps, 6),
         "pixel_format": pixel_format,
-        "audio_sample_rate": int(audio["sample_rate"]) if audio.get("sample_rate") else None,
+        "audio_sample_rate": audio_sample_rate,
         "audio_channels": audio.get("channels"),
         "file_size_bytes": media_path.stat().st_size,
+        **duration_trace,
     }
 
 
@@ -288,3 +390,107 @@ def runtime_summary(tools: MediaTools) -> dict:
         "ffmpeg_path": str(tools.ffmpeg),
         "ffprobe_path": str(tools.ffprobe),
     }
+
+
+def decode_media_fully(
+    tools: MediaTools,
+    media_path: Path,
+    *,
+    command_log: list[str] | None = None,
+    timeout_seconds: int = 600,
+) -> dict:
+    """完整解码视频和音频流，用于发现只在播放中后段出现的媒体错误。"""
+
+    if not media_path.is_file() or media_path.stat().st_size <= 0:
+        raise MediaToolError(f"媒体文件不存在或为空：{media_path}")
+    completed = run_command(
+        [
+            tools.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            media_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout_seconds=timeout_seconds,
+        command_log=command_log,
+    )
+    return {
+        "decode_ok": True,
+        "stderr": completed.stderr.strip(),
+    }
+
+
+def extract_shot_midpoint_frames(
+    tools: MediaTools,
+    media_path: Path,
+    *,
+    shot_durations: Sequence[float],
+    output_dir: Path,
+    filename_prefix: str = "subtitle",
+    command_log: list[str] | None = None,
+) -> list[dict]:
+    """按镜头计划时长抽取每个中点帧，供人工确认烧录字幕。"""
+
+    if not media_path.is_file() or media_path.stat().st_size <= 0:
+        raise MediaToolError(f"媒体文件不存在或为空：{media_path}")
+    if not shot_durations:
+        raise MediaToolError("抽帧至少需要一个镜头时长")
+    durations = [float(value) for value in shot_durations]
+    if any(value <= 0 for value in durations):
+        raise MediaToolError("镜头时长必须全部大于 0")
+
+    safe_prefix = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in filename_prefix
+    ).strip("_") or "subtitle"
+    target_dir = output_dir.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    frames: list[dict] = []
+    shot_start = 0.0
+    for index, duration in enumerate(durations, start=1):
+        midpoint = shot_start + duration / 2.0
+        target = target_dir / f"{safe_prefix}_shot_{index:02d}_midpoint.png"
+        run_command(
+            [
+                tools.ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{midpoint:.3f}",
+                "-i",
+                media_path,
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                target,
+            ],
+            timeout_seconds=120,
+            command_log=command_log,
+        )
+        if not target.is_file() or target.stat().st_size <= 0:
+            raise MediaToolError(f"中点帧未生成或为空：{target}")
+        frames.append(
+            {
+                "shot_index": index,
+                "midpoint_seconds": round(midpoint, 3),
+                "frame_path": str(target),
+                "file_size_bytes": target.stat().st_size,
+                "sha256": sha256_file(target),
+            }
+        )
+        shot_start += duration
+    return frames

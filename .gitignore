@@ -66,6 +66,8 @@ credentials*.json
 
 # 模型权重、检查点和推理缓存
 /models/
+/models/text/
+/tools/llama.cpp/
 /checkpoints/
 /model-cache/
 *.safetensors

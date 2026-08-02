@@ -1,9 +1,13 @@
 import type {
+  DesiredShotCount,
   ExportRecord,
   GenerationJob,
   HealthStatus,
   Project,
   ProjectDetail,
+  ProvidersStatus,
+  ScriptProviderId,
+  ScriptProviderStatus,
   Shot,
 } from "./types";
 
@@ -12,12 +16,37 @@ export const API_BASE = (configuredBase || "http://127.0.0.1:8000/api").replace(
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly detail: unknown;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, detail?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.detail = detail;
   }
+}
+
+function errorMessage(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(value)) {
+    const messages = value
+      .map((item) => {
+        if (!isRecord(item)) return null;
+        return optionalText(item.summary) ?? optionalText(item.message) ?? optionalText(item.msg);
+      })
+      .filter((item): item is string => item !== null);
+    if (messages.length > 0) return messages.join("；");
+  }
+  if (isRecord(value)) {
+    const nested = isRecord(value.generation_error) ? value.generation_error : value;
+    return (
+      optionalText(nested.summary) ??
+      optionalText(nested.message) ??
+      optionalText(value.message) ??
+      fallback
+    );
+  }
+  return fallback;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -31,19 +60,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`;
+    let detail: unknown;
     try {
-      const payload = (await response.json()) as {
-        detail?: string | { message?: string };
-        message?: string;
-      };
-      if (typeof payload.detail === "string") message = payload.detail;
-      else if (payload.detail?.message) message = payload.detail.message;
-      else if (payload.message) message = payload.message;
+      const payload = (await response.json()) as { detail?: unknown; message?: unknown };
+      detail = payload.detail ?? payload;
+      message = errorMessage(detail, errorMessage(payload.message, message));
     } catch {
       const text = await response.text().catch(() => "");
       if (text) message = text;
     }
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, detail);
   }
 
   if (response.status === 204) return undefined as T;
@@ -73,8 +99,54 @@ function unwrapJob(payload: unknown): GenerationJob {
   } as GenerationJob;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isScriptProviderId(value: unknown): value is ScriptProviderId {
+  return value === "mock" || value === "llamacpp";
+}
+
+function optionalText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeProvider(value: unknown): ScriptProviderStatus | null {
+  if (!isRecord(value) || !isScriptProviderId(value.provider_id)) return null;
+  const fallbackName = value.provider_id === "mock" ? "Mock 离线保底" : "本地 Qwen（llama.cpp）";
+  return {
+    provider_id: value.provider_id,
+    display_name: optionalText(value.display_name) ?? fallbackName,
+    available: value.available === true,
+    configured: typeof value.configured === "boolean" ? value.configured : null,
+    model_id: optionalText(value.model_id),
+    source_type: optionalText(value.source_type) ?? "UNKNOWN",
+    server_version: optionalText(value.server_version),
+    detail: optionalText(value.detail),
+  };
+}
+
 export async function getHealth(): Promise<HealthStatus> {
   return request<HealthStatus>("/health");
+}
+
+export async function getProviders(): Promise<ProvidersStatus> {
+  const payload = await request<unknown>("/providers");
+  if (!isRecord(payload)) {
+    throw new Error("Provider 状态响应格式无效");
+  }
+  const providers = Array.isArray(payload.providers)
+    ? payload.providers
+        .map(normalizeProvider)
+        .filter((item): item is ScriptProviderStatus => item !== null)
+    : [];
+  return {
+    default_script_provider: isScriptProviderId(payload.default_script_provider)
+      ? payload.default_script_provider
+      : null,
+    checked_at: optionalText(payload.checked_at),
+    providers,
+  };
 }
 
 export async function listProjects(): Promise<Project[]> {
@@ -116,10 +188,18 @@ export async function getProject(projectId: string): Promise<ProjectDetail> {
   };
 }
 
-export async function generateProject(projectId: string): Promise<GenerationJob> {
+export async function generateProject(
+  projectId: string,
+  scriptProvider: ScriptProviderId,
+  desiredShotCount: DesiredShotCount,
+): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/generate`, {
       method: "POST",
+      body: JSON.stringify({
+        script_provider: scriptProvider,
+        desired_shot_count: desiredShotCount,
+      }),
     }),
   );
 }

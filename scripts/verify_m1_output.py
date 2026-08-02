@@ -57,8 +57,11 @@ def main() -> int:
         validation = verify_media(
             tools,
             output_path,
-            min_duration=20.0,
-            max_duration=40.0,
+            planned_duration_seconds=float(
+                manifest.get("media_spec", {}).get(
+                    "planned_duration_seconds", 28.0
+                )
+            ),
         )
         _require(
             abs(float(validation["duration_seconds"]) - 28.0) <= 0.50,

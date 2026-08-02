@@ -16,14 +16,29 @@ class ApiModel(BaseModel):
 
 class ProjectCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    story: str = Field(min_length=1, max_length=20_000)
+    story: str
 
-    @field_validator("title", "story")
+    @field_validator("title")
     @classmethod
-    def reject_blank_text(cls, value: str) -> str:
+    def reject_blank_title(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("不得只包含空白字符")
+        return value
+
+    @field_validator("story")
+    @classmethod
+    def validate_story_length(cls, value: str) -> str:
+        value = value.strip()
+        length = len(value)
+        if length < 10:
+            raise ValueError(
+                f"故事过短：去除首尾空白后共 {length} 个字符，至少需要 10 个字符"
+            )
+        if length > 3000:
+            raise ValueError(
+                f"故事过长：去除首尾空白后共 {length} 个字符，最多允许 3000 个字符"
+            )
         return value
 
 
@@ -90,6 +105,28 @@ class ProjectDetail(BaseModel):
 class JobQueued(BaseModel):
     job_id: str
     status: Literal["QUEUED"] = "QUEUED"
+
+
+class GenerationRequest(BaseModel):
+    script_provider: Literal["mock", "llamacpp"] | None = None
+    desired_shot_count: Literal[3, 4, 5] | None = 4
+
+
+class ProviderStatusRead(BaseModel):
+    provider_id: Literal["mock", "llamacpp"]
+    display_name: str
+    available: bool
+    configured: bool
+    model_id: str
+    source_type: Literal["MOCK", "LOCAL_MODEL"]
+    server_version: str | None = None
+    detail: str | None = None
+
+
+class ProvidersRead(BaseModel):
+    default_script_provider: Literal["mock", "llamacpp"]
+    checked_at: datetime
+    providers: list[ProviderStatusRead]
 
 
 class HealthRead(BaseModel):

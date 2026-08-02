@@ -6,7 +6,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -14,10 +14,12 @@ from .. import crud
 from ..config import Settings
 from ..database import get_session
 from ..models import Export
+from ..providers.registry import check_llamacpp
 from ..schemas import (
     ExportRead,
     JobQueued,
     JobRead,
+    GenerationRequest,
     ProjectCreate,
     ProjectDetail,
     ProjectRead,
@@ -182,19 +184,50 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> Pro
 )
 def generate_project(
     project_id: str,
+    request: Request,
+    payload: GenerationRequest | None = Body(default=None),
     session: Session = Depends(get_session),
 ) -> JobQueued:
     project = crud.get_project(session, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
+    settings: Settings = request.app.state.settings
+    provider_id = payload.script_provider if payload and payload.script_provider else settings.script_provider
+    desired_shot_count = payload.desired_shot_count if payload is not None else 4
+    if provider_id == "llamacpp":
+        availability = check_llamacpp(settings)
+        if not availability["available"]:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "PROVIDER_UNAVAILABLE",
+                    "stage": "PROVIDER_UNAVAILABLE",
+                    "summary": str(availability["detail"]),
+                    "story_char_count": len(project.story.strip()),
+                    "desired_shot_count": desired_shot_count,
+                    "first_attempt_errors": [],
+                    "repair_attempt_errors": [],
+                    "suggestions": [
+                        "在项目根目录运行 .\\scripts\\run_llm_server.ps1 后重新检查。",
+                        "若只需离线保底，请显式选择 Mock Script Provider。",
+                    ],
+                    "provider_id": "llamacpp",
+                    "model_id": settings.llama_model_id,
+                    "raw_response_path": None,
+                    "repair_response_path": None,
+                },
+            )
     job = crud.create_job(
         session,
         project=project,
         request_json={
             "project_id": project.id,
             "output": {"width": 1280, "height": 720, "fps": 24},
-            "provider_id": "mock",
+            "script_provider": provider_id,
+            "desired_shot_count": desired_shot_count,
+            "story_char_count": len(project.story.strip()),
         },
+        provider_id=provider_id,
     )
     session.commit()
     return JobQueued(job_id=job.id)

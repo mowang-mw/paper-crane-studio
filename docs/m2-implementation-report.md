@@ -1,5 +1,9 @@
 # M2 最小全栈纵向链路实施记录
 
+> 阶段状态：M2 已不再是当前开发阶段，本报告保留为当时的验收记录。M3 继续复用 M2 的 API、SQLite、四态 Job、独立 Worker、前端和 Mock + FFmpeg 兜底，并在其上新增本地文本 Provider；这不会追溯改写 M2 的实测结果，也不改变 M2 原验收结论。
+
+> 字幕历史更正：M0 的 UTF-8 LF 字幕当时实际可见；M1/M2 共享动态路径在 Windows 下写出了 CRLF 文本，导致 FFmpeg `drawtext=textfile` 没有渲染旁白，成片只有左上角镜头标签。旧报告中的“命令含 drawtext/字幕文件存在”只证明配置存在，不能证明画面已出现旁白。本轮 M3 可用性修复后，公共媒体管线才通过 UTF-8 LF、完整解码与中点抽帧真正验证动态 `shot.narration` 烧录。
+
 ## 1. 阶段结论
 
 M2 的代码实现与自动化纵向链路已通过：React 页面、FastAPI、SQLite、独立单 Worker、Mock Provider、M1 复用媒体函数和 FFmpeg 导出已经连成一条可实际运行的链路。最近一次黑盒 E2E 创建真实项目和 `QUEUED` Job，再由独立 Worker 子进程生成 4 镜头 MP4；下载后的文件通过 ffprobe 与 SHA-256 校验。
@@ -109,7 +113,7 @@ conda run --no-capture-output -n anime-platform python scripts/m2_e2e_test.py --
 - 持久化：使用指向同一文件的新 Database/Application 实例仍能查询项目。
 - SQLite：应用重启后实测 `PRAGMA journal_mode` 为 `wal`。
 - 前端服务：`GET http://127.0.0.1:5173/` 为 200 且包含 `#root`；health 为 200，CORS 返回 `http://127.0.0.1:5173`。
-- M1：重构后重新生成并由独立验证脚本通过，时长与编码规格未回退。
+- M1：当时的独立验证只确认生成、时长和编码规格未回退，不能证明动态旁白字幕可见；字幕结论以上方历史更正为准。
 
 ## 7. 本轮 E2E 成片与追溯结果
 
@@ -132,7 +136,7 @@ Manifest 明确记录 Job ID、Job 请求快照、脚本 schema/fixture/provider
 ## 8. Windows、SQLite 与媒体处理
 
 - API、Worker 与脚本都从激活的 `anime-platform` 环境运行；媒体模块通过环境变量或 `shutil.which` 解析 FFmpeg/FFprobe，并在缺失时给出明确错误。
-- drawtext 使用独立 UTF-8 textfile；媒体工具统一处理 Windows 盘符、冒号、反斜杠与 filter 路径转义。
+- 当时的 drawtext 命令确实引用独立 UTF-8 textfile，媒体工具也处理了 Windows 路径转义；但动态文件采用 CRLF，实际旁白未渲染。修复后的公共模块显式以 UTF-8 LF 写入，并由真实中点帧确认。
 - SQLite 打开外键、WAL 与 5 秒 busy timeout；HTTP 入队和 Worker 领取均使用短事务，FFmpeg 不占用数据库事务。
 - 每个 Job 使用 `data/projects/<project-id>/exports/<job-id>/`，重复生成不会覆盖其他项目或旧 Job。
 - 媒体 API 只读取数据库已登记的 Export，并再次校验解析后路径仍位于对应项目目录；错误项目 ID 和越界路径返回 404。
@@ -188,3 +192,9 @@ Manifest 明确记录 Job ID、Job 请求快照、脚本 schema/fixture/provider
 本轮实际 API smoke 另创建并立即删除一个专用测试项目：DELETE 返回 204，随后 GET 返回 404，删除前后项目总数一致，未删除任何既有开发项目。DELETE 的 CORS 预检返回 200，允许方法为 `GET, POST, DELETE`。Vite 页面返回 200 且包含 React 根节点。
 
 浏览器连接再次检查时可用浏览器列表仍为空，因此本节 11.2 的真实点击、焦点位置、滚动观感、视频播放和窄屏布局仍需人工执行；报告没有把 HTTP 或源码检查冒充为浏览器交互通过。
+
+### 11.3 动态旁白字幕修复回归
+
+修复后的 M2 黑盒 E2E 创建 Project `0c8b4d51-a0d6-4c34-994b-51ba9f76c872`、Job `c22a7d1e-69fc-44bf-ab34-c027cb9b1125`，生成 4 镜头、28.021333 秒、H.264/AAC、1280×720、24 fps 成片，SHA-256 为 `639b3864867c5bd494504ec069d1bc907ddeae32a7f9fc99f5c800203f8d065e`。完整音视频解码通过，四个镜头的独立字幕文件均为 UTF-8 LF；中点帧经人工查看分别显示各自旁白，不再只有左上角镜头标签。
+
+证据目录为 `data/generated/subtitle-check/m2/short_c22a7d1e-69fc-44bf-ab34-c027cb9b1125/`，其中 `subtitle_check.report.json` 记录 ffprobe、完整解码、字幕文件和抽帧路径。该目录为本地生成证据并由 Git 忽略。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -49,7 +50,7 @@ def test_health_projects_demo_and_persistence(
         "ffmpeg_available": True,
         "ffprobe_available": True,
         "data_dir": str(settings.data_dir),
-        "stage": "M2",
+        "stage": "M3",
     }
     with database.engine.connect() as connection:
         assert connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"
@@ -161,6 +162,21 @@ def test_worker_generates_verified_media_and_persists_export(
     assert job_payload["progress"] == 100
     assert job_payload["provider_id"] == "mock"
     assert job_payload["result_json"]["source_type"] == "DETERMINISTIC_FALLBACK"
+    assert job_payload["result_json"]["script_validation_warnings"] == {
+        "unused_scene_ids": [],
+        "unused_character_ids": [],
+    }
+    assert job_payload["result_json"]["planned_duration_seconds"] == 28.0
+    assert job_payload["result_json"]["encoded_duration_seconds"] == pytest.approx(
+        28.021333
+    )
+    assert job_payload["result_json"]["duration_delta_seconds"] == pytest.approx(
+        0.021333
+    )
+    assert 0.05 <= job_payload["result_json"]["duration_tolerance_seconds"] <= 0.10
+    assert job_payload["result_json"]["duration_validation"] == (
+        "passed_with_media_tolerance"
+    )
 
     detail_response = client.get(f"/api/projects/{demo['id']}")
     assert detail_response.status_code == 200
@@ -206,6 +222,21 @@ def test_worker_generates_verified_media_and_persists_export(
     assert manifest["output"]["sha256"] == export["sha256"]
     assert manifest["generation_context"]["generation_job_id"] == job_id
     assert manifest["generation_context"]["script"]["fixture_version"] == "script.v1"
+    assert manifest["script_validation_warnings"] == {
+        "unused_scene_ids": [],
+        "unused_character_ids": [],
+    }
+    assert manifest["media_spec"]["planned_duration_seconds"] == 28.0
+    assert manifest["media_spec"]["encoded_duration_seconds"] == pytest.approx(
+        28.021333
+    )
+    assert manifest["media_spec"]["duration_delta_seconds"] == pytest.approx(
+        0.021333
+    )
+    assert 0.05 <= manifest["media_spec"]["duration_tolerance_seconds"] <= 0.10
+    assert manifest["media_spec"]["duration_validation"] == (
+        "passed_with_media_tolerance"
+    )
     assert all(item.get("audio_sha256") for item in manifest["shots"])
 
     download_response = client.get(export["download_url"])

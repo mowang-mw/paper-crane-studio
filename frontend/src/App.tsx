@@ -17,23 +17,52 @@ import {
   getHealth,
   getJob,
   getProject,
+  getProviders,
   listProjects,
   retryJob,
 } from "./api";
 import type {
+  DesiredShotCount,
+  DurationNormalization,
+  GenerationAttemptError,
+  GenerationErrorDetail,
   GenerationJob,
   HealthStatus,
   JobStatus,
   Project,
   ProjectDetail,
+  ProvidersStatus,
+  ScriptProviderId,
+  ScriptProviderStatus,
 } from "./types";
 
 const PAPER_CRANE_STORY =
   "深夜，少女在窗边折出一只纸鹤。纸鹤亮起微光，飞过屋顶、灯火与云层；黎明时，它飞向远方，少女在窗边静静注视。";
 const PAPER_CRANE_TITLE = "纸鹤的夜航";
+const LLM_START_COMMAND = ".\\scripts\\run_llm_server.ps1";
+const STORY_MIN_CHARS = 10;
+const STORY_MAX_CHARS = 3000;
+const STORY_RECOMMENDED_MIN_CHARS = 50;
+const STORY_RECOMMENDED_MAX_CHARS = 1000;
 
 type SectionName = "create" | "project" | "shots" | "result";
 type Notice = { kind: "info" | "success"; message: string; action?: SectionName };
+type PresentedShot = {
+  id?: string;
+  shot_id?: string;
+  index?: number;
+  shot_index?: number;
+  sequence_no?: number;
+  title: string;
+  visual_description: string;
+  narration: string;
+  duration_seconds: number;
+  camera?: string;
+  camera_motion?: string;
+  image_prompt?: string;
+  provider_id?: string;
+  generation_parameters?: Record<string, unknown>;
+};
 
 const statusLabels: Record<JobStatus, string> = {
   QUEUED: "等待 Worker",
@@ -58,18 +87,357 @@ function projectStatus(project: Project): string {
   return project.workflow_status ?? project.status ?? "DRAFT";
 }
 
+function textValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
+function characterCount(value: string): number {
+  return Array.from(value.trim()).length;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function booleanValue(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function desiredShotCountValue(value: unknown): DesiredShotCount | undefined {
+  if (value === null || value === 3 || value === 4 || value === 5) return value;
+  return undefined;
+}
+
+function generationErrorValue(value: unknown): GenerationErrorDetail | null {
+  const record = recordValue(value);
+  if (!record) return null;
+  const nested = recordValue(record.generation_error);
+  return (nested ?? record) as GenerationErrorDetail;
+}
+
+function jobGenerationError(job: GenerationJob | null): GenerationErrorDetail | null {
+  return generationErrorValue(job?.result_json?.generation_error);
+}
+
+function jobDesiredShotCount(job: GenerationJob | null): DesiredShotCount | undefined {
+  if (!job) return undefined;
+  const candidates = [
+    job.request_json?.desired_shot_count,
+    job.result_json?.desired_shot_count,
+    jobGenerationError(job)?.desired_shot_count,
+  ];
+  for (const candidate of candidates) {
+    const parsed = desiredShotCountValue(candidate);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
+function jobStoryCharCount(job: GenerationJob | null): number | null {
+  if (!job) return null;
+  return (
+    numberValue(job.request_json?.story_char_count) ??
+    numberValue(job.result_json?.story_char_count) ??
+    numberValue(jobGenerationError(job)?.story_char_count)
+  );
+}
+
+function jobActualShotCount(job: GenerationJob | null, fallback?: number): number | null {
+  if (!job) return fallback ?? null;
+  return (
+    numberValue(job.result_json?.actual_shot_count) ??
+    numberValue(job.result_json?.final_shot_count) ??
+    fallback ??
+    null
+  );
+}
+
+function jobRepairUsed(job: GenerationJob | null): boolean | null {
+  if (!job) return null;
+  const trace = recordValue(job.result_json?.script_trace);
+  return (
+    booleanValue(job.result_json?.repair_used) ??
+    booleanValue(trace?.repair_used)
+  );
+}
+
+function jobDurationNormalization(job: GenerationJob | null): DurationNormalization | null {
+  if (!job) return null;
+  const trace = recordValue(job.result_json?.script_trace);
+  return (
+    recordValue(job.result_json?.duration_normalization) ??
+    recordValue(trace?.duration_normalization)
+  ) as DurationNormalization | null;
+}
+
+function shotCountLabel(value: DesiredShotCount | undefined): string {
+  if (value === null) return "自动（接受 3—5 个）";
+  if (value === undefined) return "未记录";
+  return `固定 ${value} 个`;
+}
+
+function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): string {
+  const desired = jobDesiredShotCount(job);
+  const actual = jobActualShotCount(job, fallbackActual);
+  const plannedDuration = numberValue(job.result_json?.planned_duration_seconds);
+  const encodedDuration =
+    numberValue(job.result_json?.encoded_duration_seconds) ??
+    numberValue(job.result_json?.duration_seconds);
+  const durationDelta = numberValue(job.result_json?.duration_delta_seconds);
+  const durationValidation = textValue(job.result_json?.duration_validation);
+  const duration = encodedDuration;
+  const repairUsed = jobRepairUsed(job) === true;
+  const normalization = jobDurationNormalization(job);
+  const normalizationApplied =
+    normalization?.normalized === true || normalization?.applied === true;
+  const durationText = duration !== null ? `，成片 ${duration.toFixed(1)} 秒` : "";
+  const traceText = [
+    repairUsed ? "经过 1 次结构修复" : null,
+    normalizationApplied ? "进行了确定性时长归一化" : null,
+  ].filter((item): item is string => item !== null);
+  const traceSuffix = traceText.length > 0 ? `；本次输出${traceText.join("，并")}。` : "。";
+  const mediaDurationSuffix =
+    durationValidation === "passed_with_media_tolerance" &&
+    plannedDuration !== null &&
+    encodedDuration !== null &&
+    durationDelta !== null
+      ? `计划时长 ${plannedDuration.toFixed(3)} 秒，编码时长 ${encodedDuration.toFixed(3)} 秒；${Math.round(Math.abs(durationDelta) * 1000)} 毫秒差异来自媒体帧量化，验收通过。`
+      : "";
+  if (desired === null) {
+    return actual
+      ? `自动模式已生成 ${actual} 个镜头${durationText}${traceSuffix}${mediaDurationSuffix}短片可以播放和下载。`
+      : "自动模式短片已经生成完成，可以播放和下载。";
+  }
+  if (desired !== undefined) {
+    if (actual !== null && actual !== desired) {
+      return `任务已完成，但固定要求为 ${desired} 个镜头，实际报告 ${actual} 个，请检查结果。`;
+    }
+    return actual
+      ? `已按固定 ${desired} 镜头要求生成 ${actual} 个镜头${durationText}${traceSuffix}${mediaDurationSuffix}短片可以播放和下载。`
+      : `已按固定 ${desired} 镜头要求完成生成，可以播放和下载。`;
+  }
+  return "短片已经生成完成，可在下方播放和下载。";
+}
+
+function attemptErrorText(value: GenerationAttemptError | string): string {
+  if (typeof value === "string") return value;
+  const location = Array.isArray(value.location)
+    ? value.location.join(".")
+    : Array.isArray(value.loc)
+      ? value.loc.join(".")
+      : textValue(value.location) ?? textValue(value.path) ?? textValue(value.field);
+  const message =
+    textValue(value.summary) ??
+    textValue(value.message) ??
+    textValue(value.msg) ??
+    textValue(value.code) ??
+    "未提供错误摘要";
+  return location ? `${location}：${message}` : message;
+}
+
+function errorList(value: unknown): Array<GenerationAttemptError | string> {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is GenerationAttemptError | string =>
+      typeof item === "string" || recordValue(item) !== null,
+  );
+}
+
+function FailureCard({
+  detail,
+  fallbackMessage,
+  retrying,
+  onRetry,
+}: {
+  detail: GenerationErrorDetail | null;
+  fallbackMessage?: string | null;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const fallbackFirstLine = fallbackMessage
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith("Traceback"));
+  const safeFallback =
+    fallbackFirstLine && !fallbackMessage?.includes("Traceback")
+      ? fallbackFirstLine.slice(0, 500)
+      : null;
+  const summary =
+    textValue(detail?.summary) ??
+    textValue(detail?.message) ??
+    safeFallback ??
+    "生成失败，后端没有返回详细信息。";
+  const stage = textValue(detail?.stage);
+  const code = textValue(detail?.code);
+  const storyCharCount = numberValue(detail?.story_char_count);
+  const desired = desiredShotCountValue(detail?.desired_shot_count);
+  const firstErrors = errorList(detail?.first_attempt_errors);
+  const repairErrors = errorList(detail?.repair_attempt_errors);
+  const combinedErrors =
+    firstErrors.length === 0 && repairErrors.length === 0
+      ? errorList(detail?.attempt_errors)
+      : [];
+  const suggestions = stringList(detail?.suggestions);
+  const inputLengthValid =
+    storyCharCount !== null &&
+    storyCharCount >= STORY_MIN_CHARS &&
+    storyCharCount <= STORY_MAX_CHARS;
+
+  return (
+    <div className="failure-box">
+      <p className="failure-summary">{summary}</p>
+      {inputLengthValid && stage !== "INPUT_VALIDATION" && (
+        <p className="failure-context">
+          输入故事共 {storyCharCount} 个字符，长度合法；失败发生在
+          {stage ? ` ${stage} 阶段` : "模型输出处理阶段"}，不是故事长度拦截。
+        </p>
+      )}
+      <details className="failure-details">
+        <summary>查看诊断详情</summary>
+        <dl>
+          <div><dt>错误代码</dt><dd>{code ?? "未报告"}</dd></div>
+          <div><dt>失败阶段</dt><dd>{stage ?? "未报告"}</dd></div>
+          <div><dt>镜头要求</dt><dd>{shotCountLabel(desired)}</dd></div>
+          <div><dt>输入字符数</dt><dd>{storyCharCount ?? "未报告"}</dd></div>
+          <div><dt>Provider</dt><dd>{textValue(detail?.provider_id) ?? "未报告"}</dd></div>
+          <div><dt>模型</dt><dd>{textValue(detail?.model_id) ?? "未报告"}</dd></div>
+        </dl>
+        {firstErrors.length > 0 && (
+          <div className="attempt-errors">
+            <strong>首次输出</strong>
+            <ul>{firstErrors.map((item, index) => <li key={index}>{attemptErrorText(item)}</li>)}</ul>
+          </div>
+        )}
+        {repairErrors.length > 0 && (
+          <div className="attempt-errors">
+            <strong>唯一一次修复输出</strong>
+            <ul>{repairErrors.map((item, index) => <li key={index}>{attemptErrorText(item)}</li>)}</ul>
+          </div>
+        )}
+        {combinedErrors.length > 0 && (
+          <div className="attempt-errors">
+            <strong>校验错误</strong>
+            <ul>{combinedErrors.map((item, index) => <li key={index}>{attemptErrorText(item)}</li>)}</ul>
+          </div>
+        )}
+        <div className="failure-suggestions">
+          <strong>建议</strong>
+          {suggestions.length > 0 ? (
+            <ul>{suggestions.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          ) : (
+            <p>可手动重试；若重复失败，请查看后端保存的校验报告。</p>
+          )}
+        </div>
+      </details>
+      <button className="button button-danger" onClick={onRetry} disabled={retrying}>
+        {retrying ? "正在创建重试任务…" : "手动重试"}
+      </button>
+    </div>
+  );
+}
+
+function jobValidationWarnings(job: GenerationJob | null) {
+  const resultWarnings = recordValue(job?.result_json?.script_validation_warnings);
+  const trace = recordValue(job?.result_json?.script_trace);
+  const traceWarnings = recordValue(trace?.validation_warnings);
+  const warnings = resultWarnings ?? traceWarnings;
+  return {
+    unusedSceneIds: stringList(warnings?.unused_scene_ids),
+    unusedCharacterIds: stringList(warnings?.unused_character_ids),
+  };
+}
+
+function jobScriptProvider(job: GenerationJob | null): string | null {
+  if (!job) return null;
+  return (
+    textValue(job.request_json?.script_provider) ??
+    textValue(job.result_json?.script_provider) ??
+    textValue(job.provider_id)
+  );
+}
+
+function jobModelId(job: GenerationJob | null): string | null {
+  if (!job) return null;
+  const scriptTrace = recordValue(job.result_json?.script_trace);
+  return (
+    textValue(job.result_json?.script_model_id) ??
+    textValue(scriptTrace?.model)
+  );
+}
+
+function formatCheckedAt(value: string | null | undefined): string {
+  if (!value) return "尚未检查";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
+}
+
+function providerName(providerId: ScriptProviderId): string {
+  return providerId === "mock" ? "Mock 离线保底" : "本地 Qwen（llama.cpp）";
+}
+
+function shotNumber(shot: PresentedShot, fallback: number): number {
+  return shot.index ?? shot.shot_index ?? shot.sequence_no ?? fallback;
+}
+
 function JobPanel({
   job,
   retrying,
   onRetry,
   onViewResult,
+  configuredModelId,
+  actualShotCount,
 }: {
   job: GenerationJob;
   retrying: boolean;
   onRetry: () => void;
   onViewResult: () => void;
+  configuredModelId?: string | null;
+  actualShotCount?: number;
 }) {
   const progress = Math.max(0, Math.min(100, Math.round(job.progress ?? 0)));
+  const tracedModelId = jobModelId(job);
+  const modelLabel =
+    tracedModelId ??
+    (configuredModelId ? `${configuredModelId}（配置值，任务尚未报告）` : "任务尚未报告");
+  const desired = jobDesiredShotCount(job);
+  const finalShotCount = jobActualShotCount(job, actualShotCount);
+  const storyCharCount = jobStoryCharCount(job);
+  const repairUsed = jobRepairUsed(job);
+  const normalization = jobDurationNormalization(job);
+  const normalizationApplied =
+    normalization?.normalized === true || normalization?.applied === true;
+  const originalDurations = Array.isArray(normalization?.original_durations)
+    ? normalization.original_durations.filter((item): item is number => typeof item === "number")
+    : [];
+  const normalizedDurationValues =
+    normalization?.normalized_durations ?? normalization?.final_durations;
+  const finalDurations = Array.isArray(normalizedDurationValues)
+    ? normalizedDurationValues.filter((item): item is number => typeof item === "number")
+    : [];
+  const originalTotal =
+    numberValue(normalization?.original_total) ??
+    numberValue(normalization?.original_total_seconds);
+  const normalizedTotal =
+    numberValue(normalization?.normalized_total) ??
+    numberValue(normalization?.final_total_seconds);
+  const warnings = jobValidationWarnings(job);
+  const plannedDuration = numberValue(job.result_json?.planned_duration_seconds);
+  const encodedDuration = numberValue(job.result_json?.encoded_duration_seconds);
+  const durationDelta = numberValue(job.result_json?.duration_delta_seconds);
+  const durationTolerance = numberValue(job.result_json?.duration_tolerance_seconds);
+  const mediaDurationValidation = textValue(job.result_json?.duration_validation);
   return (
     <section className={`job-panel job-${job.status.toLowerCase()}`} aria-live="polite">
       <div className="job-heading">
@@ -89,26 +457,205 @@ function JobPanel({
         <span style={{ width: `${progress}%` }} />
       </div>
       <p className="job-meta">
-        任务 {job.id.slice(0, 8)} · Provider：{job.provider_id ?? "mock"}
+        任务 {job.id.slice(0, 8)} · 剧本 Provider：{jobScriptProvider(job) ?? "未报告"}
+        {` · 模型：${modelLabel}`}
       </p>
+      <dl className="job-facts">
+        <div><dt>本次镜头要求</dt><dd>{shotCountLabel(desired)}</dd></div>
+        <div><dt>最终实际镜头</dt><dd>{finalShotCount === null ? "生成后报告" : `${finalShotCount} 个`}</dd></div>
+        <div><dt>故事字符数</dt><dd>{storyCharCount ?? "未报告"}</dd></div>
+        <div>
+          <dt>LLM 修复</dt>
+          <dd>{repairUsed === null ? "未报告" : repairUsed ? "已使用唯一一次修复" : "未使用"}</dd>
+        </div>
+        <div>
+          <dt>时长归一化</dt>
+          <dd>
+            {normalization
+              ? normalizationApplied
+                ? "已执行"
+                : "未执行"
+              : "未报告"}
+          </dd>
+        </div>
+        <div><dt>计划时长</dt><dd>{plannedDuration === null ? "未报告" : `${plannedDuration.toFixed(3)} 秒`}</dd></div>
+        <div><dt>编码时长</dt><dd>{encodedDuration === null ? "未报告" : `${encodedDuration.toFixed(3)} 秒`}</dd></div>
+      </dl>
+      {mediaDurationValidation === "passed_with_media_tolerance" &&
+        plannedDuration !== null && encodedDuration !== null &&
+        durationDelta !== null && durationTolerance !== null && (
+          <p className="job-hint">
+            计划时长 {plannedDuration.toFixed(3)} 秒，编码时长 {encodedDuration.toFixed(3)} 秒；
+            {Math.round(Math.abs(durationDelta) * 1000)} 毫秒差异来自媒体帧量化，
+            在 ±{durationTolerance.toFixed(3)} 秒容差内，验收通过。
+          </p>
+        )}
+      {normalizationApplied && (
+        <div className="normalization-note" role="status">
+          <strong>已进行确定性时长归一化。</strong>
+          {textValue(normalization?.reason) && <span>原因：{textValue(normalization?.reason)}</span>}
+          {(originalDurations.length > 0 || finalDurations.length > 0) && (
+            <span>
+              {originalDurations.length > 0 ? `原始 ${originalDurations.join(" / ")} 秒` : "原始时长未报告"}
+              {" → "}
+              {finalDurations.length > 0 ? `最终 ${finalDurations.join(" / ")} 秒` : "最终时长未报告"}
+            </span>
+          )}
+          {(originalTotal !== null || normalizedTotal !== null) && (
+            <span>
+              总时长：{originalTotal ?? "未报告"} 秒 → {normalizedTotal ?? "未报告"} 秒
+            </span>
+          )}
+        </div>
+      )}
+      {(warnings.unusedSceneIds.length > 0 || warnings.unusedCharacterIds.length > 0) && (
+        <p className="job-warning">
+          非阻断警告：
+          {warnings.unusedSceneIds.length > 0 && `${warnings.unusedSceneIds.length} 个未使用场景`}
+          {warnings.unusedSceneIds.length > 0 && warnings.unusedCharacterIds.length > 0 && "，"}
+          {warnings.unusedCharacterIds.length > 0 && `${warnings.unusedCharacterIds.length} 个未使用角色`}
+          。
+        </p>
+      )}
       {job.status === "QUEUED" && (
         <p className="job-hint">任务已入队。请确认独立 Worker 正在运行。</p>
       )}
       {job.status === "FAILED" && (
-        <div className="failure-box">
-          <p>{job.error_message || "生成失败，后端没有返回详细信息。"}</p>
-          <button className="button button-danger" onClick={onRetry} disabled={retrying}>
-            {retrying ? "正在创建重试任务…" : "手动重试"}
-          </button>
-        </div>
+        <FailureCard
+          detail={jobGenerationError(job)}
+          fallbackMessage={job.error_message}
+          retrying={retrying}
+          onRetry={onRetry}
+        />
       )}
       {job.status === "SUCCEEDED" && (
         <div className="success-box">
-          <p>短片已经生成完成，可在下方播放和下载。</p>
+          <p>{generationSuccessSummary(job, actualShotCount)}</p>
           <button className="button button-success" type="button" onClick={onViewResult}>
             查看成片
           </button>
         </div>
+      )}
+    </section>
+  );
+}
+
+function ProviderSelector({
+  value,
+  status,
+  error,
+  checking,
+  disabled,
+  onChange,
+  onRefresh,
+}: {
+  value: ScriptProviderId;
+  status: ProvidersStatus | null;
+  error: string;
+  checking: boolean;
+  disabled: boolean;
+  onChange: (providerId: ScriptProviderId) => void;
+  onRefresh: () => void;
+}) {
+  const descriptors = new Map(
+    (status?.providers ?? []).map((provider) => [provider.provider_id, provider]),
+  );
+  const llamaAvailable = descriptors.get("llamacpp")?.available === true && !error;
+  const initialCheckInProgress = checking && status === null;
+  const providerIds: ScriptProviderId[] = ["mock", "llamacpp"];
+
+  return (
+    <section className="provider-control" aria-labelledby="provider-title">
+      <div className="provider-control-heading">
+        <div>
+          <p className="eyebrow">剧本模型</p>
+          <h4 id="provider-title">选择 Script Provider</h4>
+        </div>
+        <button
+          className="button button-ghost button-small"
+          type="button"
+          onClick={onRefresh}
+          disabled={checking || disabled}
+        >
+          {checking ? "检查中…" : "重新检查"}
+        </button>
+      </div>
+
+      <label className="provider-select-label">
+        本次生成使用
+        <select
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value as ScriptProviderId)}
+          aria-describedby="provider-help"
+        >
+          <option value="mock">Mock（离线保底）</option>
+          <option value="llamacpp" disabled={!llamaAvailable || checking}>
+            本地 Qwen（llama.cpp）
+            {llamaAvailable ? "" : initialCheckInProgress ? " — 检查中" : " — 离线"}
+          </option>
+        </select>
+      </label>
+
+      <div className="provider-status-grid" aria-live="polite">
+        {providerIds.map((providerId) => {
+          const descriptor: ScriptProviderStatus | undefined = descriptors.get(providerId);
+          const available = providerId === "mock" ? true : descriptor?.available === true && !error;
+          const stateLabel =
+            providerId === "mock"
+              ? "离线可用"
+              : initialCheckInProgress
+                ? "检查中"
+                : available
+                  ? "在线"
+                  : descriptor?.configured === false
+                    ? "离线（未配置）"
+                    : "离线";
+          return (
+            <article
+              className={`provider-status-card ${
+                initialCheckInProgress && providerId === "llamacpp"
+                  ? "is-checking"
+                  : available
+                    ? "is-available"
+                    : "is-unavailable"
+              }`}
+              key={providerId}
+            >
+              <div>
+                <strong>{descriptor?.display_name ?? providerName(providerId)}</strong>
+                {status?.default_script_provider === providerId && (
+                  <span className="provider-default">默认</span>
+                )}
+              </div>
+              <span className="provider-state">{stateLabel}</span>
+              <small>Provider ID：{providerId}</small>
+              <small>模型 ID：{descriptor?.model_id ?? (providerId === "mock" ? "N/A（Mock）" : "未报告")}</small>
+              <small>
+                配置：
+                {descriptor?.configured === true
+                  ? "已配置"
+                  : descriptor?.configured === false
+                    ? "未配置"
+                    : "未报告"}
+              </small>
+              <small>来源：{descriptor?.source_type ?? (providerId === "mock" ? "MOCK" : "未报告")}</small>
+              {descriptor?.detail && <small className="provider-detail">{descriptor.detail}</small>}
+            </article>
+          );
+        })}
+      </div>
+
+      <p className="provider-check-meta" id="provider-help">
+        API 默认：{status?.default_script_provider ?? "未报告"} · 最近检查：
+        {formatCheckedAt(status?.checked_at)}
+      </p>
+      {error && <p className="provider-warning">{error}；当前仅允许 Mock 离线保底。</p>}
+      {!checking && !llamaAvailable && (
+        <p className="provider-command">
+          本地 Qwen 当前离线，不会提交 llamacpp 任务。启动后重新检查：
+          <code>{LLM_START_COMMAND}</code>
+        </p>
       )}
     </section>
   );
@@ -156,6 +703,11 @@ function StageNavigation({
 export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthError, setHealthError] = useState("");
+  const [providersStatus, setProvidersStatus] = useState<ProvidersStatus | null>(null);
+  const [providerError, setProviderError] = useState("");
+  const [providerChecking, setProviderChecking] = useState(false);
+  const [scriptProvider, setScriptProvider] = useState<ScriptProviderId>("mock");
+  const [desiredShotCount, setDesiredShotCount] = useState<DesiredShotCount>(4);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
@@ -164,6 +716,8 @@ export default function App() {
   const [story, setStory] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [generationRequestError, setGenerationRequestError] =
+    useState<GenerationErrorDetail | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [deleteCandidate, setDeleteCandidate] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -176,6 +730,7 @@ export default function App() {
   const resultTitleRef = useRef<HTMLHeadingElement>(null);
   const creationInFlightRef = useRef(false);
   const deletionInFlightRef = useRef(false);
+  const providerSelectionTouchedRef = useRef(false);
   const pendingNavigationRef = useRef<"project" | "result" | null>(null);
   const handledSucceededJobsRef = useRef(new Set<string>());
 
@@ -203,6 +758,30 @@ export default function App() {
     const items = await listProjects();
     setProjects(items);
     return items;
+  }, []);
+
+  const refreshProviderStatus = useCallback(async (): Promise<ProvidersStatus | null> => {
+    setProviderChecking(true);
+    setProviderError("");
+    try {
+      const value = await getProviders();
+      setProvidersStatus(value);
+      if (!providerSelectionTouchedRef.current && value.default_script_provider) {
+        const defaultDescriptor = value.providers.find(
+          (provider) => provider.provider_id === value.default_script_provider,
+        );
+        if (value.default_script_provider === "mock" || defaultDescriptor?.available === true) {
+          setScriptProvider(value.default_script_provider);
+        }
+      }
+      return value;
+    } catch (cause) {
+      setProvidersStatus(null);
+      setProviderError(`Provider 状态检查失败：${readableError(cause)}`);
+      return null;
+    } finally {
+      setProviderChecking(false);
+    }
   }, []);
 
   const refreshDetail = useCallback(async (projectId: string) => {
@@ -233,6 +812,10 @@ export default function App() {
   }, [refreshProjects]);
 
   useEffect(() => {
+    void refreshProviderStatus();
+  }, [refreshProviderStatus]);
+
+  useEffect(() => {
     if (!selectedId) {
       setDetail(null);
       return;
@@ -240,6 +823,7 @@ export default function App() {
     setDetail(null);
     setActiveJob(null);
     setError("");
+    setGenerationRequestError(null);
     refreshDetail(selectedId).catch((cause: unknown) => setError(readableError(cause)));
   }, [refreshDetail, selectedId]);
 
@@ -260,7 +844,7 @@ export default function App() {
             pendingNavigationRef.current = "result";
             setNotice({
               kind: "success",
-              message: "短片已经生成完成，可在下方播放和下载。",
+              message: generationSuccessSummary(job),
               action: "result",
             });
           }
@@ -306,12 +890,18 @@ export default function App() {
 
   const submitProject = async (event: FormEvent) => {
     event.preventDefault();
-    if (
-      creationInFlightRef.current ||
-      busy !== null ||
-      !title.trim() ||
-      !story.trim()
-    ) {
+    if (creationInFlightRef.current || busy !== null) return;
+    if (!title.trim()) {
+      setError("请输入项目标题。");
+      return;
+    }
+    const currentStoryCharCount = characterCount(story);
+    if (currentStoryCharCount < STORY_MIN_CHARS) {
+      setError(`故事正文至少需要 ${STORY_MIN_CHARS} 个字符，当前为 ${currentStoryCharCount} 个。`);
+      return;
+    }
+    if (currentStoryCharCount > STORY_MAX_CHARS) {
+      setError(`故事正文最多允许 ${STORY_MAX_CHARS} 个字符，当前为 ${currentStoryCharCount} 个。`);
       return;
     }
     creationInFlightRef.current = true;
@@ -340,6 +930,7 @@ export default function App() {
     setError("");
     setTitle(PAPER_CRANE_TITLE);
     setStory(PAPER_CRANE_STORY);
+    setDesiredShotCount(4);
     setNotice({
       kind: "info",
       message: "演示故事已填入，请确认内容后点击创建项目。",
@@ -385,15 +976,54 @@ export default function App() {
 
   const startGeneration = async () => {
     if (!selectedId) return;
+    const projectForGeneration =
+      detail?.project ?? projects.find((project) => project.id === selectedId);
+    const selectedStoryCharCount = characterCount(projectForGeneration?.story ?? "");
+    if (
+      selectedStoryCharCount < STORY_MIN_CHARS ||
+      selectedStoryCharCount > STORY_MAX_CHARS
+    ) {
+      setGenerationRequestError({
+        code: "STORY_LENGTH_OUT_OF_RANGE",
+        stage: "INPUT_VALIDATION",
+        summary: `故事正文必须为 ${STORY_MIN_CHARS}—${STORY_MAX_CHARS} 个字符，当前为 ${selectedStoryCharCount} 个。`,
+        story_char_count: selectedStoryCharCount,
+        desired_shot_count: desiredShotCount,
+        suggestions: ["请返回创建区，使用符合长度要求的故事新建项目。"],
+      });
+      setError("");
+      return;
+    }
     setBusy("generate");
     setError("");
+    setGenerationRequestError(null);
     setNotice(null);
     try {
-      const job = await generateProject(selectedId);
+      if (scriptProvider === "llamacpp") {
+        const latestStatus = await refreshProviderStatus();
+        const localQwenReady = latestStatus?.providers.some(
+          (provider) => provider.provider_id === "llamacpp" && provider.available,
+        );
+        if (!localQwenReady) {
+          setError(`本地 Qwen 当前离线，未提交生成任务。请先运行 ${LLM_START_COMMAND}，再重新检查。`);
+          return;
+        }
+      }
+      const job = await generateProject(selectedId, scriptProvider, desiredShotCount);
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
-      setError(readableError(cause));
+      if (cause instanceof ApiError) {
+        const structured = generationErrorValue(cause.detail);
+        if (structured) {
+          setGenerationRequestError(structured);
+          setError("");
+        } else {
+          setError(cause.message);
+        }
+      } else {
+        setError(readableError(cause));
+      }
     } finally {
       setBusy(null);
     }
@@ -402,6 +1032,7 @@ export default function App() {
   const retryGeneration = async (failedJob: GenerationJob) => {
     setBusy("retry");
     setError("");
+    setGenerationRequestError(null);
     setNotice(null);
     try {
       const job = await retryJob(failedJob.id);
@@ -415,6 +1046,13 @@ export default function App() {
   };
 
   const selectedProject = detail?.project ?? projects.find((item) => item.id === selectedId) ?? null;
+  const formStoryCharCount = characterCount(story);
+  const formStoryLengthValid =
+    formStoryCharCount >= STORY_MIN_CHARS && formStoryCharCount <= STORY_MAX_CHARS;
+  const formStoryLengthRecommended =
+    formStoryCharCount >= STORY_RECOMMENDED_MIN_CHARS &&
+    formStoryCharCount <= STORY_RECOMMENDED_MAX_CHARS;
+  const selectedStoryCharCount = selectedProject ? characterCount(selectedProject.story) : 0;
   const latestVisibleJob = activeJob ?? detail?.recent_jobs[0] ?? null;
   const media = useMemo(() => {
     if (!selectedId || !detail?.latest_export) return null;
@@ -422,6 +1060,65 @@ export default function App() {
   }, [detail?.latest_export, selectedId]);
   const generationInProgress =
     activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING";
+  const providerDescriptors = providersStatus?.providers ?? [];
+  const selectedProviderDescriptor = providerDescriptors.find(
+    (provider) => provider.provider_id === scriptProvider,
+  );
+  const llamaAvailable = providerDescriptors.some(
+    (provider) => provider.provider_id === "llamacpp" && provider.available,
+  ) && !providerError;
+  const structuredScript = detail?.project.script_json ?? null;
+  const scriptCharacters = Array.isArray(structuredScript?.characters)
+    ? structuredScript.characters
+    : [];
+  const scriptScenes = Array.isArray(structuredScript?.scenes) ? structuredScript.scenes : [];
+  const scriptShots: PresentedShot[] =
+    Array.isArray(structuredScript?.shots) && structuredScript.shots.length > 0
+      ? structuredScript.shots
+      : (detail?.shots ?? []).map((shot) => {
+          const parameters = recordValue(shot.parameters_json);
+          return {
+            id: shot.id,
+            index: shot.shot_index,
+            title: shot.title,
+            visual_description: shot.visual_description,
+            narration: shot.narration,
+            duration_seconds: shot.duration_seconds,
+            camera:
+              textValue(parameters?.camera) ??
+              textValue(parameters?.camera_motion) ??
+              textValue(parameters?.motion) ??
+              undefined,
+            image_prompt: textValue(parameters?.image_prompt) ?? undefined,
+            provider_id: shot.provider_id,
+            generation_parameters: parameters ?? undefined,
+          };
+        });
+  const exportJob = detail?.latest_export
+    ? detail.recent_jobs.find((job) => job.id === detail.latest_export?.job_id) ?? null
+    : null;
+  const scriptJob =
+    detail?.recent_jobs.find(
+      (job) => recordValue(job.result_json?.script_trace) !== null,
+    ) ?? null;
+  const scriptProviderUsed = jobScriptProvider(exportJob) ?? "未报告";
+  const scriptModelUsed = jobModelId(exportJob) ?? "未报告";
+  const scriptSourceUsed = textValue(exportJob?.result_json?.script_source_type) ?? "未报告";
+  const imageProviderUsed = textValue(exportJob?.result_json?.image_provider) ?? "未报告";
+  const audioProviderUsed = textValue(exportJob?.result_json?.audio_provider) ?? "未报告";
+  const videoSourceUsed =
+    textValue(exportJob?.result_json?.video_source_type) ??
+    textValue(exportJob?.result_json?.source_type) ??
+    "未报告";
+  const exportDesiredShotCount = jobDesiredShotCount(exportJob);
+  const exportActualShotCount = jobActualShotCount(exportJob, scriptShots.length);
+  const exportRepairUsed = jobRepairUsed(exportJob);
+  const exportDurationNormalization = jobDurationNormalization(exportJob);
+  const scriptWarnings = jobValidationWarnings(exportJob ?? scriptJob ?? latestVisibleJob);
+  const currentJobProviderId = jobScriptProvider(latestVisibleJob);
+  const currentJobProviderDescriptor = providerDescriptors.find(
+    (provider) => provider.provider_id === currentJobProviderId,
+  );
   const currentStage: SectionName =
     latestVisibleJob?.status === "QUEUED" ||
     latestVisibleJob?.status === "RUNNING" ||
@@ -429,7 +1126,7 @@ export default function App() {
       ? "project"
       : media
         ? "result"
-        : detail?.shots.length
+        : scriptShots.length
           ? "shots"
           : selectedProject
             ? "project"
@@ -437,13 +1134,13 @@ export default function App() {
   const completedStages: Record<SectionName, boolean> = {
     create: Boolean(selectedProject),
     project: latestVisibleJob?.status === "SUCCEEDED" || Boolean(media),
-    shots: Boolean(detail?.shots.length),
+    shots: Boolean(scriptShots.length),
     result: Boolean(media),
   };
   const availableStages: Record<SectionName, boolean> = {
     create: true,
     project: true,
-    shots: Boolean(detail?.shots.length),
+    shots: Boolean(scriptShots.length),
     result: Boolean(media),
   };
 
@@ -460,16 +1157,16 @@ export default function App() {
           </a>
           <div className={`health-pill ${healthError ? "is-offline" : ""}`}>
             <span className="health-dot" />
-            {healthError ? "后端未连接" : `M2 · ${displayHealth(health)}`}
+            {healthError ? "后端未连接" : `M3 · ${displayHealth(health)}`}
           </div>
         </nav>
 
         <div className="hero-copy" id="top">
-          <p className="kicker">MOCK PROVIDER × FFMPEG</p>
+          <p className="kicker">SCRIPT PROVIDER × FFMPEG</p>
           <h1>把一个故事，折成一段<br />真正可播放的短片。</h1>
           <p>
-            当前纵向链路使用确定性 Mock 素材。项目、任务、镜头与成片均由后端持久化，
-            Worker 在 HTTP 请求之外完成渲染。
+            剧本可选择 Mock 离线保底或本地 Qwen；图像与音频仍使用 Mock，视频由
+            FFmpeg 确定性兜底生成，Worker 在 HTTP 请求之外完成渲染。
           </p>
           <a className="text-link" href="#workspace">开始创建 <span>↓</span></a>
         </div>
@@ -527,18 +1224,51 @@ export default function App() {
                 />
               </label>
               <label>
-                故事梗概
+                故事正文（这里只写故事）
                 <textarea
                   value={story}
-                  onChange={(event) => setStory(event.target.value)}
-                  maxLength={4000}
+                  onChange={(event) => {
+                    setStory(event.target.value);
+                    setError("");
+                  }}
+                  minLength={STORY_MIN_CHARS}
+                  maxLength={STORY_MAX_CHARS}
                   rows={6}
                   required
-                  placeholder="写下一个可以拆成四个镜头的短故事……"
+                  aria-invalid={story.length > 0 && !formStoryLengthValid}
+                  aria-describedby="story-length-help"
+                  placeholder="请只描述人物、事件与结局；镜头数量在生成区域单独选择。"
                 />
+                <span
+                  className={`story-length ${
+                    formStoryLengthValid
+                      ? formStoryLengthRecommended
+                        ? "is-recommended"
+                        : "is-valid"
+                      : story.length > 0
+                        ? "is-invalid"
+                        : ""
+                  }`}
+                  id="story-length-help"
+                >
+                  {formStoryCharCount} / {STORY_MAX_CHARS} 字符 · 推荐{" "}
+                  {STORY_RECOMMENDED_MIN_CHARS}—{STORY_RECOMMENDED_MAX_CHARS}，硬限制{" "}
+                  {STORY_MIN_CHARS}—{STORY_MAX_CHARS}
+                  {formStoryLengthValid
+                    ? formStoryLengthRecommended
+                      ? " · 推荐长度"
+                      : " · 长度合法"
+                    : story.length > 0
+                      ? " · 长度不合法"
+                      : ""}
+                </span>
               </label>
               <div className="form-actions">
-                <button className="button button-primary" type="submit" disabled={busy !== null}>
+                <button
+                  className="button button-primary"
+                  type="submit"
+                  disabled={busy !== null || !title.trim() || !formStoryLengthValid}
+                >
                   {busy === "create" ? "正在创建……" : "创建项目"}
                 </button>
                 <button
@@ -554,12 +1284,12 @@ export default function App() {
             <aside className="workflow-card">
               <p className="eyebrow">本次生成路径</p>
               <ol>
-                <li><span>1</span>Mock 剧本拆成 4 个镜头</li>
+                <li><span>1</span>所选剧本 Provider 生成 3—5 个镜头</li>
                 <li><span>2</span>Worker 领取 SQLite 任务</li>
                 <li><span>3</span>FFmpeg 合成画面、字幕与音频</li>
                 <li><span>4</span>浏览器播放并下载 MP4</li>
               </ol>
-              <p className="offline-note">无需网络、API Key 或模型权重</p>
+              <p className="offline-note">Mock 保底无需网络、API Key 或模型权重</p>
             </aside>
           </div>
         </section>
@@ -670,21 +1400,93 @@ export default function App() {
                       className="button button-primary"
                       type="button"
                       onClick={startGeneration}
-                      disabled={busy !== null || generationInProgress}
+                      disabled={
+                        busy !== null ||
+                        generationInProgress ||
+                        (scriptProvider === "llamacpp" && (!llamaAvailable || providerChecking))
+                      }
                     >
                       {busy === "generate"
                         ? "正在提交…"
                         : generationInProgress
                           ? "任务进行中"
-                          : detail?.latest_export
-                            ? "再次生成"
-                            : "生成 Mock 短片"}
+                          : scriptProvider === "llamacpp" && !llamaAvailable
+                            ? "本地 Qwen 未启动"
+                            : detail?.latest_export
+                              ? `再次生成（${selectedProviderDescriptor?.display_name ?? providerName(scriptProvider)}）`
+                              : scriptProvider === "mock"
+                                ? "生成 Mock 短片"
+                                : "用本地 Qwen 生成"}
                     </button>
                   </div>
                   <p className="story-preview">{selectedProject.story}</p>
-                  {detail && detail.shots.length === 0 && !latestVisibleJob && (
+                  <ProviderSelector
+                    value={scriptProvider}
+                    status={providersStatus}
+                    error={providerError}
+                    checking={providerChecking}
+                    disabled={busy !== null || generationInProgress}
+                    onChange={(providerId) => {
+                      providerSelectionTouchedRef.current = true;
+                      setScriptProvider(providerId);
+                      setError("");
+                      setGenerationRequestError(null);
+                      setNotice(null);
+                    }}
+                    onRefresh={() => void refreshProviderStatus()}
+                  />
+                  <section className="generation-options" aria-labelledby="shot-count-title">
+                    <label className="shot-count-control">
+                      <span id="shot-count-title">本次生成的镜头数量</span>
+                      <select
+                        value={desiredShotCount === null ? "auto" : String(desiredShotCount)}
+                        disabled={busy !== null || generationInProgress}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setDesiredShotCount(value === "auto" ? null : Number(value) as 3 | 4 | 5);
+                          setGenerationRequestError(null);
+                          setError("");
+                        }}
+                      >
+                        <option value="auto">自动（接受 3—5 个）</option>
+                        <option value="3">固定 3 个</option>
+                        <option value="4">固定 4 个（默认）</option>
+                        <option value="5">固定 5 个</option>
+                      </select>
+                    </label>
+                    <div className="generation-option-help">
+                      <p>
+                        {desiredShotCount === null
+                          ? "自动模式接受模型生成 3—5 个镜头，并在完成后显示实际数量。"
+                          : `固定模式要求模型最终严格生成 ${desiredShotCount} 个镜头。`}
+                      </p>
+                      <p>
+                        当前项目故事：{selectedStoryCharCount} 个字符 ·
+                        {selectedStoryCharCount >= STORY_MIN_CHARS &&
+                        selectedStoryCharCount <= STORY_MAX_CHARS
+                          ? " 长度合法"
+                          : ` 不符合 ${STORY_MIN_CHARS}—${STORY_MAX_CHARS} 字符硬限制`}
+                      </p>
+                    </div>
+                  </section>
+                  {generationRequestError && (
+                    <section className="job-panel job-failed request-failure" aria-live="polite">
+                      <div className="job-heading">
+                        <div>
+                          <span className="eyebrow">生成请求</span>
+                          <h3>未创建任务</h3>
+                        </div>
+                      </div>
+                      <FailureCard
+                        detail={generationRequestError}
+                        retrying={busy === "generate"}
+                        onRetry={() => void startGeneration()}
+                      />
+                    </section>
+                  )}
+                  {detail && scriptShots.length === 0 && !latestVisibleJob && (
                     <p className="inline-empty">
-                      尚未生成分镜。提交任务后，独立 Worker 会写入 4 个结构化镜头。
+                      尚未生成剧本。提交任务后，独立 Worker 会写入角色、场景和 3—5 个结构化镜头。
                     </p>
                   )}
                   {latestVisibleJob && (
@@ -693,6 +1495,10 @@ export default function App() {
                       retrying={busy === "retry"}
                       onRetry={() => retryGeneration(latestVisibleJob)}
                       onViewResult={() => scrollToSection("result")}
+                      configuredModelId={currentJobProviderDescriptor?.model_id}
+                      actualShotCount={
+                        latestVisibleJob.status === "SUCCEEDED" ? scriptShots.length : undefined
+                      }
                     />
                   )}
                 </>
@@ -701,7 +1507,7 @@ export default function App() {
           </div>
         </section>
 
-        {detail && detail.shots.length > 0 && (
+        {detail && scriptShots.length > 0 && (
           <section
             className="section shots-section"
             id="shots-section"
@@ -711,24 +1517,117 @@ export default function App() {
             <div className="section-heading compact">
               <span className="section-number">03</span>
               <div>
-                <p className="eyebrow">结构化分镜</p>
-                <h2>{detail.shots.length} 个镜头</h2>
+                <p className="eyebrow">结构化剧本</p>
+                <h2>{scriptShots.length} 个镜头</h2>
               </div>
             </div>
+
+            <div className="script-overview">
+              <div className="script-overview-heading">
+                <div>
+                  <p className="eyebrow">SCRIPT.V1</p>
+                  <h3>{structuredScript?.title ?? detail.project.title}</h3>
+                  <p>{structuredScript?.synopsis ?? "当前剧本未提供独立摘要。"}</p>
+                </div>
+                <dl className="script-trace">
+                  <div><dt>Schema</dt><dd>{structuredScript?.schema_version ?? "兼容旧结构"}</dd></div>
+                  <div><dt>Provider</dt><dd>{jobScriptProvider(scriptJob) ?? "未报告"}</dd></div>
+                  <div><dt>模型</dt><dd>{jobModelId(scriptJob) ?? "任务未报告"}</dd></div>
+                </dl>
+              </div>
+              {!structuredScript && (
+                <p className="script-compatibility-note">
+                  这是 M2 兼容项目：未保存完整 script.v1，以下镜头由 Shot 表兼容展示。
+                </p>
+              )}
+              {(scriptWarnings.unusedSceneIds.length > 0 ||
+                scriptWarnings.unusedCharacterIds.length > 0) && (
+                <div className="script-validation-warning" role="status">
+                  {scriptWarnings.unusedSceneIds.length > 0 && (
+                    <p>
+                      剧本包含 {scriptWarnings.unusedSceneIds.length} 个当前分镜未使用的场景：
+                      <code>{scriptWarnings.unusedSceneIds.join("、")}</code>
+                    </p>
+                  )}
+                  {scriptWarnings.unusedCharacterIds.length > 0 && (
+                    <p>
+                      剧本包含 {scriptWarnings.unusedCharacterIds.length} 个当前分镜未使用的角色：
+                      <code>{scriptWarnings.unusedCharacterIds.join("、")}</code>
+                    </p>
+                  )}
+                </div>
+              )}
+              <div className="script-entity-grid">
+                <section className="script-entity-panel">
+                  <h4>角色 · {scriptCharacters.length}</h4>
+                  {scriptCharacters.length > 0 ? (
+                    <ul>
+                      {scriptCharacters.map((character, index) => (
+                        <li key={character.id || `${character.name}-${index}`}>
+                          <strong>
+                            {character.name}
+                            {` · ${character.role}`}
+                          </strong>
+                          <span>
+                            {[character.appearance, character.personality, character.costume].join("；")}
+                          </span>
+                          <small>一致性提示：{character.consistency_prompt}</small>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>当前剧本未提供角色列表。</p>
+                  )}
+                </section>
+                <section className="script-entity-panel">
+                  <h4>场景 · {scriptScenes.length}</h4>
+                  {scriptScenes.length > 0 ? (
+                    <ul>
+                      {scriptScenes.map((scene, index) => (
+                        <li key={scene.id || `${scene.name}-${index}`}>
+                          <strong>{scene.name}</strong>
+                          <span>{scene.description}</span>
+                          <small>{scene.time} · {scene.lighting}</small>
+                          <small>一致性提示：{scene.consistency_prompt}</small>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>当前剧本未提供场景列表。</p>
+                  )}
+                </section>
+              </div>
+            </div>
+
             <div className="shot-grid">
-              {[...detail.shots]
-                .sort((left, right) => left.shot_index - right.shot_index)
+              {[...scriptShots]
+                .sort((left, right) => shotNumber(left, 0) - shotNumber(right, 0))
                 .map((shot, index) => (
-                  <article className="shot-card" key={shot.id}>
+                  <article
+                    className="shot-card"
+                    key={shot.id ?? shot.shot_id ?? `${shot.title}-${index}`}
+                  >
                     <div className="shot-art" data-shot={(index % 4) + 1}>
-                      <span>{String(index + 1).padStart(2, "0")}</span>
+                      <span>{String(shotNumber(shot, index + 1)).padStart(2, "0")}</span>
                       <i />
                     </div>
                     <div className="shot-copy">
-                      <p className="eyebrow">{shot.duration_seconds}s · {shot.provider_id}</p>
+                      <p className="eyebrow">
+                        {shot.duration_seconds}s · {shot.provider_id ?? jobScriptProvider(scriptJob) ?? "未报告"}
+                      </p>
                       <h3>{shot.title}</h3>
                       <p>{shot.visual_description}</p>
                       <blockquote>“{shot.narration}”</blockquote>
+                      <dl className="shot-details">
+                        <div>
+                          <dt>Camera</dt>
+                          <dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd>
+                        </div>
+                        <div>
+                          <dt>Image prompt</dt>
+                          <dd>{shot.image_prompt ?? "未提供"}</dd>
+                        </div>
+                      </dl>
                     </div>
                   </article>
                 ))}
@@ -777,7 +1676,21 @@ export default function App() {
             <div className="result-status-summary" aria-label="成片状态">
               <span className="result-ready">● 已生成</span>
               <span>{detail.latest_export.duration_seconds?.toFixed(2) ?? "—"} 秒</span>
-              <span>{detail.shots.length} 个镜头</span>
+              <span>{scriptShots.length} 个镜头</span>
+              <span>要求：{shotCountLabel(exportDesiredShotCount)}</span>
+              <span>实际：{exportActualShotCount ?? scriptShots.length} 个</span>
+              <span>
+                修复：{exportRepairUsed === null ? "未报告" : exportRepairUsed ? "已使用" : "未使用"}
+              </span>
+              <span>
+                时长归一化：
+                {exportDurationNormalization
+                  ? exportDurationNormalization.normalized || exportDurationNormalization.applied
+                    ? "已执行"
+                    : "未执行"
+                  : "未报告"}
+              </span>
+              <span>剧本：{scriptProviderUsed}</span>
             </div>
             <div className="result-grid">
               <div className="video-frame">
@@ -790,8 +1703,13 @@ export default function App() {
                 <h3>{detail.project.title}</h3>
                 <dl>
                   <div><dt>时长</dt><dd>{detail.latest_export.duration_seconds?.toFixed(2) ?? "—"} 秒</dd></div>
-                  <div><dt>镜头</dt><dd>{detail.shots.length} 个</dd></div>
-                  <div><dt>Provider</dt><dd>mock</dd></div>
+                  <div><dt>镜头</dt><dd>{scriptShots.length} 个</dd></div>
+                  <div><dt>Script Provider</dt><dd title={scriptProviderUsed}>{scriptProviderUsed}</dd></div>
+                  <div><dt>Script Model</dt><dd title={scriptModelUsed}>{scriptModelUsed}</dd></div>
+                  <div><dt>Script Source</dt><dd title={scriptSourceUsed}>{scriptSourceUsed}</dd></div>
+                  <div><dt>Image Provider</dt><dd title={imageProviderUsed}>{imageProviderUsed}</dd></div>
+                  <div><dt>Audio Provider</dt><dd title={audioProviderUsed}>{audioProviderUsed}</dd></div>
+                  <div><dt>Video</dt><dd title={videoSourceUsed}>{videoSourceUsed}</dd></div>
                   <div>
                     <dt>SHA-256</dt>
                     <dd title={detail.latest_export.sha256}>{detail.latest_export.sha256?.slice(0, 12) ?? "—"}…</dd>
@@ -830,8 +1748,8 @@ export default function App() {
       )}
 
       <footer>
-        <span>纸鹤工坊 · M2 最小全栈纵向链路</span>
-        <span>Mock 可运行，Provider 可替换</span>
+        <span>纸鹤工坊 · M3 本地文本模型纵向链路</span>
+        <span>Mock 可离线运行，本地 Qwen 显式选择</span>
       </footer>
     </div>
   );

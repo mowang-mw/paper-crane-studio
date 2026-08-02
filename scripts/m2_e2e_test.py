@@ -202,6 +202,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     manifest_status, manifest, _ = client.request("GET", get_media_url(args.api_base, manifest_url))
     if manifest_status != 200 or not isinstance(manifest, dict):
         raise E2EFailure(f"Manifest download failed with HTTP {manifest_status}")
+    media_spec = manifest.get("media_spec")
+    if not isinstance(media_spec, dict) or not isinstance(
+        media_spec.get("planned_duration_seconds"), (int, float)
+    ):
+        raise E2EFailure("Manifest 缺少 planned_duration_seconds")
 
     with tempfile.TemporaryDirectory(prefix="anime-m2-e2e-") as temporary_directory:
         downloaded_video = Path(temporary_directory) / "paper_crane_m2.mp4"
@@ -211,8 +216,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         probe = verify_media(
             tools,
             downloaded_video,
-            min_duration=20.0,
-            max_duration=40.0,
+            planned_duration_seconds=float(
+                media_spec["planned_duration_seconds"]
+            ),
             expected_width=1280,
             expected_height=720,
             expected_fps=24.0,

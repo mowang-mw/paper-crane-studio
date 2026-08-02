@@ -23,9 +23,11 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 
 ## 当前阶段
 
-**M0、M1 以及 M2 最小全栈纵向链路已经实现。** 浏览器页面可编辑故事；“载入《纸鹤的夜航》Demo”只填充表单，只有“创建项目”才会发出创建请求。FastAPI 只将生成任务写入 SQLite，独立单 Worker 调用 Mock Provider 和 M1 同一套 FFmpeg 媒体函数，最后持久化 4 个镜头、Asset、Export、manifest 和可播放 MP4。前端通过轮询展示四态 Job，并提供项目确认删除、失败后的显式手动重试、阶段导航、视频播放与下载入口。
+**M0、M1、M2 以及 M3 本地真实文本模型纵向链路已经实现。** M3 保留全部 Mock + FFmpeg 离线保底，并接入本地 `Qwen3-4B Q4_K_M`、`llama.cpp` Script Provider、Provider 即时健康检查和前端显式选择。生成任务可选择自动 3—5 镜头或固定 3/4/5 镜头，默认固定 4；故事去除首尾空白后硬限制为 10—3000 字符，界面建议 50—1000 字符。真实模型失败会显示分阶段中文诊断、首次与唯一修复错误及建议，不会静默伪装为 Mock 成功。
 
-本轮自动验证已经覆盖生产构建、API、SQLite 持久化、独立 Worker、真实 FFmpeg 导出、媒体下载、ffprobe 和 SHA-256；最近一次黑盒 E2E 生成了 28.021333 秒、H.264/AAC、1280×720、24 fps 的成片。当前执行环境没有可用浏览器绑定，因此“真实浏览器点击、播放与下载”仍需按下文步骤做一次现场人工确认，不能把 HTTP 媒体验证冒充为浏览器播放验证。M2 仍只使用 Mock Provider，尚未进入 M3 真实模型接入。
+媒体业务时长与编码时长现已分开验收：ScriptV1 计划总时长仍严格限制为 20—40 秒；最终 MP4 允许一个视频帧、一个 AAC 采样帧与小量封装舍入共同决定的量化容差。`MEDIA_RENDER` 失败任务手动重试时会优先从来源 Job 的严格 ScriptV1 与已有 MP4 恢复，不调用 ScriptProvider、不改变镜头，并记录 `resumed_from_stage=MEDIA_RENDER`。自动镜头 Prompt 现明确要求覆盖开端、主要发展和结局；这只是提示增强，尚未实现独立语义覆盖评分。
+
+公共媒体管线现已把每个 `shot.narration` 作为独立 UTF-8 LF 文本文件烧录到对应镜头，并在 Manifest 记录字幕文件、字体和滤镜。最新 M2 黑盒 E2E 生成了 28.021333 秒、H.264/AAC、1280×720、24 fps 成片；真实 M3 固定 4 镜头测试生成 27.979329 秒成片，自动模式生成 3 镜头、20.021333 秒成片。两者均完成完整解码和镜头中点抽帧。当前执行环境仍没有可绑定浏览器实例，因此真实点击、折叠详情、播放和下载需现场人工确认；HTTP/E2E 和抽帧结果没有被冒充为浏览器验证。
 
 调研基线日期为 ****。模型许可、远程 API 型号、价格、额度和地区可用性会变化，在实际接入或公开展示前必须再次核实。
 
@@ -39,7 +41,7 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 | Python | 3.11.15，Conda 环境 `anime-platform` | FastAPI 0.116.1、SQLAlchemy 2.0.43、Pydantic 2.13.4、Uvicorn 0.35.0 已锁定并实测 |
 | Node.js / npm | 24.15.0 / 11.12.1 | `package-lock.json` 已锁定 React 19.2.8、Vite 7.3.6、TypeScript 5.9.3，生产构建通过 |
 | FFmpeg | Conda 环境内 8.0 | 本轮只读预检确认 libx264/libopenh264/h264_nvenc、AAC、drawtext、zoompan、concat、xfade；未发现 subtitles/ass（构建未启用 libass）。基础 PATH 不可见，须激活 `anime-platform` 或配置已验证绝对路径 |
-| 可用模型服务 | 当前无独立文本、图像、视频或语音 API | 全 Mock 离线链路是无条件基线 |
+| 可用模型服务 | 项目内本地 `llama.cpp` + `Qwen3-4B Q4_K_M` 文本链路；无图像、视频或语音模型 API | 本地文本服务必须单独启动；全 Mock 离线链路仍是无条件基线 |
 
 
 ## M1 本地运行
@@ -59,6 +61,7 @@ where.exe ffprobe
 python scripts\media_smoke_test.py
 python scripts\generate_m1_short.py
 python scripts\verify_m1_output.py
+python scripts\verify_subtitle_burnin.py
 ```
 
 若当前终端没有加载 Conda 激活脚本，可使用不修改全局 PATH 的等价命令：
@@ -67,6 +70,7 @@ python scripts\verify_m1_output.py
 conda run -n anime-platform python scripts\media_smoke_test.py
 conda run -n anime-platform python scripts\generate_m1_short.py
 conda run -n anime-platform python scripts\verify_m1_output.py
+conda run -n anime-platform python scripts\verify_subtitle_burnin.py
 ```
 
 主要输出位于：
@@ -74,8 +78,9 @@ conda run -n anime-platform python scripts\verify_m1_output.py
 - `data/generated/m0/smoke_test.mp4`
 - `data/generated/m1/paper_crane_night_flight.mp4`
 - `data/generated/m1/manifest.json`
+- `data/generated/subtitle-check/paper_crane_night_flight/`
 
-`data/` 已由 `.gitignore` 忽略。当前画面是确定性的几何 Mock 构图，音频是标准库生成的 Mock 提示音，镜头运动、H.264/AAC 编码、拼接和中文字幕烧录由 FFmpeg 完成；它们均不代表真实图像、视频或 TTS 模型能力。
+`data/` 已由 `.gitignore` 忽略。当前画面是确定性的几何 Mock 构图，音频是标准库生成的 Mock 提示音，镜头运动、H.264/AAC 编码、拼接和动态中文字幕烧录由 FFmpeg 完成；它们均不代表真实图像、视频或 TTS 模型能力。Windows 下字幕文件必须由公共模块写成 UTF-8 LF；不能改回平台默认 CRLF。
 
 ## M2 本地运行
 
@@ -113,10 +118,77 @@ python scripts\m2_e2e_test.py --worker-once
 
 若已经启动持续运行的 Worker，执行 E2E 时不要再加 `--worker-once`，以保持第一版“单 Worker”约束。默认数据位于 `data/app.db` 和 `data/projects/<project-id>/exports/<job-id>/`；整个 `data/`、`node_modules/`、前端构建产物和 TypeScript 构建缓存均不会进入 Git。
 
+## M3 本地运行与 Provider 选择
+
+M3 不替换 Mock 保底，而是在相同生成接口中增加 `llamacpp`。所有终端均从项目根目录启动，并先执行：
+
+```powershell
+conda activate anime-platform
+```
+
+### Mock 模式：三个终端
+
+Mock 模式不需要启动模型服务。分别打开三个 PowerShell 终端：
+
+```powershell
+# 终端 1：API
+powershell -ExecutionPolicy Bypass -File scripts\run_backend.ps1
+
+# 终端 2：唯一 Worker
+powershell -ExecutionPolicy Bypass -File scripts\run_worker.ps1
+
+# 终端 3：前端
+powershell -ExecutionPolicy Bypass -File scripts\run_frontend.ps1
+```
+
+打开 `http://127.0.0.1:5173`，在“选择 Script Provider”中选择“Mock（离线保底）”后生成。该路径不需要网络、API Key 或模型服务。
+
+### 本地 Qwen 模式：四个终端
+
+按默认配置，真实文本模式要求项目内已经存在 `tools/llama.cpp/llama-server.exe` 和 `models/text/Qwen3-4B-Q4_K_M.gguf`。分别打开四个 PowerShell 终端：
+
+```powershell
+# 终端 1：本地 Qwen3-4B Q4_K_M + llama.cpp
+powershell -ExecutionPolicy Bypass -File scripts\run_llm_server.ps1
+
+# 终端 2：先检查模型服务，再启动 API
+powershell -ExecutionPolicy Bypass -File scripts\check_llm_server.ps1
+powershell -ExecutionPolicy Bypass -File scripts\run_backend.ps1
+
+# 终端 3：唯一 Worker
+powershell -ExecutionPolicy Bypass -File scripts\run_worker.ps1
+
+# 终端 4：前端
+powershell -ExecutionPolicy Bypass -File scripts\run_frontend.ps1
+```
+
+打开页面后选择“本地 Qwen（llama.cpp）”。前端会读取 `GET /api/providers` 展示在线/离线、是否配置、模型 ID、默认 Provider 和最近检查时间；生成区另行选择自动或固定镜头数，不需要把“生成 4 镜头”写进故事正文。若本地服务离线，页面会禁用该选项并提示运行 `scripts\run_llm_server.ps1`；用户仍可显式切回 Mock 完整生成成片。
+
+运行状态、构建和真实文本纵向测试可使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_llm_server.ps1
+Invoke-RestMethod http://127.0.0.1:8000/api/providers | ConvertTo-Json -Depth 6
+python -m pytest backend\tests -q
+npm --prefix frontend run build
+python scripts\m3_real_llm_test.py --desired-shot-count 4
+python scripts\m3_real_llm_test.py --desired-shot-count auto --title "雨夜的纸灯" --story "雨夜，小男孩在巷口捡到一盏会飞的纸灯。他追着纸灯穿过屋顶，最后在晨光里找到了回家的路。"
+```
+
+执行 `m3_real_llm_test.py` 时保留 llama.cpp 与 API 运行，但应先停止持续 Worker；测试脚本会自行启动一次 `Worker --once`，避免两个 Worker 同时领取任务。
+
+交互生成结果位于 `data/projects/<project-id>/exports/<job-id>/`。每次真实文本调用的受控追溯目录包含 `first_raw_response.json`、可选的 `repair_raw_response.json`、`validation_report.json`、请求快照和 trace；数据库只保存路径、摘要与结构化诊断，不保存大段原始模型响应。`m3_real_llm_test.py` 的独立证据位于 `data/generated/m3/real-llm-test/<project-id>/`，包括 `script.v1.json`、MP4、manifest、Worker 日志和 `summary.json`。这些目录均属于本地生成数据，不应提交到 Git。
+
 ## 人工可用性测试修复
 
-本轮保持 M2 架构和媒体流程不变，只修复已经确认的交互问题：
+在不改变 M2/M3 总体架构和视觉体系的前提下，当前交互包括：
 
+- 故事输入只承载故事内容，实时显示字符数、建议 50—1000 和硬限制 10—3000；镜头数在生成区单独选择，默认固定 4。
+- Job 明确展示要求镜头数、最终镜头数、故事字符数、是否发生一次修复、是否发生确定性时长规范化和未使用实体警告。
+- 成功 Job 记录并展示计划时长、编码时长、差值、媒体容差和验收结论；帧量化范围内的毫秒级偏差不再误报失败。
+- `MEDIA_RENDER` 手动重试创建新的恢复 Job，来源失败记录保持不变；合法 ScriptV1 和已编码 MP4 可复用时不会再次请求 Qwen 或重新编码。
+- 失败卡先显示中文主因，并在折叠区展示首次/修复错误、阶段、代码和建议；合法输入长度与模型输出校验失败明确区分。
+- 成功摘要区分固定模式和自动模式，不再让用户猜测系统是否固定生成 3 个镜头。
 - Demo 按钮只把标题和故事填入表单，并提示“演示故事已填入，请确认内容后点击创建项目”；重复点击不会创建项目。
 - 创建期间由同步 ref 与按钮禁用共同防止双击重复 POST；创建成功后自动选中新项目、滚动到项目任务区域并聚焦项目标题。
 - 项目列表提供独立的“删除”按钮和二次确认。`DELETE /api/projects/{project_id}` 会拒绝仍有 `QUEUED`/`RUNNING` Job 的项目；确认删除会级联清理数据库记录和 `data/projects/<project-id>`，且不可恢复。
@@ -165,6 +237,8 @@ python scripts\m2_e2e_test.py --worker-once
 - [验收标准](docs/acceptance-criteria.md)
 - [M1 实施记录](docs/m1-implementation-report.md)
 - [M2 实施记录](docs/m2-implementation-report.md)
+- [M3 实施记录](docs/m3-implementation-report.md)
+- [ScriptV1 契约](docs/script-v1-schema.md)
 - [当前环境](ENVIRONMENT.md)
 
 ## 成功判断
