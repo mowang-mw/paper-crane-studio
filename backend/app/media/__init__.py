@@ -1,4 +1,4 @@
-"""M0—M4 可复用媒体与烧录字幕工具。"""
+"""M0—M5 可复用媒体、真实旁白时序与烧录字幕工具。"""
 
 from .ffmpeg import (
     MediaToolError,
@@ -6,6 +6,7 @@ from .ffmpeg import (
     extract_shot_midpoint_frames,
     media_duration_tolerance_seconds,
     resolve_media_tools,
+    validate_expected_encoded_duration,
     validate_planned_encoded_duration,
     verify_media,
 )
@@ -14,6 +15,7 @@ from .mock_pipeline import (
     generate_m1_short,
     render_image_project_short,
     render_mock_project_short,
+    render_real_audio_project_short,
     resume_mock_project_short,
 )
 from .subtitles import (
@@ -33,9 +35,11 @@ __all__ = [
     "prepare_burned_subtitle",
     "render_image_project_short",
     "render_mock_project_short",
+    "render_real_audio_project_short",
     "resume_mock_project_short",
     "resolve_media_tools",
     "verify_media",
+    "validate_expected_encoded_duration",
     "validate_planned_encoded_duration",
     "wrap_subtitle_text",
 ]

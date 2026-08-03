@@ -21,6 +21,7 @@ from ..schemas import (
     JobQueued,
     JobRead,
     GenerationRequest,
+    RealAudioRenderRequest,
     RealImageRenderRequest,
     ProjectCreate,
     ProjectDetail,
@@ -34,6 +35,14 @@ from ..services.image_jobs import (
     script_from_source_job,
     write_script_snapshot,
 )
+from ..services.audio_jobs import (
+    REAL_AUDIO_JOB_TYPE,
+    REAL_AUDIO_PROVIDER_ID,
+    audio_gpu_handoff_error_payload,
+    audio_gpu_handoff_status,
+    create_audio_source_snapshot,
+)
+from ..services.image_jobs import REAL_IMAGE_JOB_TYPE, REAL_IMAGE_PROVIDER_ID
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -372,6 +381,190 @@ def render_project_with_real_images(
         "output": {"width": 1280, "height": 720, "fps": 24},
         "story_char_count": len(project.story.strip()),
         "actual_shot_count": len(script.shots),
+    }
+    session.commit()
+    return JobQueued(job_id=job.id)
+
+
+@router.post(
+    "/{project_id}/render-real-audio",
+    response_model=JobQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def render_project_with_real_audio(
+    project_id: str,
+    payload: RealAudioRenderRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> JobQueued:
+    """复用成功 M4-B ScriptV1 与真实 PNG，创建不调用上游模型的旁白 Job。"""
+
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if crud.project_has_active_jobs(session, project.id):
+        raise HTTPException(
+            status_code=409,
+            detail="当前项目仍有任务正在等待或运行，请完成后再生成真实 AI 旁白。",
+        )
+
+    source_image_job = crud.get_job(session, payload.source_image_job_id)
+    if (
+        source_image_job is None
+        or source_image_job.project_id != project.id
+        or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+        or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
+        or source_image_job.status != JobStatus.SUCCEEDED
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="只能复用当前项目中已经成功的 M4-B 真实图像 Job。",
+        )
+    source_result = dict(source_image_job.result_json or {})
+    if (
+        source_result.get("image_provider") != REAL_IMAGE_PROVIDER_ID
+        or source_result.get("mock_image_fallback") is not False
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="来源 Job 没有可证明为真实模型生成的完整关键帧。",
+        )
+    source_images = source_result.get("image_shots")
+    if not isinstance(source_images, list) or not 3 <= len(source_images) <= 5:
+        raise HTTPException(
+            status_code=409,
+            detail="来源真实图像 Job 的逐镜头关键帧追溯不完整。",
+        )
+
+    settings: Settings = request.app.state.settings
+    handoff = audio_gpu_handoff_status(settings)
+    if handoff["conflict"]:
+        raise HTTPException(
+            status_code=409,
+            detail=audio_gpu_handoff_error_payload(handoff),
+        )
+    if not Path(settings.qwen_tts_python).is_file():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TTS_ENV_NOT_FOUND",
+                "stage": "TTS_PREFLIGHT",
+                "summary": "独立 Qwen3-TTS Python 环境不存在。",
+                "retryable": False,
+                "provider_id": REAL_AUDIO_PROVIDER_ID,
+            },
+        )
+    if not Path(settings.qwen_tts_model_path).joinpath("model.safetensors").is_file():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TTS_MODEL_NOT_FOUND",
+                "stage": "TTS_PREFLIGHT",
+                "summary": "固定 Qwen3-TTS 模型文件不存在。",
+                "retryable": False,
+                "provider_id": REAL_AUDIO_PROVIDER_ID,
+            },
+        )
+
+    try:
+        script, source_trace = script_from_source_job(
+            settings,
+            project=project,
+            source_job=source_image_job,
+        )
+    except RuntimeError as exc:
+        detail = getattr(exc, "generation_error", str(exc))
+        raise HTTPException(status_code=409, detail=detail) from exc
+    script_json = script.model_dump(mode="json")
+    if project.script_json != script_json:
+        raise HTTPException(
+            status_code=409,
+            detail="来源真实图像 Job 已不是项目当前 ScriptV1，拒绝生成旁白。",
+        )
+
+    source_script_job_id = str(
+        source_result.get("source_script_job_id")
+        or (source_image_job.request_json or {}).get("source_script_job_id")
+        or ""
+    )
+    source_script_provider = str(
+        source_result.get("source_script_provider") or "unknown"
+    )
+    if not source_script_job_id:
+        raise HTTPException(
+            status_code=409,
+            detail="来源真实图像 Job 缺少原始 Script Job 追溯。",
+        )
+
+    job = crud.create_job(
+        session,
+        project=project,
+        provider_id=payload.audio_provider,
+        job_type=REAL_AUDIO_JOB_TYPE,
+        request_json={},
+    )
+    try:
+        snapshot_path, snapshot_sha256 = create_audio_source_snapshot(
+            settings,
+            project_id=project.id,
+            audio_job_id=job.id,
+            source_script_job_id=source_script_job_id,
+            source_image_job_id=source_image_job.id,
+            source_script_provider=source_script_provider,
+            source_image_provider=REAL_IMAGE_PROVIDER_ID,
+            script=script,
+            source_images=source_images,
+            source_trace=source_trace,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"无法写入受控 M5-B 来源快照：{exc}",
+        ) from exc
+
+    relative_snapshot = snapshot_path.resolve().relative_to(
+        Path(settings.data_dir).resolve()
+    ).as_posix()
+    source_duration = sum(float(shot.duration_seconds) for shot in script.shots)
+    job.request_json = {
+        "project_id": project.id,
+        "parent_job_id": source_image_job.id,
+        "source_script_job_id": source_script_job_id,
+        "source_image_job_id": source_image_job.id,
+        "script_provider": "reused",
+        "source_script_provider": source_script_provider,
+        "script_provider_calls_expected": 0,
+        "image_provider": "reused",
+        "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+        "image_provider_calls_expected": 0,
+        "source_image_model_id": source_result.get("image_model_id"),
+        "audio_provider": payload.audio_provider,
+        "speaker": payload.speaker,
+        "language": payload.language,
+        "audio_source_snapshot_path": relative_snapshot,
+        "audio_source_snapshot_sha256": snapshot_sha256,
+        "audio_source_snapshot_owner_job_id": job.id,
+        "audio_options": {
+            "speaker": payload.speaker,
+            "language": payload.language,
+            "base_seed": settings.qwen_tts_seed,
+            "model_load_timeout_seconds": (
+                settings.qwen_tts_model_load_timeout_seconds
+            ),
+            "generation_timeout_seconds": settings.qwen_tts_shot_timeout_seconds,
+            "job_timeout_seconds": settings.qwen_tts_job_timeout_seconds,
+        },
+        "timing_options": {
+            "lead_in_seconds": settings.audio_lead_in_seconds,
+            "lead_out_seconds": settings.audio_lead_out_seconds,
+            "max_total_duration_seconds": settings.audio_rendered_max_seconds,
+            "fps": 24,
+        },
+        "output": {"width": 1280, "height": 720, "fps": 24},
+        "story_char_count": len(project.story.strip()),
+        "actual_shot_count": len(script.shots),
+        "source_planned_duration_seconds": source_duration,
     }
     session.commit()
     return JobQueued(job_id=job.id)

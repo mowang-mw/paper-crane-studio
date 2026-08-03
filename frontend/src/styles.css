@@ -267,11 +267,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--coral); box-shad
 .script-entity-panel strong { font-size: 12px; }
 .script-entity-panel span, .script-entity-panel > p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .real-image-control { margin: 0 0 28px; padding: 26px 28px; border: 1px solid #c9c1ad; border-top: 4px solid var(--gold); background: #f7f4ed; }
+.real-audio-control { margin: 0 0 28px; padding: 26px 28px; border: 1px solid #b9c8c1; border-top: 4px solid #4f9a70; background: #f1f7f3; }
 .real-image-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .real-image-heading h3 { margin: 0; font: 500 25px Georgia, "STSong", serif; }
 .visual-source-badge { display: inline-flex; align-items: center; width: fit-content; padding: 4px 8px; border: 1px solid #c7c0b2; border-radius: 99px; color: #646975; background: rgba(255,255,255,.54); font-size: 9px; font-weight: 800; letter-spacing: .04em; white-space: nowrap; }
 .visual-source-badge.is-real { border-color: rgba(54,126,83,.34); color: #286343; background: #e6f4eb; }
 .visual-source-badge.is-mock { border-color: rgba(154,91,86,.25); color: #805b57; background: #f6eeeb; }
+.audio-source-badge { display: inline-flex; align-items: center; width: fit-content; padding: 4px 8px; border: 1px solid #c7c0b2; border-radius: 99px; font-size: 9px; font-weight: 800; letter-spacing: .04em; white-space: nowrap; }
+.audio-source-badge.is-real { border-color: rgba(54,126,83,.34); color: #286343; background: #e2f3e8; }
+.audio-source-badge.is-mock { border-color: rgba(154,91,86,.25); color: #805b57; background: #f6eeeb; }
 .real-image-provider-line { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 7px 18px; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .real-image-provider-line strong { flex-basis: 100%; color: #333946; font-size: 12px; }
 .real-image-provider-line .image-provider-detail { flex-basis: 100%; color: #555d69; }
@@ -282,6 +286,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--coral); box-shad
 .real-image-facts dt { color: var(--muted); font-size: 9px; letter-spacing: .06em; }
 .real-image-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 10px; line-height: 1.45; }
 .real-image-actions { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px; }
+.speaker-selector { margin: 18px 0 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; border: 0; }
+.speaker-selector legend { margin-bottom: 8px; color: #444b55; font-size: 11px; font-weight: 800; }
+.speaker-selector label { padding: 13px 15px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); background: rgba(255,255,255,.68); cursor: pointer; }
+.speaker-selector label.is-selected { border-color: rgba(54,126,83,.55); box-shadow: inset 0 0 0 1px rgba(54,126,83,.18); background: #e7f4eb; }
+.speaker-selector input { accent-color: #367e53; }
+.speaker-selector span, .speaker-selector strong, .speaker-selector small { display: block; }
+.speaker-selector strong { color: #303842; font-size: 11px; }
+.speaker-selector small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.speaker-selector:disabled label { cursor: not-allowed; opacity: .64; }
 .shot-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
 .shot-card { min-width: 0; display: grid; grid-template-columns: 150px minmax(0, 1fr); border: 1px solid var(--line); background: var(--paper); }
 .shot-card.has-real-image { grid-template-columns: minmax(210px, .85fr) minmax(0, 1.15fr); border-color: rgba(54,126,83,.32); }
@@ -305,6 +318,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--coral); box-shad
 .shot-copy h3 { margin: 0 0 12px; font: 500 22px Georgia, "STSong", serif; }
 .shot-copy > p:not(.eyebrow) { color: var(--muted); font-size: 13px; line-height: 1.7; }
 .shot-copy blockquote { margin: 20px 0 0; padding-left: 13px; border-left: 2px solid var(--gold); color: #4d5360; font: italic 13px/1.6 Georgia, "STSong", serif; }
+.shot-audio-summary { margin-top: 14px; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 5px 12px; border-left: 3px solid #a9883f; background: #faf5e7; color: #6a5728; font-size: 10px; line-height: 1.5; }
+.shot-audio-summary.is-real { border-left-color: #4f9a70; background: #eaf5ed; color: #336247; }
+.shot-audio-summary span:first-child { flex-basis: 100%; font-weight: 800; }
 .shot-details { margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line); }
 .shot-details div + div { margin-top: 10px; }
 .shot-details dt { margin-bottom: 3px; color: #9a5b56; font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
@@ -385,7 +401,7 @@ footer { max-width: 1180px; min-height: 90px; margin: auto; display: flex; justi
   .generation-options { grid-template-columns: 1fr; align-items: start; }
   .job-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .failure-details dl { grid-template-columns: 1fr; }
-  .provider-status-grid, .script-entity-grid { grid-template-columns: 1fr; }
+  .provider-status-grid, .script-entity-grid, .speaker-selector { grid-template-columns: 1fr; }
   .real-image-heading, .gpu-handoff-notice { grid-template-columns: 1fr; flex-direction: column; }
   .real-image-actions .button { width: 100%; }
   .real-image-facts { grid-template-columns: 1fr; }

@@ -1,4 +1,7 @@
 import type {
+  AudioProviderId,
+  AudioProviderStatus,
+  AudioSpeaker,
   DesiredShotCount,
   ExportRecord,
   GenerationJob,
@@ -113,6 +116,14 @@ function isImageProviderId(value: unknown): value is ImageProviderId {
   return value === "mock" || value === "comfyui-animagine-xl-4";
 }
 
+function isAudioProviderId(value: unknown): value is AudioProviderId {
+  return value === "mock" || value === "qwen3-tts-0.6b-customvoice";
+}
+
+function isAudioSpeaker(value: unknown): value is AudioSpeaker {
+  return value === "Serena" || value === "Vivian";
+}
+
 function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -148,6 +159,29 @@ function normalizeImageProvider(value: unknown): ImageProviderStatus | null {
   };
 }
 
+function normalizeAudioProvider(value: unknown): AudioProviderStatus | null {
+  if (!isRecord(value) || !isAudioProviderId(value.provider_id)) return null;
+  const fallbackName =
+    value.provider_id === "mock" ? "Mock 音频" : "真实 AI 旁白 · Qwen3-TTS 0.6B";
+  return {
+    provider_id: value.provider_id,
+    display_name: optionalText(value.display_name) ?? fallbackName,
+    available: value.available === true,
+    configured: typeof value.configured === "boolean" ? value.configured : null,
+    model_id: optionalText(value.model_id),
+    source_type: optionalText(value.source_type) ?? "UNKNOWN",
+    detail: optionalText(value.detail),
+    requires_gpu_handoff: value.requires_gpu_handoff === true,
+    speakers: Array.isArray(value.speakers)
+      ? value.speakers.filter(isAudioSpeaker)
+      : undefined,
+    default_speaker: isAudioSpeaker(value.default_speaker)
+      ? value.default_speaker
+      : undefined,
+    language: value.language === "Chinese" ? "Chinese" : undefined,
+  };
+}
+
 export async function getHealth(): Promise<HealthStatus> {
   return request<HealthStatus>("/health");
 }
@@ -167,6 +201,11 @@ export async function getProviders(): Promise<ProvidersStatus> {
         .map(normalizeImageProvider)
         .filter((item): item is ImageProviderStatus => item !== null)
     : [];
+  const audioProviders = Array.isArray(payload.audio_providers)
+    ? payload.audio_providers
+        .map(normalizeAudioProvider)
+        .filter((item): item is AudioProviderStatus => item !== null)
+    : [];
   return {
     default_script_provider: isScriptProviderId(payload.default_script_provider)
       ? payload.default_script_provider
@@ -174,9 +213,13 @@ export async function getProviders(): Promise<ProvidersStatus> {
     default_image_provider: isImageProviderId(payload.default_image_provider)
       ? payload.default_image_provider
       : null,
+    default_audio_provider: isAudioProviderId(payload.default_audio_provider)
+      ? payload.default_audio_provider
+      : null,
     checked_at: optionalText(payload.checked_at),
     providers,
     image_providers: imageProviders,
+    audio_providers: audioProviders,
   };
 }
 
@@ -247,6 +290,24 @@ export async function renderRealImages(
         source_script_job_id: sourceScriptJobId,
         image_provider: "comfyui-animagine-xl-4",
         ...(baseSeed === undefined ? {} : { base_seed: baseSeed }),
+      }),
+    }),
+  );
+}
+
+export async function renderRealAudio(
+  projectId: string,
+  sourceImageJobId: string,
+  speaker: AudioSpeaker,
+): Promise<GenerationJob> {
+  return unwrapJob(
+    await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-audio`, {
+      method: "POST",
+      body: JSON.stringify({
+        source_image_job_id: sourceImageJobId,
+        audio_provider: "qwen3-tts-0.6b-customvoice",
+        speaker,
+        language: "Chinese",
       }),
     }),
   );

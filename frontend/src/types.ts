@@ -1,6 +1,9 @@
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export type ScriptProviderId = "mock" | "llamacpp";
 export type ImageProviderId = "mock" | "comfyui-animagine-xl-4";
+export type AudioProviderId = "mock" | "qwen3-tts-0.6b-customvoice";
+export type AudioSpeaker = "Serena" | "Vivian";
+export type AudioLanguage = "Chinese";
 export type DesiredShotCount = 3 | 4 | 5 | null;
 
 export interface ScriptProviderStatus {
@@ -17,9 +20,11 @@ export interface ScriptProviderStatus {
 export interface ProvidersStatus {
   default_script_provider: ScriptProviderId | null;
   default_image_provider: ImageProviderId | null;
+  default_audio_provider: AudioProviderId | null;
   checked_at: string | null;
   providers: ScriptProviderStatus[];
   image_providers: ImageProviderStatus[];
+  audio_providers: AudioProviderStatus[];
 }
 
 export interface ImageProviderStatus {
@@ -31,6 +36,20 @@ export interface ImageProviderStatus {
   source_type: string;
   detail?: string | null;
   requires_gpu_handoff?: boolean;
+}
+
+export interface AudioProviderStatus {
+  provider_id: AudioProviderId;
+  display_name: string;
+  available: boolean;
+  configured: boolean | null;
+  model_id: string | null;
+  source_type: string;
+  detail?: string | null;
+  requires_gpu_handoff?: boolean;
+  speakers?: AudioSpeaker[];
+  default_speaker?: AudioSpeaker;
+  language?: AudioLanguage;
 }
 
 export interface ScriptCharacter {
@@ -82,6 +101,11 @@ export interface GenerationRequestSnapshot {
   source_script_job_id?: string;
   reuse_script_from_job_id?: string;
   image_provider?: ImageProviderId;
+  source_image_job_id?: string;
+  parent_job_id?: string;
+  audio_provider?: AudioProviderId;
+  speaker?: AudioSpeaker;
+  language?: AudioLanguage;
   base_seed?: number;
   image_options?: Record<string, unknown>;
   desired_shot_count?: DesiredShotCount;
@@ -157,8 +181,20 @@ export interface GenerationErrorDetail {
   total_images?: number;
   image_total_count?: number;
   total_image_count?: number;
+  audio_completed_count?: number;
+  completed_audio_count?: number;
+  completed_audios?: number;
+  audio_total_count?: number;
+  total_audio_count?: number;
+  total_audios?: number;
+  reusable_audio_count?: number;
+  completed_audio_reusable?: boolean;
+  speaker?: AudioSpeaker | string;
+  language?: AudioLanguage | string;
+  audio_provider?: string;
   retryable?: boolean;
   requires_qwen_shutdown?: boolean;
+  requires_gpu_handoff?: boolean;
   oom?: boolean;
   log_path?: string;
   log_paths?: string[] | Record<string, string>;
@@ -181,6 +217,60 @@ export interface GeneratedImageShot {
   generation_seconds?: number;
   image_sha256?: string;
   warnings?: string[];
+  [key: string]: unknown;
+}
+
+export type AudioShotStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "REUSED" | string;
+
+export interface GeneratedAudioShot {
+  shot_id: string;
+  shot_index?: number;
+  status?: AudioShotStatus;
+  provider_id?: string;
+  model_id?: string;
+  speaker?: AudioSpeaker | string;
+  language?: AudioLanguage | string;
+  text?: string;
+  audio_path?: string;
+  sample_rate?: number;
+  channels?: number;
+  duration_seconds?: number;
+  audio_duration_seconds?: number;
+  generation_seconds?: number;
+  real_time_factor?: number;
+  audio_sha256?: string;
+  warnings?: string[];
+  reused?: boolean;
+  [key: string]: unknown;
+}
+
+export interface MediaTimingShot {
+  shot_id: string;
+  shot_index?: number;
+  source_shot_duration?: number;
+  source_shot_duration_seconds?: number;
+  source_duration_seconds?: number;
+  audio_duration?: number;
+  audio_duration_seconds?: number;
+  lead_in_seconds?: number;
+  lead_out_seconds?: number;
+  rendered_shot_duration?: number;
+  rendered_shot_duration_seconds?: number;
+  rendered_duration_seconds?: number;
+  extended_by_seconds?: number;
+  extension_reason?: string | null;
+  [key: string]: unknown;
+}
+
+export interface MediaTimingPlan {
+  shots?: MediaTimingShot[];
+  source_planned_duration_seconds?: number;
+  source_total_duration_seconds?: number;
+  rendered_planned_duration_seconds?: number;
+  rendered_total_duration_seconds?: number;
+  audio_extension_seconds?: number;
+  extended_by_seconds?: number;
+  fps?: number;
   [key: string]: unknown;
 }
 
@@ -225,7 +315,28 @@ export interface GenerationResult {
   base_seed?: number;
   script_source_job_id?: string;
   source_script_job_id?: string;
+  source_image_job_id?: string;
+  parent_job_id?: string;
   audio_provider?: string;
+  audio_model_id?: string;
+  speaker?: AudioSpeaker | string;
+  language?: AudioLanguage | string;
+  audio_shots?: GeneratedAudioShot[];
+  audio_completed_count?: number;
+  completed_audio_count?: number;
+  audio_total_count?: number;
+  total_audio_count?: number;
+  audio_generation_seconds?: number;
+  audio_generation_total_seconds?: number;
+  tts_generation_seconds?: number;
+  current_audio_shot_id?: string;
+  current_audio_shot_index?: number;
+  timing_plan?: MediaTimingPlan;
+  timing_plan_path?: string;
+  source_planned_duration_seconds?: number;
+  rendered_planned_duration_seconds?: number;
+  audio_extension_seconds?: number;
+  extended_by_seconds?: number;
   video_source_type?: string;
   source_type?: string;
   [key: string]: unknown;

@@ -19,6 +19,10 @@ from .database import Database
 from .media.ffmpeg import sha256_file
 from .models import JobStatus
 from .providers.base import (
+    AudioGenerationOptions,
+    AudioGenerationRequest,
+    AudioProvider,
+    GeneratedAudioAsset,
     GeneratedImageAsset,
     ImageGenerationOptions,
     ImageGenerationRequest,
@@ -27,6 +31,7 @@ from .providers.base import (
 from .providers.comfyui import ComfyUIImageProvider
 from .providers.llama_cpp import LlamaCppScriptProvider
 from .providers.mock import MockAudioProvider, MockImageProvider, MockScriptProvider
+from .providers.qwen3_tts import create_qwen3_tts_provider
 from .providers.registry import check_llamacpp
 from .script_schema import ScriptV1
 from .services.generation import GenerationService, PreparedGeneration
@@ -38,10 +43,21 @@ from .services.image_jobs import (
     gpu_handoff_status,
     load_script_snapshot,
 )
+from .services.audio_jobs import (
+    REAL_AUDIO_JOB_TYPE,
+    REAL_AUDIO_PROVIDER_ID,
+    REAL_AUDIO_SOURCE_TYPE,
+    RealAudioJobError,
+    atomic_json,
+    audio_gpu_handoff_status,
+    build_media_timing_plan,
+    load_audio_source_snapshot,
+)
 
 
 Renderer = Callable[..., dict[str, Any]]
 ImageProviderFactory = Callable[[Settings], ImageProvider]
+AudioProviderFactory = Callable[[Settings], AudioProvider]
 
 
 class MediaResumeError(RuntimeError):
@@ -83,6 +99,8 @@ class Worker:
         generation_service: GenerationService | None = None,
         real_image_renderer: Renderer | None = None,
         image_provider_factory: ImageProviderFactory | None = None,
+        real_audio_renderer: Renderer | None = None,
+        audio_provider_factory: AudioProviderFactory | None = None,
     ) -> None:
         self.settings = settings or Settings.from_env()
         self.settings.ensure_directories()
@@ -93,6 +111,8 @@ class Worker:
         self.generation_service = generation_service
         self.real_image_renderer = real_image_renderer
         self.image_provider_factory = image_provider_factory
+        self.real_audio_renderer = real_audio_renderer
+        self.audio_provider_factory = audio_provider_factory
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -208,13 +228,35 @@ class Worker:
             if project is None:
                 raise RuntimeError(f"任务所属项目不存在：{job.project_id}")
             request_snapshot = dict(job.request_json or {})
-            if job.job_type == REAL_IMAGE_JOB_TYPE:
+            image_provider_id: str | None = None
+            audio_provider_id: str | None = None
+            if job.job_type == REAL_AUDIO_JOB_TYPE:
+                project_id = project.id
+                project_title = project.title
+                project_story = project.story
+                audio_provider_id = job.provider_id
+            elif job.job_type == REAL_IMAGE_JOB_TYPE:
                 project_id = project.id
                 project_title = project.title
                 project_story = project.story
                 image_provider_id = job.provider_id
-            else:
-                image_provider_id = None
+
+            if audio_provider_id is not None:
+                if request_snapshot.get("audio_provider") != audio_provider_id:
+                    raise RealAudioJobError(
+                        code="AUDIO_PROVIDER_SNAPSHOT_MISMATCH",
+                        stage="AUDIO_GENERATION",
+                        summary="Job provider_id 与真实旁白 Provider 快照不一致。",
+                        retryable=False,
+                    )
+                if audio_provider_id != REAL_AUDIO_PROVIDER_ID:
+                    raise RealAudioJobError(
+                        code="AUDIO_PROVIDER_UNSUPPORTED",
+                        stage="AUDIO_GENERATION",
+                        summary=f"不支持的真实 AudioProvider：{audio_provider_id}",
+                        retryable=False,
+                    )
+                project_script_json = copy.deepcopy(project.script_json)
 
             if image_provider_id is not None:
                 # 真实图片 Job 的 provider_id 描述 ImageProvider；不能再按
@@ -234,6 +276,17 @@ class Worker:
                         retryable=False,
                     )
                 project_script_json = copy.deepcopy(project.script_json)
+
+        if audio_provider_id is not None:
+            self._process_real_audio_job(
+                job_id=job_id,
+                project_id=project_id,
+                project_title=project_title,
+                project_story=project_story,
+                project_script_json=project_script_json,
+                request_snapshot=request_snapshot,
+            )
+            return
 
         if image_provider_id is not None:
             self._process_real_image_job(
@@ -663,6 +716,1113 @@ class Worker:
             crud.mark_job_succeeded(session, job=job, result_json=result_json)
             session.commit()
         print(f"[worker] job={job_id} SUCCEEDED export={export.id}", flush=True)
+
+    def _process_real_audio_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        project_title: str,
+        project_story: str,
+        project_script_json: dict[str, Any] | None,
+        request_snapshot: dict[str, Any],
+    ) -> None:
+        """只复用 ScriptV1 与真实 PNG，顺序生成真实旁白后进入 FFmpeg。"""
+
+        if request_snapshot.get("script_provider_calls_expected") != 0:
+            raise RealAudioJobError(
+                code="SOURCE_REUSE_INVALID",
+                stage="SOURCE_REUSE",
+                summary="真实旁白 Job 必须明确记录文本 Provider 调用次数为 0。",
+                retryable=False,
+            )
+        if request_snapshot.get("image_provider_calls_expected") != 0:
+            raise RealAudioJobError(
+                code="SOURCE_REUSE_INVALID",
+                stage="SOURCE_REUSE",
+                summary="真实旁白 Job 必须明确记录图像 Provider 调用次数为 0。",
+                retryable=False,
+            )
+        script, source_payload = load_audio_source_snapshot(
+            self.settings,
+            project_id=project_id,
+            audio_job_id=job_id,
+            request_snapshot=request_snapshot,
+        )
+        script_json = script.model_dump(mode="json")
+        if project_script_json != script_json:
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_STALE",
+                stage="SOURCE_REUSE",
+                summary="项目当前剧本已变化，拒绝用旧 ScriptV1 生成旁白。",
+                retryable=False,
+            )
+        if request_snapshot.get("story_char_count") != len(project_story.strip()):
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_STALE",
+                stage="SOURCE_REUSE",
+                summary="项目故事与真实旁白 Job 的请求快照不一致。",
+                retryable=False,
+            )
+        if request_snapshot.get("actual_shot_count") != len(script.shots):
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_INVALID",
+                stage="SOURCE_REUSE",
+                summary="ScriptV1 镜头数与真实旁白 Job 快照不一致。",
+                retryable=False,
+            )
+
+        source_script_job_id = str(request_snapshot.get("source_script_job_id") or "")
+        source_image_job_id = str(request_snapshot.get("source_image_job_id") or "")
+        source_script_provider = str(
+            request_snapshot.get("source_script_provider") or "unknown"
+        )
+        source_image_provider = str(
+            request_snapshot.get("source_image_provider") or ""
+        )
+        if source_payload.get("source_script_job_id") != source_script_job_id:
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_INVALID",
+                stage="SOURCE_REUSE",
+                summary="来源快照的 Script Job 与请求不一致。",
+                retryable=False,
+            )
+        if source_payload.get("source_image_job_id") != source_image_job_id:
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_INVALID",
+                stage="SOURCE_REUSE",
+                summary="来源快照的 Image Job 与请求不一致。",
+                retryable=False,
+            )
+        if source_payload.get("source_image_provider") != source_image_provider:
+            raise RealAudioJobError(
+                code="AUDIO_SOURCE_SNAPSHOT_INVALID",
+                stage="SOURCE_REUSE",
+                summary="来源快照的 ImageProvider 与请求不一致。",
+                retryable=False,
+            )
+        source_images = self._real_audio_source_images(
+            project_id=project_id,
+            script=script,
+            source_payload=source_payload,
+        )
+
+        with self.database.session() as session:
+            source_image_job = crud.get_job(session, source_image_job_id)
+            if (
+                source_image_job is None
+                or source_image_job.project_id != project_id
+                or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+                or source_image_job.provider_id != source_image_provider
+                or source_image_job.status != JobStatus.SUCCEEDED
+            ):
+                raise RealAudioJobError(
+                    code="AUDIO_SOURCE_JOB_INVALID",
+                    stage="SOURCE_REUSE",
+                    summary="来源 M4-B 真实图像 Job 不存在、未成功或归属不匹配。",
+                    retryable=False,
+                )
+            database_shots = crud.list_shots(session, project_id)
+            if len(database_shots) != len(script.shots):
+                raise RealAudioJobError(
+                    code="AUDIO_SOURCE_SNAPSHOT_STALE",
+                    stage="SOURCE_REUSE",
+                    summary="数据库镜头与复用 ScriptV1 数量不一致。",
+                    retryable=False,
+                )
+            database_shot_ids: dict[int, str] = {}
+            for script_shot, database_shot in zip(
+                script.shots, database_shots, strict=True
+            ):
+                if (
+                    database_shot.shot_index != script_shot.index
+                    or database_shot.title != script_shot.title
+                    or database_shot.visual_description
+                    != script_shot.visual_description
+                    or database_shot.narration != script_shot.narration
+                    or abs(
+                        float(database_shot.duration_seconds)
+                        - float(script_shot.duration_seconds)
+                    )
+                    > 1e-6
+                ):
+                    raise RealAudioJobError(
+                        code="AUDIO_SOURCE_SNAPSHOT_STALE",
+                        stage="SOURCE_REUSE",
+                        summary="数据库镜头内容与复用 ScriptV1 不一致。",
+                        failed_shot_id=script_shot.id,
+                        failed_shot_index=script_shot.index,
+                        retryable=False,
+                    )
+                database_shot_ids[script_shot.index] = database_shot.id
+
+        options = self._real_audio_options(request_snapshot)
+        provider = self._real_audio_provider()
+        if provider.provider_id != REAL_AUDIO_PROVIDER_ID:
+            raise RealAudioJobError(
+                code="AUDIO_PROVIDER_SNAPSHOT_MISMATCH",
+                stage="AUDIO_GENERATION",
+                summary="注入的 AudioProvider 与 Job 请求快照不一致。",
+                retryable=False,
+            )
+        audio_dir = (
+            self.settings.project_dir(project_id) / "jobs" / job_id / "audio"
+        ).resolve()
+        requests = tuple(
+            AudioGenerationRequest(
+                project_id=project_id,
+                job_id=job_id,
+                source_script_job_id=source_script_job_id,
+                source_image_job_id=source_image_job_id,
+                script=script,
+                shot=shot,
+                output_dir=audio_dir,
+                options=options,
+            )
+            for shot in script.shots
+        )
+        reusable_assets = self._load_reusable_audio_assets(
+            project_id=project_id,
+            request_snapshot=request_snapshot,
+        )
+        initial_audio = [
+            {
+                "shot_id": shot.id,
+                "shot_index": shot.index,
+                "title": shot.title,
+                "narration": shot.narration,
+                "status": "PENDING",
+                "provider_id": REAL_AUDIO_PROVIDER_ID,
+                "model_id": getattr(
+                    provider, "model_id", self.settings.qwen_tts_model_id
+                ),
+                "model_revision": getattr(
+                    provider,
+                    "model_revision",
+                    self.settings.qwen_tts_model_revision,
+                ),
+                "speaker": options.speaker,
+                "language": options.language,
+            }
+            for shot in script.shots
+        ]
+        initial_result = {
+            "stage": "AUDIO_GENERATION",
+            "parent_job_id": request_snapshot.get("parent_job_id"),
+            "source_script_job_id": source_script_job_id,
+            "source_image_job_id": source_image_job_id,
+            "script_provider": "reused",
+            "source_script_provider": source_script_provider,
+            "script_provider_calls": 0,
+            "image_provider": "reused",
+            "source_image_provider": source_image_provider,
+            "image_provider_calls": 0,
+            "audio_provider": REAL_AUDIO_PROVIDER_ID,
+            "audio_model_id": getattr(
+                provider, "model_id", self.settings.qwen_tts_model_id
+            ),
+            "audio_model_revision": getattr(
+                provider,
+                "model_revision",
+                self.settings.qwen_tts_model_revision,
+            ),
+            "audio_model_license": getattr(
+                provider, "model_license", self.settings.qwen_tts_model_license
+            ),
+            "speaker": options.speaker,
+            "language": options.language,
+            "script_json": script_json,
+            "actual_shot_count": len(script.shots),
+            "story_char_count": len(project_story.strip()),
+            "source_planned_duration_seconds": round(
+                sum(float(shot.duration_seconds) for shot in script.shots), 6
+            ),
+            "audio_options": options.as_dict(),
+            "audio_shots": initial_audio,
+            "audio_completed_count": 0,
+            "audio_total_count": len(script.shots),
+            "retry_of_job_id": request_snapshot.get("retry_of_job_id"),
+            "resume_audio_from_job_id": request_snapshot.get(
+                "resume_audio_from_job_id"
+            ),
+            "mock_audio_fallback": False,
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"真实旁白准备完成时 Job 不再是 RUNNING：{job_id}")
+            crud.set_job_progress(session, job, 5)
+            job.result_json = initial_result
+            session.commit()
+
+        handoff = audio_gpu_handoff_status(self.settings)
+        if handoff["conflict"]:
+            raise RealAudioJobError(
+                code="GPU_HANDOFF_REQUIRED",
+                stage="GPU_HANDOFF_REQUIRED",
+                summary="真实旁白生成前检测到模型服务或高显存占用，需要先完成 GPU 交接。",
+                total_audio_count=len(script.shots),
+                requires_qwen_shutdown=bool(
+                    handoff.get("llama_port_listening")
+                    or handoff.get("llama_process_detected")
+                ),
+                requires_comfyui_shutdown=bool(
+                    handoff.get("comfyui_port_listening")
+                    or handoff.get("comfyui_process_detected")
+                ),
+                suggestions=[
+                    "确认 8081 与 8188 已释放后手动重试。",
+                    (
+                        "关闭其他高显存程序后重试。"
+                        if handoff.get("gpu_memory_conflict")
+                        else "确认没有其他高显存推理进程。"
+                    ),
+                    "平台不会终止用户启动的外部模型进程。",
+                ],
+            )
+
+        monitor = GpuMemoryMonitor()
+        monitor.start()
+        audio_started = time.monotonic()
+        try:
+            generated_assets = provider.generate_batch(
+                requests=requests,
+                reusable_assets=reusable_assets,
+                progress_callback=lambda completed, total, asset: (
+                    self._record_real_audio_progress(
+                        job_id=job_id,
+                        project_id=project_id,
+                        database_shot_id=database_shot_ids[
+                            next(
+                                shot.index
+                                for shot in script.shots
+                                if shot.id == asset.shot_id
+                            )
+                        ],
+                        shot_index=next(
+                            shot.index
+                            for shot in script.shots
+                            if shot.id == asset.shot_id
+                        ),
+                        total=total,
+                        asset=asset,
+                    )
+                ),
+            )
+        except Exception:
+            monitor.stop()
+            self._record_gpu_observation(job_id, monitor.summary())
+            raise
+        monitor.stop()
+        gpu_observation = monitor.summary()
+        self._record_gpu_observation(job_id, gpu_observation)
+        audio_generation_total_seconds = round(
+            time.monotonic() - audio_started, 3
+        )
+        if (
+            len(generated_assets) != len(script.shots)
+            or [item.shot_id for item in generated_assets]
+            != [shot.id for shot in script.shots]
+        ):
+            raise RealAudioJobError(
+                code="AUDIO_OUTPUT_MISSING",
+                stage="AUDIO_GENERATION",
+                summary="AudioProvider 返回的旁白数量或顺序不完整。",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(script.shots),
+            )
+
+        timing_options = self._real_audio_timing_options(request_snapshot)
+        timing_plan = build_media_timing_plan(
+            script=script,
+            audio_assets=generated_assets,
+            fps=timing_options["fps"],
+            lead_in_seconds=timing_options["lead_in_seconds"],
+            lead_out_seconds=timing_options["lead_out_seconds"],
+            max_total_duration_seconds=timing_options[
+                "max_total_duration_seconds"
+            ],
+        )
+        job_trace_dir = audio_dir.parent
+        timing_plan_path = job_trace_dir / "timing_plan.json"
+        atomic_json(timing_plan_path, timing_plan)
+        report_path = job_trace_dir / "audio_generation_report.json"
+        provider_report = getattr(provider, "last_run_report", None)
+        if not isinstance(provider_report, dict):
+            provider_report = {}
+            if report_path.is_file():
+                try:
+                    loaded = json.loads(report_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        provider_report = loaded
+                except (OSError, json.JSONDecodeError):
+                    provider_report = {}
+        provider_gpu_allocator_observation = provider_report.get(
+            "gpu_memory_observed"
+        )
+        model_load_count = provider_report.get("model_load_count")
+        generated_count = sum(not item.reused for item in generated_assets)
+        reused_count = sum(item.reused for item in generated_assets)
+
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"旁白生成完成时 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            current.update(
+                {
+                    "stage": "MEDIA_RENDER",
+                    "audio_generation_total_seconds": (
+                        audio_generation_total_seconds
+                    ),
+                    "audio_generation_report_path": self._relative_project_path(
+                        report_path, project_id
+                    )
+                    if report_path.is_file()
+                    else None,
+                    "audio_completed_count": len(generated_assets),
+                    "audio_total_count": len(generated_assets),
+                    "audio_generated_count": generated_count,
+                    "audio_reused_count": reused_count,
+                    "model_load_count": model_load_count,
+                    "sequential_generation": provider_report.get(
+                        "sequential_generation", True
+                    ),
+                    "max_audio_concurrency": provider_report.get(
+                        "max_audio_concurrency", 1
+                    ),
+                    "gpu_memory_observed": gpu_observation,
+                    "provider_gpu_allocator_observed": (
+                        provider_gpu_allocator_observation
+                    ),
+                    "timing_plan_path": self._relative_project_path(
+                        timing_plan_path, project_id
+                    ),
+                    "timing_plan": timing_plan,
+                    "rendered_planned_duration_seconds": timing_plan[
+                        "rendered_total_duration_seconds"
+                    ],
+                }
+            )
+            job.result_json = current
+            crud.set_job_progress(session, job, 65)
+            session.commit()
+
+        source_trace = source_payload.get("source_trace")
+        if not isinstance(source_trace, dict):
+            source_trace = {}
+        generation_context = {
+            "generation_job_id": job_id,
+            "job_type": REAL_AUDIO_JOB_TYPE,
+            "request": request_snapshot,
+            "parent_job_id": request_snapshot.get("parent_job_id"),
+            "source_script_job_id": source_script_job_id,
+            "source_image_job_id": source_image_job_id,
+            "script": {
+                "schema_version": script.schema_version,
+                "provider_id": "reused",
+                "source_script_provider": source_script_provider,
+                "source_script_job_id": source_script_job_id,
+                "script_provider_calls": 0,
+            },
+            "providers": {
+                "script_provider": "reused",
+                "source_script_provider": source_script_provider,
+                "script_source_type": "REUSED_VALIDATED_SCRIPT",
+                "image_provider": source_image_provider,
+                "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+                "image_provider_calls": 0,
+                "audio_provider": REAL_AUDIO_PROVIDER_ID,
+                "audio_model_id": getattr(
+                    provider, "model_id", self.settings.qwen_tts_model_id
+                ),
+                "audio_model_revision": getattr(
+                    provider,
+                    "model_revision",
+                    self.settings.qwen_tts_model_revision,
+                ),
+                "audio_model_license": getattr(
+                    provider,
+                    "model_license",
+                    self.settings.qwen_tts_model_license,
+                ),
+                "audio_source_type": REAL_AUDIO_SOURCE_TYPE,
+                "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            },
+            "source_trace": source_trace,
+            "audio_generation_report": self._relative_project_path(
+                report_path, project_id
+            )
+            if report_path.is_file()
+            else None,
+            "timing_plan_path": self._relative_project_path(
+                timing_plan_path, project_id
+            ),
+            "timing_plan": timing_plan,
+            "audio_generation_total_seconds": audio_generation_total_seconds,
+            "model_load_count": model_load_count,
+            "sequential_generation": provider_report.get(
+                "sequential_generation", True
+            ),
+            "max_audio_concurrency": provider_report.get(
+                "max_audio_concurrency", 1
+            ),
+            "gpu_memory_observed": gpu_observation,
+            "provider_gpu_allocator_observed": provider_gpu_allocator_observation,
+            "mock_audio_fallback": False,
+        }
+        media_shots = self._real_audio_media_shots(script)
+        output_dir = self.settings.project_dir(project_id) / "exports" / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        renderer = self.real_audio_renderer or self._default_real_audio_renderer()
+        try:
+            rendered = renderer(
+                root=self.settings.root_dir,
+                project_id=project_id,
+                project_title=project_title,
+                shots=media_shots,
+                keyframes=source_images,
+                audio_assets=[asset.as_dict() for asset in generated_assets],
+                timing_plan=timing_plan,
+                timing_plan_path=timing_plan_path,
+                output_dir=output_dir,
+                output_filename=f"short_{job_id}.mp4",
+                provider_id=REAL_AUDIO_PROVIDER_ID,
+                generation_context=generation_context,
+                max_total_duration_seconds=timing_options[
+                    "max_total_duration_seconds"
+                ],
+                progress_callback=lambda progress: self._set_running_job_progress(
+                    job_id, max(66, min(95, int(progress)))
+                ),
+            )
+        except RealAudioJobError:
+            raise
+        except Exception as exc:
+            message = str(exc)
+            if "AUDIO_TIMING_EXCEEDS_LIMIT" in message:
+                raise RealAudioJobError(
+                    code="AUDIO_TIMING_EXCEEDS_LIMIT",
+                    stage="AUDIO_TIMING",
+                    summary=message[:500],
+                    completed_audio_count=len(generated_assets),
+                    total_audio_count=len(generated_assets),
+                    retryable=False,
+                ) from exc
+            raise RealAudioJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary=f"真实旁白媒体渲染失败：{message[:500]}",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(generated_assets),
+                log_paths={
+                    "audio_generation_report": str(report_path),
+                    "tts_stdout": str(job_trace_dir / "tts.stdout.log"),
+                    "tts_stderr": str(job_trace_dir / "tts.stderr.log"),
+                    "timing_plan": str(timing_plan_path),
+                },
+                suggestions=["检查 FFmpeg/FFprobe 与媒体追溯后手动重试。"],
+            ) from exc
+
+        self._finish_real_audio_job(
+            job_id=job_id,
+            project_id=project_id,
+            request_snapshot=request_snapshot,
+            generated_assets=generated_assets,
+            rendered=rendered,
+            timing_plan=timing_plan,
+            timing_plan_path=timing_plan_path,
+            source_script_job_id=source_script_job_id,
+            source_script_provider=source_script_provider,
+            source_image_job_id=source_image_job_id,
+            source_image_provider=source_image_provider,
+            audio_generation_total_seconds=audio_generation_total_seconds,
+            provider_report=provider_report,
+            gpu_observation=gpu_observation,
+        )
+
+    def _real_audio_options(
+        self, request_snapshot: dict[str, Any]
+    ) -> AudioGenerationOptions:
+        payload = request_snapshot.get("audio_options")
+        if not isinstance(payload, dict):
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary="真实旁白 Job 缺少 audio_options 快照。",
+                retryable=False,
+            )
+        if payload.get("speaker") != request_snapshot.get("speaker"):
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary="audio_options.speaker 与 Job 顶层快照不一致。",
+                retryable=False,
+            )
+        if payload.get("language") != request_snapshot.get("language"):
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary="audio_options.language 与 Job 顶层快照不一致。",
+                retryable=False,
+            )
+        try:
+            options = AudioGenerationOptions(
+                speaker=str(payload["speaker"]),
+                language=str(payload["language"]),
+                base_seed=payload["base_seed"],
+                model_load_timeout_seconds=float(
+                    payload["model_load_timeout_seconds"]
+                ),
+                generation_timeout_seconds=float(
+                    payload["generation_timeout_seconds"]
+                ),
+                job_timeout_seconds=float(payload["job_timeout_seconds"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary=f"真实旁白参数快照无法通过校验：{exc}",
+                retryable=False,
+            ) from exc
+        if options.speaker not in {"Serena", "Vivian"}:
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary="M5-B 音色只允许 Serena 或 Vivian。",
+                retryable=False,
+            )
+        if options.language != "Chinese":
+            raise RealAudioJobError(
+                code="AUDIO_OPTIONS_INVALID",
+                stage="AUDIO_GENERATION",
+                summary="M5-B language 必须为 Chinese。",
+                retryable=False,
+            )
+        return options
+
+    def _real_audio_timing_options(
+        self, request_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = request_snapshot.get("timing_options")
+        if not isinstance(payload, dict):
+            raise RealAudioJobError(
+                code="AUDIO_TIMING_INVALID",
+                stage="AUDIO_TIMING",
+                summary="真实旁白 Job 缺少 timing_options 快照。",
+                retryable=False,
+            )
+        try:
+            fps = payload["fps"]
+            lead_in = float(payload["lead_in_seconds"])
+            lead_out = float(payload["lead_out_seconds"])
+            maximum = float(payload["max_total_duration_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RealAudioJobError(
+                code="AUDIO_TIMING_INVALID",
+                stage="AUDIO_TIMING",
+                summary=f"真实旁白时序参数无法读取：{exc}",
+                retryable=False,
+            ) from exc
+        if type(fps) is not int or fps != 24:
+            raise RealAudioJobError(
+                code="AUDIO_TIMING_INVALID",
+                stage="AUDIO_TIMING",
+                summary="M5-B 媒体帧率快照必须为 24fps。",
+                retryable=False,
+            )
+        if abs(lead_in - 0.20) > 1e-6 or abs(lead_out - 0.35) > 1e-6:
+            raise RealAudioJobError(
+                code="AUDIO_TIMING_INVALID",
+                stage="AUDIO_TIMING",
+                summary="M5-B 前导和尾部留白必须分别为 0.20 与 0.35 秒。",
+                retryable=False,
+            )
+        if maximum <= 0:
+            raise RealAudioJobError(
+                code="AUDIO_TIMING_INVALID",
+                stage="AUDIO_TIMING",
+                summary="真实旁白渲染总时长上限必须大于 0。",
+                retryable=False,
+            )
+        return {
+            "fps": fps,
+            "lead_in_seconds": lead_in,
+            "lead_out_seconds": lead_out,
+            "max_total_duration_seconds": maximum,
+        }
+
+    def _real_audio_provider(self) -> AudioProvider:
+        if self.audio_provider_factory is not None:
+            return self.audio_provider_factory(self.settings)
+        return create_qwen3_tts_provider(self.settings)
+
+    def _real_audio_source_images(
+        self,
+        *,
+        project_id: str,
+        script: ScriptV1,
+        source_payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        raw_images = source_payload.get("source_images")
+        if not isinstance(raw_images, list) or len(raw_images) != len(script.shots):
+            raise RealAudioJobError(
+                code="IMAGE_OUTPUT_MISSING",
+                stage="SOURCE_REUSE",
+                summary="真实旁白来源快照缺少完整真实 PNG。",
+                retryable=False,
+            )
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in raw_images:
+            if not isinstance(item, dict) or not isinstance(item.get("shot_id"), str):
+                raise RealAudioJobError(
+                    code="IMAGE_OUTPUT_MISSING",
+                    stage="SOURCE_REUSE",
+                    summary="来源真实 PNG 追溯格式无效。",
+                    retryable=False,
+                )
+            payload = dict(item)
+            shot_id = str(payload["shot_id"])
+            if shot_id in by_id:
+                raise RealAudioJobError(
+                    code="IMAGE_OUTPUT_MISSING",
+                    stage="SOURCE_REUSE",
+                    summary=f"来源真实 PNG shot_id 重复：{shot_id}",
+                    retryable=False,
+                )
+            try:
+                image_path = self._stored_project_path(
+                    str(payload["image_path"]), project_id
+                )
+                recorded_sha256 = str(payload["image_sha256"]).lower()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RealAudioJobError(
+                    code="IMAGE_OUTPUT_MISSING",
+                    stage="SOURCE_REUSE",
+                    summary=f"来源真实 PNG {shot_id} 路径追溯无效。",
+                    retryable=False,
+                ) from exc
+            if (
+                not image_path.is_file()
+                or image_path.stat().st_size <= 0
+                or sha256_file(image_path) != recorded_sha256
+            ):
+                raise RealAudioJobError(
+                    code="IMAGE_OUTPUT_MISSING",
+                    stage="SOURCE_REUSE",
+                    summary=f"来源真实 PNG {shot_id} 缺失或 SHA256 不匹配。",
+                    failed_shot_id=shot_id,
+                    retryable=False,
+                )
+            payload["image_path"] = str(image_path)
+            for field in ("workflow_path", "trace_path"):
+                value = payload.get(field)
+                if isinstance(value, str) and value:
+                    payload[field] = str(
+                        self._stored_project_path(value, project_id)
+                    )
+            by_id[shot_id] = payload
+        expected_ids = [shot.id for shot in script.shots]
+        if set(by_id) != set(expected_ids):
+            raise RealAudioJobError(
+                code="IMAGE_OUTPUT_MISSING",
+                stage="SOURCE_REUSE",
+                summary="来源真实 PNG 镜头集合与 ScriptV1 不一致。",
+                retryable=False,
+            )
+        return [by_id[shot_id] for shot_id in expected_ids]
+
+    @staticmethod
+    def _real_audio_media_shots(script: ScriptV1) -> list[dict[str, Any]]:
+        return [
+            {
+                "shot_id": shot.id,
+                "sequence_no": shot.index,
+                "title": shot.title,
+                "visual_description": shot.visual_description,
+                "subtitle_text": shot.narration,
+                "duration_seconds": float(shot.duration_seconds),
+                "provider_id": "reused",
+                "script_provider_id": "reused",
+                "source_type": "REUSED_VALIDATED_SCRIPT",
+                "generation_parameters": {
+                    "scene_id": shot.scene_id,
+                    "character_ids": list(shot.character_ids),
+                    "camera": shot.camera,
+                    "image_prompt": shot.image_prompt,
+                    "negative_prompt": shot.negative_prompt,
+                },
+            }
+            for shot in script.shots
+        ]
+
+    def _load_reusable_audio_assets(
+        self,
+        *,
+        project_id: str,
+        request_snapshot: dict[str, Any],
+    ) -> tuple[GeneratedAudioAsset, ...]:
+        source_job_id = request_snapshot.get("resume_audio_from_job_id")
+        if not isinstance(source_job_id, str) or not source_job_id:
+            return ()
+        with self.database.session() as session:
+            source_job = crud.get_job(session, source_job_id)
+            if (
+                source_job is None
+                or source_job.project_id != project_id
+                or source_job.job_type != REAL_AUDIO_JOB_TYPE
+                or source_job.provider_id != REAL_AUDIO_PROVIDER_ID
+            ):
+                raise RealAudioJobError(
+                    code="AUDIO_RESUME_INVALID",
+                    stage="AUDIO_GENERATION",
+                    summary="真实旁白重试来源 Job 不存在或来源不匹配。",
+                    retryable=False,
+                )
+            source_result = dict(source_job.result_json or {})
+        items = source_result.get("audio_shots")
+        if not isinstance(items, list):
+            return ()
+        reusable: list[GeneratedAudioAsset] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("status") not in {
+                "SUCCEEDED",
+                "REUSED",
+            }:
+                continue
+            try:
+                warnings = item.get("warnings", [])
+                if not isinstance(warnings, list) or not all(
+                    isinstance(value, str) for value in warnings
+                ):
+                    continue
+                reusable.append(
+                    GeneratedAudioAsset(
+                        provider_id=str(item["provider_id"]),
+                        model_id=str(item["model_id"]),
+                        model_revision=str(item["model_revision"]),
+                        model_sha256=str(item["model_sha256"]),
+                        shot_id=str(item["shot_id"]),
+                        audio_path=self._stored_project_path(
+                            str(item["audio_path"]), project_id
+                        ),
+                        trace_path=self._stored_project_path(
+                            str(item["trace_path"]), project_id
+                        ),
+                        text=str(item["text"]),
+                        speaker=str(item["speaker"]),
+                        language=str(item["language"]),
+                        seed=int(item["seed"]),
+                        sample_rate=int(item["sample_rate"]),
+                        channels=int(item["channels"]),
+                        sample_width_bytes=int(item["sample_width_bytes"]),
+                        duration_seconds=float(item["duration_seconds"]),
+                        generation_seconds=float(item["generation_seconds"]),
+                        real_time_factor=float(item["real_time_factor"]),
+                        peak_amplitude=float(item["peak_amplitude"]),
+                        rms=float(item["rms"]),
+                        audio_sha256=str(item["audio_sha256"]),
+                        warnings=tuple(warnings),
+                        reused=True,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return tuple(reusable)
+
+    def _record_real_audio_progress(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        database_shot_id: str,
+        shot_index: int,
+        total: int,
+        asset: GeneratedAudioAsset,
+    ) -> None:
+        relative_audio = self._relative_project_path(asset.audio_path, project_id)
+        relative_trace = self._relative_project_path(asset.trace_path, project_id)
+        serialized = {
+            **asset.as_dict(),
+            "shot_index": shot_index,
+            "status": "REUSED" if asset.reused else "SUCCEEDED",
+            "audio_path": relative_audio,
+            "trace_path": relative_trace,
+            "source_type": REAL_AUDIO_SOURCE_TYPE,
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"记录旁白时 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            audio_shots = current.get("audio_shots")
+            if not isinstance(audio_shots, list):
+                audio_shots = []
+            existing = next(
+                (
+                    item
+                    for item in audio_shots
+                    if isinstance(item, dict)
+                    and item.get("shot_id") == asset.shot_id
+                    and item.get("audio_asset_id")
+                ),
+                None,
+            )
+            if existing is None:
+                database_asset = crud.create_asset(
+                    session,
+                    project_id=project_id,
+                    shot_id=database_shot_id,
+                    asset_type="NARRATION_AUDIO",
+                    provider_id=asset.provider_id,
+                    source_type=REAL_AUDIO_SOURCE_TYPE,
+                    file_path=relative_audio,
+                    sha256=asset.audio_sha256,
+                    metadata_json={
+                        "job_id": job_id,
+                        "shot_id": asset.shot_id,
+                        "shot_index": shot_index,
+                        "model_id": asset.model_id,
+                        "model_revision": asset.model_revision,
+                        "model_sha256": asset.model_sha256,
+                        "speaker": asset.speaker,
+                        "language": asset.language,
+                        "seed": asset.seed,
+                        "sample_rate": asset.sample_rate,
+                        "channels": asset.channels,
+                        "sample_width_bytes": asset.sample_width_bytes,
+                        "duration_seconds": asset.duration_seconds,
+                        "generation_seconds": asset.generation_seconds,
+                        "real_time_factor": asset.real_time_factor,
+                        "peak_amplitude": asset.peak_amplitude,
+                        "rms": asset.rms,
+                        "trace_path": relative_trace,
+                        "reused": asset.reused,
+                    },
+                )
+                serialized["audio_asset_id"] = database_asset.id
+                serialized["audio_url"] = (
+                    f"/api/projects/{project_id}/assets/"
+                    f"{database_asset.id}/content"
+                )
+            else:
+                serialized["audio_asset_id"] = existing.get("audio_asset_id")
+                serialized["audio_url"] = existing.get("audio_url")
+            by_id = {
+                str(item.get("shot_id")): dict(item)
+                for item in audio_shots
+                if isinstance(item, dict) and item.get("shot_id")
+            }
+            by_id[asset.shot_id] = serialized
+            ordered = sorted(
+                by_id.values(), key=lambda item: int(item.get("shot_index", 999))
+            )
+            completed_count = sum(
+                item.get("status") in {"SUCCEEDED", "REUSED"} for item in ordered
+            )
+            current.update(
+                {
+                    "stage": "AUDIO_GENERATION",
+                    "audio_shots": ordered,
+                    "audio_completed_count": completed_count,
+                    "audio_total_count": total,
+                    "current_shot_id": asset.shot_id,
+                    "current_shot_index": shot_index,
+                }
+            )
+            job.result_json = current
+            crud.set_job_progress(session, job, 5 + int(55 * completed_count / total))
+            session.commit()
+
+    def _finish_real_audio_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        request_snapshot: dict[str, Any],
+        generated_assets: tuple[GeneratedAudioAsset, ...],
+        rendered: dict[str, Any],
+        timing_plan: dict[str, Any],
+        timing_plan_path: Path,
+        source_script_job_id: str,
+        source_script_provider: str,
+        source_image_job_id: str,
+        source_image_provider: str,
+        audio_generation_total_seconds: float,
+        provider_report: dict[str, Any],
+        gpu_observation: dict[str, Any],
+    ) -> None:
+        output_path = Path(str(rendered.get("output_path", ""))).resolve()
+        manifest_path = Path(str(rendered.get("manifest_path", ""))).resolve()
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise RealAudioJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层未生成有效真实旁白 MP4。",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(generated_assets),
+            )
+        if not manifest_path.is_file() or manifest_path.stat().st_size <= 0:
+            raise RealAudioJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层未生成有效真实旁白 Manifest。",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(generated_assets),
+            )
+        validation = rendered.get("validation")
+        if not isinstance(validation, dict):
+            raise RealAudioJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层返回结果缺少 ffprobe 验证。",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(generated_assets),
+            )
+        relative_video = self._relative_project_path(output_path, project_id)
+        relative_manifest = self._relative_project_path(manifest_path, project_id)
+        relative_timing = self._relative_project_path(timing_plan_path, project_id)
+        video_sha256 = sha256_file(output_path)
+        if rendered.get("sha256") not in (None, video_sha256):
+            raise RealAudioJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层返回的 MP4 SHA256 与文件实算值不一致。",
+                completed_audio_count=len(generated_assets),
+                total_audio_count=len(generated_assets),
+            )
+        manifest_sha256 = sha256_file(manifest_path)
+        source_duration = float(timing_plan["source_total_duration_seconds"])
+        rendered_duration = float(timing_plan["rendered_total_duration_seconds"])
+        encoded_duration = float(
+            validation.get(
+                "encoded_duration_seconds", validation.get("duration_seconds")
+            )
+        )
+        extension = round(rendered_duration - source_duration, 6)
+        generated_count = sum(not item.reused for item in generated_assets)
+        reused_count = sum(item.reused for item in generated_assets)
+
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"媒体完成时真实旁白 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            video_asset = crud.create_asset(
+                session,
+                project_id=project_id,
+                asset_type="EXPORT_VIDEO",
+                provider_id=REAL_AUDIO_PROVIDER_ID,
+                source_type="REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+                file_path=relative_video,
+                sha256=video_sha256,
+                metadata_json={"job_id": job_id, "validation": validation},
+            )
+            manifest_asset = crud.create_asset(
+                session,
+                project_id=project_id,
+                asset_type="MANIFEST",
+                provider_id=REAL_AUDIO_PROVIDER_ID,
+                source_type="REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+                file_path=relative_manifest,
+                sha256=manifest_sha256,
+                metadata_json={"job_id": job_id},
+            )
+            export = crud.create_export(
+                session,
+                project_id=project_id,
+                job_id=job_id,
+                file_path=relative_video,
+                manifest_path=relative_manifest,
+                duration_seconds=encoded_duration,
+                sha256=video_sha256,
+            )
+            current.update(
+                {
+                    "stage": "SUCCEEDED",
+                    "export_id": export.id,
+                    "video_asset_id": video_asset.id,
+                    "manifest_asset_id": manifest_asset.id,
+                    "video_path": relative_video,
+                    "manifest_path": relative_manifest,
+                    "timing_plan_path": relative_timing,
+                    "sha256": video_sha256,
+                    "validation": validation,
+                    "source_planned_duration_seconds": source_duration,
+                    "rendered_planned_duration_seconds": rendered_duration,
+                    "planned_duration_seconds": rendered_duration,
+                    "encoded_duration_seconds": encoded_duration,
+                    "duration_seconds": encoded_duration,
+                    "duration_delta_seconds": float(
+                        validation.get(
+                            "duration_delta_seconds",
+                            encoded_duration - rendered_duration,
+                        )
+                    ),
+                    "duration_tolerance_seconds": validation.get(
+                        "duration_tolerance_seconds"
+                    ),
+                    "duration_validation": validation.get("duration_validation"),
+                    "extended_by_seconds": extension,
+                    "timing_plan": timing_plan,
+                    "provider_id": REAL_AUDIO_PROVIDER_ID,
+                    "script_provider": "reused",
+                    "source_script_provider": source_script_provider,
+                    "source_script_job_id": source_script_job_id,
+                    "script_provider_calls": 0,
+                    "image_provider": "reused",
+                    "source_image_provider": source_image_provider,
+                    "source_image_job_id": source_image_job_id,
+                    "image_provider_calls": 0,
+                    "audio_provider": REAL_AUDIO_PROVIDER_ID,
+                    "audio_model_id": generated_assets[0].model_id,
+                    "audio_model_revision": generated_assets[0].model_revision,
+                    "audio_model_sha256": generated_assets[0].model_sha256,
+                    "audio_model_license": self.settings.qwen_tts_model_license,
+                    "speaker": generated_assets[0].speaker,
+                    "language": generated_assets[0].language,
+                    "source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+                    "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+                    "audio_generation_total_seconds": (
+                        audio_generation_total_seconds
+                    ),
+                    "audio_generated_count": generated_count,
+                    "audio_reused_count": reused_count,
+                    "model_load_count": provider_report.get("model_load_count"),
+                    "sequential_generation": provider_report.get(
+                        "sequential_generation", True
+                    ),
+                    "max_audio_concurrency": provider_report.get(
+                        "max_audio_concurrency", 1
+                    ),
+                    "gpu_memory_observed": gpu_observation,
+                    "provider_gpu_allocator_observed": provider_report.get(
+                        "gpu_memory_observed"
+                    ),
+                    "mock_audio_fallback": False,
+                    "mock_audio_used": False,
+                    "cloud_api_used": False,
+                    "voice_cloning_used": False,
+                    "video_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/video"
+                    ),
+                    "download_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/video"
+                        "?download=true"
+                    ),
+                    "manifest_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/manifest"
+                    ),
+                    "request_snapshot": request_snapshot,
+                }
+            )
+            crud.mark_job_succeeded(session, job=job, result_json=current)
+            session.commit()
+        print(
+            f"[worker] real-audio job={job_id} SUCCEEDED export={export.id}",
+            flush=True,
+        )
 
     def _process_real_image_job(
         self,
@@ -1577,6 +2737,12 @@ class Worker:
         from .media import render_image_project_short
 
         return render_image_project_short
+
+    @staticmethod
+    def _default_real_audio_renderer() -> Renderer:
+        from .media import render_real_audio_project_short
+
+        return render_real_audio_project_short
 
     def _relative_project_path(self, path: Path, project_id: str) -> str:
         data_root = Path(self.settings.data_dir).resolve()

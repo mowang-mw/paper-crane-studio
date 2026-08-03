@@ -20,18 +20,23 @@ import {
   getProviders,
   imageAssetUrl,
   listProjects,
+  renderRealAudio,
   renderRealImages,
   retryJob,
 } from "./api";
 import type {
+  AudioProviderStatus,
+  AudioSpeaker,
   DesiredShotCount,
   DurationNormalization,
+  GeneratedAudioShot,
   GeneratedImageShot,
   GenerationAttemptError,
   GenerationErrorDetail,
   GenerationJob,
   HealthStatus,
   JobStatus,
+  MediaTimingPlan,
   Project,
   ProjectDetail,
   ProvidersStatus,
@@ -44,6 +49,7 @@ const PAPER_CRANE_STORY =
 const PAPER_CRANE_TITLE = "纸鹤的夜航";
 const LLM_START_COMMAND = ".\\scripts\\run_llm_server.ps1";
 const REAL_IMAGE_PROVIDER_ID = "comfyui-animagine-xl-4";
+const REAL_AUDIO_PROVIDER_ID = "qwen3-tts-0.6b-customvoice";
 const STORY_MIN_CHARS = 10;
 const STORY_MAX_CHARS = 3000;
 const STORY_RECOMMENDED_MIN_CHARS = 50;
@@ -108,6 +114,125 @@ function isRealImageJob(job: GenerationJob | null | undefined): boolean {
     job.job_type === "RENDER_REAL_IMAGES" ||
     textValue(job.request_json?.image_provider) === REAL_IMAGE_PROVIDER_ID ||
     textValue(job.result_json?.image_provider) === REAL_IMAGE_PROVIDER_ID
+  );
+}
+
+function isRealAudioJob(job: GenerationJob | null | undefined): boolean {
+  if (!job) return false;
+  return (
+    job.job_type === "GENERATE_REAL_AUDIO_VIDEO" ||
+    textValue(job.request_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID ||
+    textValue(job.result_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID
+  );
+}
+
+function jobAudioProvider(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return (
+    textValue(job.result_json?.audio_provider) ??
+    textValue(job.request_json?.audio_provider) ??
+    (isRealAudioJob(job) ? textValue(job.provider_id) : null)
+  );
+}
+
+function jobAudioSpeaker(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return textValue(job.result_json?.speaker) ?? textValue(job.request_json?.speaker);
+}
+
+function jobAudioLanguage(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return textValue(job.result_json?.language) ?? textValue(job.request_json?.language);
+}
+
+function jobSourceImageId(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return (
+    textValue(job.result_json?.source_image_job_id) ??
+    textValue(job.request_json?.source_image_job_id) ??
+    textValue(job.request_json?.parent_job_id)
+  );
+}
+
+function jobAudioShots(job: GenerationJob | null | undefined): GeneratedAudioShot[] {
+  const audios = job?.result_json?.audio_shots;
+  if (!Array.isArray(audios)) return [];
+  return audios.filter(
+    (item): item is GeneratedAudioShot =>
+      recordValue(item) !== null && typeof item.shot_id === "string" && item.shot_id.length > 0,
+  );
+}
+
+function jobAudioCompletedCount(job: GenerationJob | null | undefined): number {
+  if (!job) return 0;
+  return (
+    numberValue(job.result_json?.audio_completed_count) ??
+    numberValue(job.result_json?.completed_audio_count) ??
+    jobAudioShots(job).filter(
+      (audio) =>
+        audio.status === "SUCCEEDED" ||
+        audio.status === "REUSED" ||
+        Boolean(textValue(audio.audio_sha256)),
+    ).length
+  );
+}
+
+function jobAudioTotalCount(job: GenerationJob | null | undefined, fallback = 0): number {
+  if (!job) return fallback;
+  return (
+    numberValue(job.result_json?.audio_total_count) ??
+    numberValue(job.result_json?.total_audio_count) ??
+    jobActualShotCount(job, fallback) ??
+    fallback
+  );
+}
+
+function jobAudioGenerationSeconds(job: GenerationJob | null | undefined): number | null {
+  if (!job) return null;
+  return (
+    numberValue(job.result_json?.audio_generation_total_seconds) ??
+    numberValue(job.result_json?.audio_generation_seconds) ??
+    numberValue(job.result_json?.tts_generation_seconds)
+  );
+}
+
+function jobTimingPlan(job: GenerationJob | null | undefined): MediaTimingPlan | null {
+  const plan = recordValue(job?.result_json?.timing_plan);
+  return plan ? (plan as MediaTimingPlan) : null;
+}
+
+function jobSourcePlannedDuration(job: GenerationJob | null | undefined): number | null {
+  const plan = jobTimingPlan(job);
+  return (
+    numberValue(job?.result_json?.source_planned_duration_seconds) ??
+    numberValue(plan?.source_planned_duration_seconds) ??
+    numberValue(plan?.source_total_duration_seconds) ??
+    numberValue(job?.result_json?.planned_duration_seconds)
+  );
+}
+
+function jobRenderedPlannedDuration(job: GenerationJob | null | undefined): number | null {
+  const plan = jobTimingPlan(job);
+  return (
+    numberValue(job?.result_json?.rendered_planned_duration_seconds) ??
+    numberValue(plan?.rendered_planned_duration_seconds) ??
+    numberValue(plan?.rendered_total_duration_seconds) ??
+    numberValue(job?.result_json?.planned_duration_seconds)
+  );
+}
+
+function jobAudioExtensionSeconds(job: GenerationJob | null | undefined): number | null {
+  const plan = jobTimingPlan(job);
+  return (
+    numberValue(job?.result_json?.audio_extension_seconds) ??
+    numberValue(job?.result_json?.extended_by_seconds) ??
+    numberValue(plan?.audio_extension_seconds) ??
+    numberValue(plan?.extended_by_seconds) ??
+    (() => {
+      const source = jobSourcePlannedDuration(job);
+      const rendered = jobRenderedPlannedDuration(job);
+      return source !== null && rendered !== null ? Math.max(0, rendered - source) : null;
+    })()
   );
 }
 
@@ -268,6 +393,20 @@ function shotCountLabel(value: DesiredShotCount | undefined): string {
 }
 
 function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): string {
+  if (isRealAudioJob(job)) {
+    const completed = jobAudioCompletedCount(job);
+    const total = jobAudioTotalCount(job, fallbackActual ?? 0);
+    const speaker = jobAudioSpeaker(job) ?? "未报告音色";
+    const elapsed = jobAudioGenerationSeconds(job);
+    const extension = jobAudioExtensionSeconds(job);
+    const countText = total > 0 ? `${completed}/${total} 段` : `${completed} 段`;
+    const elapsedText = elapsed === null ? "" : `，TTS 共 ${elapsed.toFixed(1)} 秒`;
+    const extensionText =
+      extension !== null && extension > 0.0005
+        ? `；为完整播放旁白，成片透明延长 ${extension.toFixed(2)} 秒`
+        : "";
+    return `真实 AI 旁白已完成 ${countText}（${speaker}）${elapsedText}${extensionText}，并已合成为可播放短片。`;
+  }
   if (isRealImageJob(job)) {
     const completed = jobImageCompletedCount(job);
     const total = jobImageTotalCount(job, fallbackActual ?? 0);
@@ -381,13 +520,22 @@ function FailureCard({
     storyCharCount !== null &&
     storyCharCount >= STORY_MIN_CHARS &&
     storyCharCount <= STORY_MAX_CHARS;
-  const imageFailure =
+  const audioFailure =
+    stage?.startsWith("TTS_") === true ||
+    stage?.startsWith("AUDIO_") === true ||
+    code?.startsWith("TTS_") === true ||
+    code?.startsWith("AUDIO_") === true ||
+    textValue(detail?.provider_id) === REAL_AUDIO_PROVIDER_ID ||
+    textValue(detail?.audio_provider) === REAL_AUDIO_PROVIDER_ID ||
+    textValue(detail?.speaker) !== null;
+  const imageFailure = !audioFailure && (
     stage?.startsWith("IMAGE_") === true ||
     stage?.startsWith("COMFYUI_") === true ||
     code === "GPU_HANDOFF_REQUIRED" ||
     code === "GPU_OOM" ||
     code === "MODEL_NOT_FOUND" ||
-    code === "MODEL_HASH_MISMATCH";
+    code === "MODEL_HASH_MISMATCH"
+  );
   const failedShotId = textValue(detail?.failed_shot_id) ?? textValue(detail?.shot_id);
   const failedShotIndex =
     numberValue(detail?.failed_shot_index) ?? numberValue(detail?.shot_index);
@@ -399,9 +547,21 @@ function FailureCard({
     numberValue(detail?.image_total_count) ??
     numberValue(detail?.total_image_count) ??
     numberValue(detail?.total_images);
+  const completedAudios =
+    numberValue(detail?.audio_completed_count) ??
+    numberValue(detail?.completed_audio_count) ??
+    numberValue(detail?.completed_audios);
+  const totalAudios =
+    numberValue(detail?.audio_total_count) ??
+    numberValue(detail?.total_audio_count) ??
+    numberValue(detail?.total_audios);
+  const reusableAudios = numberValue(detail?.reusable_audio_count);
+  const failureSpeaker = textValue(detail?.speaker);
   const retryable = booleanValue(detail?.retryable);
-  const requiresQwenShutdown =
-    booleanValue(detail?.requires_qwen_shutdown) === true || code === "GPU_HANDOFF_REQUIRED";
+  const requiresGpuHandoff =
+    booleanValue(detail?.requires_gpu_handoff) === true ||
+    booleanValue(detail?.requires_qwen_shutdown) === true ||
+    code === "GPU_HANDOFF_REQUIRED";
   const oom = booleanValue(detail?.oom) === true || code === "GPU_OOM";
   const rawLogPaths = detail?.log_paths;
   const logPathRecord = recordValue(rawLogPaths);
@@ -418,7 +578,7 @@ function FailureCard({
   return (
     <div className="failure-box">
       <p className="failure-summary">{summary}</p>
-      {inputLengthValid && stage !== "INPUT_VALIDATION" && !imageFailure && (
+      {inputLengthValid && stage !== "INPUT_VALIDATION" && !imageFailure && !audioFailure && (
         <p className="failure-context">
           输入故事共 {storyCharCount} 个字符，长度合法；失败发生在
           {stage ? ` ${stage} 阶段` : "模型输出处理阶段"}，不是故事长度拦截。
@@ -436,8 +596,15 @@ function FailureCard({
           {imageFailure && <div><dt>失败镜头</dt><dd>{failedShotIndex !== null ? `第 ${failedShotIndex} 镜` : failedShotId ?? "尚未进入单镜生成"}</dd></div>}
           {imageFailure && <div><dt>已完成图片</dt><dd>{completedImages === null ? "未报告" : `${completedImages}/${totalImages ?? "?"}`}</dd></div>}
           {imageFailure && <div><dt>可直接重试</dt><dd>{retryable === null ? "未报告" : retryable ? "可以" : "不建议"}</dd></div>}
-          {imageFailure && <div><dt>需要停止 Qwen</dt><dd>{requiresQwenShutdown ? "是" : "否"}</dd></div>}
+          {imageFailure && <div><dt>需要释放 GPU</dt><dd>{requiresGpuHandoff ? "是" : "否"}</dd></div>}
           {imageFailure && <div><dt>发生显存不足</dt><dd>{oom ? "是" : "否"}</dd></div>}
+          {audioFailure && <div><dt>失败镜头</dt><dd>{failedShotIndex !== null ? `第 ${failedShotIndex} 镜` : failedShotId ?? "尚未进入单镜生成"}</dd></div>}
+          {audioFailure && <div><dt>已完成旁白</dt><dd>{completedAudios === null ? "未报告" : `${completedAudios}/${totalAudios ?? "?"} 段`}</dd></div>}
+          {audioFailure && <div><dt>旁白音色</dt><dd>{failureSpeaker ?? "未报告"}</dd></div>}
+          {audioFailure && <div><dt>可复用旁白</dt><dd>{reusableAudios === null ? "由重试任务重新校验" : `${reusableAudios} 段`}</dd></div>}
+          {audioFailure && <div><dt>可直接重试</dt><dd>{retryable === null ? "未报告" : retryable ? "可以" : "不建议"}</dd></div>}
+          {audioFailure && <div><dt>需要释放 GPU</dt><dd>{requiresGpuHandoff ? "是" : "否"}</dd></div>}
+          {audioFailure && <div><dt>发生显存不足</dt><dd>{oom ? "是" : "否"}</dd></div>}
         </dl>
         {logPaths.length > 0 && (
           <div className="attempt-errors">
@@ -469,7 +636,9 @@ function FailureCard({
             <ul>{suggestions.map((item, index) => <li key={index}>{item}</li>)}</ul>
           ) : (
             <p>
-              {imageFailure
+              {audioFailure
+                ? "排除独立 TTS 环境、模型或显存问题后可手动重试；后端只会复用通过校验的旁白，不会回退 Mock。"
+                : imageFailure
                 ? "可在排除显存、模型或 ComfyUI 问题后重试；已完成且校验通过的图片会被复用。"
                 : "可手动重试；若重复失败，请查看后端保存的校验报告。"}
             </p>
@@ -537,6 +706,7 @@ function JobPanel({
   onViewResult,
   configuredModelId,
   configuredImageModelId,
+  configuredAudioModelId,
   actualShotCount,
 }: {
   job: GenerationJob;
@@ -545,9 +715,11 @@ function JobPanel({
   onViewResult: () => void;
   configuredModelId?: string | null;
   configuredImageModelId?: string | null;
+  configuredAudioModelId?: string | null;
   actualShotCount?: number;
 }) {
-  const imageJob = isRealImageJob(job);
+  const audioJob = isRealAudioJob(job);
+  const imageJob = !audioJob && isRealImageJob(job);
   const progress = Math.max(0, Math.min(100, Math.round(job.progress ?? 0)));
   const tracedModelId = jobModelId(job);
   const modelLabel =
@@ -590,12 +762,30 @@ function JobPanel({
     textValue(job.result_json?.image_model_id) ??
     configuredImageModelId ??
     "任务尚未报告";
+  const audioCompleted = jobAudioCompletedCount(job);
+  const audioTotal = jobAudioTotalCount(job, actualShotCount ?? 0);
+  const audioElapsed = jobAudioGenerationSeconds(job);
+  const audioSpeaker = jobAudioSpeaker(job);
+  const audioLanguage = jobAudioLanguage(job);
+  const audioModelLabel =
+    textValue(job.result_json?.audio_model_id) ??
+    configuredAudioModelId ??
+    "任务尚未报告";
+  const sourcePlannedDuration = jobSourcePlannedDuration(job);
+  const renderedPlannedDuration = jobRenderedPlannedDuration(job);
+  const audioExtension = jobAudioExtensionSeconds(job);
+  const currentAudioShotIndex =
+    numberValue(job.result_json?.current_audio_shot_index) ?? currentShotIndex;
+  const currentAudioShotId =
+    textValue(job.result_json?.current_audio_shot_id) ?? currentShotId;
   const jobStage = textValue(job.result_json?.stage);
   return (
     <section className={`job-panel job-${job.status.toLowerCase()}`} aria-live="polite">
       <div className="job-heading">
         <div>
-          <span className="eyebrow">{imageJob ? "真实图像与成片任务" : "生成任务"}</span>
+          <span className="eyebrow">
+            {audioJob ? "真实 AI 旁白与成片任务" : imageJob ? "真实图像与成片任务" : "生成任务"}
+          </span>
           <h3>{statusLabels[job.status] ?? job.status}</h3>
         </div>
         <span className="job-percent">{progress}%</span>
@@ -611,12 +801,25 @@ function JobPanel({
       </div>
       <p className="job-meta">
         任务 {job.id.slice(0, 8)} ·
-        {imageJob
+        {audioJob
+          ? ` Audio Provider：${jobAudioProvider(job) ?? "未报告"} · 模型：${audioModelLabel}`
+          : imageJob
           ? ` 图像 Provider：${jobImageProvider(job) ?? "未报告"} · 模型：${imageModelLabel}`
           : ` 剧本 Provider：${jobScriptProvider(job) ?? "未报告"} · 模型：${modelLabel}`}
       </p>
       <dl className="job-facts">
-        {imageJob ? (
+        {audioJob ? (
+          <>
+            <div><dt>旁白进度</dt><dd>{audioCompleted}/{audioTotal || "?"} 段</dd></div>
+            <div><dt>当前阶段</dt><dd>{jobStage ?? (job.status === "QUEUED" ? "等待 Worker" : "TTS 生成")}</dd></div>
+            <div><dt>当前镜头</dt><dd>{currentAudioShotIndex !== null ? `第 ${currentAudioShotIndex} 镜` : currentAudioShotId ?? "未报告"}</dd></div>
+            <div><dt>音色</dt><dd>{audioSpeaker ?? "未报告"}</dd></div>
+            <div><dt>语言</dt><dd>{audioLanguage ?? "未报告"}</dd></div>
+            <div><dt>TTS 总耗时</dt><dd>{audioElapsed === null ? "生成后报告" : `${audioElapsed.toFixed(1)} 秒`}</dd></div>
+            <div><dt>源图像 Job</dt><dd title={jobSourceImageId(job) ?? undefined}>{jobSourceImageId(job)?.slice(0, 8) ?? "未报告"}</dd></div>
+            <div><dt>并发</dt><dd>1（同次加载、顺序生成）</dd></div>
+          </>
+        ) : imageJob ? (
           <>
             <div><dt>图像进度</dt><dd>{imageCompleted}/{imageTotal || "?"} 张</dd></div>
             <div><dt>当前阶段</dt><dd>{jobStage ?? (job.status === "QUEUED" ? "等待 Worker" : "图像生成")}</dd></div>
@@ -647,9 +850,16 @@ function JobPanel({
             </div>
           </>
         )}
-        <div><dt>计划时长</dt><dd>{plannedDuration === null ? "未报告" : `${plannedDuration.toFixed(3)} 秒`}</dd></div>
+        <div><dt>{audioJob ? "源计划时长" : "计划时长"}</dt><dd>{(audioJob ? sourcePlannedDuration : plannedDuration) === null ? "未报告" : `${(audioJob ? sourcePlannedDuration : plannedDuration)!.toFixed(3)} 秒`}</dd></div>
+        {audioJob && <div><dt>渲染计划时长</dt><dd>{renderedPlannedDuration === null ? "未报告" : `${renderedPlannedDuration.toFixed(3)} 秒`}</dd></div>}
         <div><dt>编码时长</dt><dd>{encodedDuration === null ? "未报告" : `${encodedDuration.toFixed(3)} 秒`}</dd></div>
+        {audioJob && <div><dt>旁白延长</dt><dd>{audioExtension === null ? "未报告" : `${audioExtension.toFixed(3)} 秒`}</dd></div>}
       </dl>
+      {audioJob && (job.status === "RUNNING" || audioCompleted > 0) && (
+        <p className="job-hint audio-progress-copy">
+          已完成 {audioCompleted}/{audioTotal || "?"} 段真实旁白；本 Job 只加载一次 Qwen3-TTS，并按镜头顺序单并发生成。
+        </p>
+      )}
       {imageJob && (job.status === "RUNNING" || imageCompleted > 0) && (
         <p className="job-hint image-progress-copy">
           已完成 {imageCompleted}/{imageTotal || "?"} 张真实关键帧；同一任务内 ComfyUI 仅启动一次并顺序生成。
@@ -693,7 +903,9 @@ function JobPanel({
       )}
       {job.status === "QUEUED" && (
         <p className="job-hint">
-          {imageJob
+          {audioJob
+            ? "真实旁白任务已入队。请确保文本 Qwen 与 ComfyUI 已停止并释放 GPU；失败不会回退 Mock 音频。"
+            : imageJob
             ? "真实图像任务已入队。开始前请确保本地 Qwen 已停止并释放显存。"
             : "任务已入队。请确认独立 Worker 正在运行。"}
         </p>
@@ -885,6 +1097,7 @@ export default function App() {
   const [providerError, setProviderError] = useState("");
   const [providerChecking, setProviderChecking] = useState(false);
   const [scriptProvider, setScriptProvider] = useState<ScriptProviderId>("mock");
+  const [audioSpeaker, setAudioSpeaker] = useState<AudioSpeaker>("Serena");
   const [desiredShotCount, setDesiredShotCount] = useState<DesiredShotCount>(4);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -897,6 +1110,8 @@ export default function App() {
   const [generationRequestError, setGenerationRequestError] =
     useState<GenerationErrorDetail | null>(null);
   const [imageRequestError, setImageRequestError] =
+    useState<GenerationErrorDetail | null>(null);
+  const [audioRequestError, setAudioRequestError] =
     useState<GenerationErrorDetail | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [deleteCandidate, setDeleteCandidate] = useState<Project | null>(null);
@@ -1005,6 +1220,7 @@ export default function App() {
     setError("");
     setGenerationRequestError(null);
     setImageRequestError(null);
+    setAudioRequestError(null);
     refreshDetail(selectedId).catch((cause: unknown) => setError(readableError(cause)));
   }, [refreshDetail, selectedId]);
 
@@ -1179,6 +1395,7 @@ export default function App() {
     setError("");
     setGenerationRequestError(null);
     setImageRequestError(null);
+    setAudioRequestError(null);
     setNotice(null);
     try {
       if (scriptProvider === "llamacpp") {
@@ -1215,6 +1432,8 @@ export default function App() {
     setBusy("retry");
     setError("");
     setGenerationRequestError(null);
+    setImageRequestError(null);
+    setAudioRequestError(null);
     setNotice(null);
     try {
       const job = await retryJob(failedJob.id);
@@ -1233,6 +1452,7 @@ export default function App() {
     setError("");
     setGenerationRequestError(null);
     setImageRequestError(null);
+    setAudioRequestError(null);
     setNotice(null);
     try {
       const job = await renderRealImages(selectedId, scriptJob.id);
@@ -1243,6 +1463,35 @@ export default function App() {
         const structured = generationErrorValue(cause.detail);
         if (structured) {
           setImageRequestError(structured);
+          setError("");
+        } else {
+          setError(cause.message);
+        }
+      } else {
+        setError(readableError(cause));
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startRealAudioGeneration = async () => {
+    if (!selectedId || !sourceImageJob) return;
+    setBusy("real-audio");
+    setError("");
+    setGenerationRequestError(null);
+    setImageRequestError(null);
+    setAudioRequestError(null);
+    setNotice(null);
+    try {
+      const job = await renderRealAudio(selectedId, sourceImageJob.id, audioSpeaker);
+      setActiveJob({ ...job, project_id: job.project_id || selectedId });
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      if (cause instanceof ApiError) {
+        const structured = generationErrorValue(cause.detail);
+        if (structured) {
+          setAudioRequestError(structured);
           setError("");
         } else {
           setError(cause.message);
@@ -1272,6 +1521,7 @@ export default function App() {
     activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING";
   const providerDescriptors = providersStatus?.providers ?? [];
   const imageProviderDescriptors = providersStatus?.image_providers ?? [];
+  const audioProviderDescriptors = providersStatus?.audio_providers ?? [];
   const selectedProviderDescriptor = providerDescriptors.find(
     (provider) => provider.provider_id === scriptProvider,
   );
@@ -1282,8 +1532,15 @@ export default function App() {
     (provider) => provider.provider_id === REAL_IMAGE_PROVIDER_ID,
   );
   const realImageProviderConfigured = realImageProviderDescriptor?.configured !== false;
+  const realAudioProviderDescriptor: AudioProviderStatus | undefined =
+    audioProviderDescriptors.find(
+      (provider) => provider.provider_id === REAL_AUDIO_PROVIDER_ID,
+    );
+  const realAudioProviderConfigured = realAudioProviderDescriptor?.configured !== false;
   const gpuHandoffRequired =
-    llamaAvailable || realImageProviderDescriptor?.requires_gpu_handoff === true;
+    llamaAvailable ||
+    realImageProviderDescriptor?.requires_gpu_handoff === true ||
+    realAudioProviderDescriptor?.requires_gpu_handoff === true;
   const structuredScript = detail?.project.script_json ?? null;
   const scriptCharacters = Array.isArray(structuredScript?.characters)
     ? structuredScript.characters
@@ -1325,14 +1582,32 @@ export default function App() {
       (job) =>
         job.status === "SUCCEEDED" &&
         !isRealImageJob(job) &&
+        !isRealAudioJob(job) &&
         recordValue(job.result_json?.script_trace) !== null,
     ) ??
     null;
   const scriptProviderUsed = jobScriptProvider(exportJob) ?? "未报告";
   const scriptModelUsed = jobModelId(exportJob) ?? jobModelId(scriptJob) ?? "未报告";
   const scriptSourceUsed = textValue(exportJob?.result_json?.script_source_type) ?? "未报告";
-  const imageProviderUsed = textValue(exportJob?.result_json?.image_provider) ?? "未报告";
-  const audioProviderUsed = textValue(exportJob?.result_json?.audio_provider) ?? "未报告";
+  const referencedImageJobId =
+    jobSourceImageId(latestVisibleJob) ?? jobSourceImageId(exportJob);
+  const referencedImageJob = referencedImageJobId
+    ? detail?.recent_jobs.find((job) => job.id === referencedImageJobId) ?? null
+    : null;
+  const sourceImageJob =
+    (referencedImageJob?.status === "SUCCEEDED" && isRealImageJob(referencedImageJob)
+      ? referencedImageJob
+      : null) ??
+    detail?.recent_jobs.find(
+      (job) => job.status === "SUCCEEDED" && isRealImageJob(job),
+    ) ??
+    null;
+  const sourceImageProviderUsed = jobImageProvider(sourceImageJob);
+  const imageProviderUsed =
+    textValue(exportJob?.result_json?.image_provider) ??
+    sourceImageProviderUsed ??
+    "未报告";
+  const audioProviderUsed = jobAudioProvider(exportJob) ?? "未报告";
   const videoSourceUsed =
     textValue(exportJob?.result_json?.video_source_type) ??
     textValue(exportJob?.result_json?.source_type) ??
@@ -1341,17 +1616,39 @@ export default function App() {
   const exportActualShotCount = jobActualShotCount(exportJob, scriptShots.length);
   const exportRepairUsed = jobRepairUsed(exportJob);
   const exportDurationNormalization = jobDurationNormalization(exportJob);
+  const exportIsRealAudio =
+    exportJob?.status === "SUCCEEDED" && audioProviderUsed === REAL_AUDIO_PROVIDER_ID;
   const exportIsRealImage =
-    exportJob?.status === "SUCCEEDED" && imageProviderUsed === REAL_IMAGE_PROVIDER_ID;
+    exportJob?.status === "SUCCEEDED" &&
+    (imageProviderUsed === REAL_IMAGE_PROVIDER_ID || sourceImageProviderUsed === REAL_IMAGE_PROVIDER_ID);
   const imageDisplayJob =
     (isRealImageJob(latestVisibleJob) ? latestVisibleJob : null) ??
     (isRealImageJob(exportJob) ? exportJob : null) ??
-    detail?.recent_jobs.find((job) => isRealImageJob(job)) ??
+    sourceImageJob ??
     null;
   const generatedImageShots = jobImageShots(imageDisplayJob);
   const imageGenerationInProgress =
     isRealImageJob(activeJob) &&
     (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
+  const audioDisplayJob =
+    (isRealAudioJob(latestVisibleJob) ? latestVisibleJob : null) ??
+    (isRealAudioJob(exportJob) ? exportJob : null) ??
+    detail?.recent_jobs.find((job) => isRealAudioJob(job)) ??
+    null;
+  const generatedAudioShots = jobAudioShots(audioDisplayJob);
+  const audioGenerationInProgress =
+    isRealAudioJob(activeJob) &&
+    (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
+  const audioTimingShots = jobTimingPlan(audioDisplayJob)?.shots ?? [];
+  const audioExtendedShotCount = audioTimingShots.filter(
+    (timing) => (numberValue(timing.extended_by_seconds) ?? 0) > 0.0005,
+  ).length;
+  const exportAudioSpeaker = jobAudioSpeaker(exportJob);
+  const exportAudioLanguage = jobAudioLanguage(exportJob);
+  const exportSourceDuration = jobSourcePlannedDuration(exportJob);
+  const exportRenderedDuration = jobRenderedPlannedDuration(exportJob);
+  const exportAudioExtension = jobAudioExtensionSeconds(exportJob);
+  const exportAudioGenerationSeconds = jobAudioGenerationSeconds(exportJob);
   const scriptWarnings = jobValidationWarnings(exportJob ?? scriptJob ?? latestVisibleJob);
   const currentJobProviderId = jobScriptProvider(latestVisibleJob);
   const currentJobProviderDescriptor = providerDescriptors.find(
@@ -1672,6 +1969,7 @@ export default function App() {
                       setError("");
                       setGenerationRequestError(null);
                       setImageRequestError(null);
+                      setAudioRequestError(null);
                       setNotice(null);
                     }}
                     onRefresh={() => void refreshProviderStatus()}
@@ -1687,6 +1985,7 @@ export default function App() {
                           setDesiredShotCount(value === "auto" ? null : Number(value) as 3 | 4 | 5);
                           setGenerationRequestError(null);
                           setImageRequestError(null);
+                          setAudioRequestError(null);
                           setError("");
                         }}
                       >
@@ -1739,6 +2038,7 @@ export default function App() {
                       onViewResult={() => scrollToSection("result")}
                       configuredModelId={currentJobProviderDescriptor?.model_id}
                       configuredImageModelId={realImageProviderDescriptor?.model_id}
+                      configuredAudioModelId={realAudioProviderDescriptor?.model_id}
                       actualShotCount={
                         latestVisibleJob.status === "SUCCEEDED" ? scriptShots.length : undefined
                       }
@@ -1929,6 +2229,126 @@ export default function App() {
               )}
             </section>
 
+            <section className="real-audio-control" aria-labelledby="real-audio-title">
+              <div className="real-image-heading">
+                <div>
+                  <p className="eyebrow">M5-B · AUDIO PROVIDER</p>
+                  <h3 id="real-audio-title">为当前真实动漫画面生成 AI 旁白</h3>
+                </div>
+                <span className={`audio-source-badge ${exportIsRealAudio ? "is-real" : "is-mock"}`}>
+                  当前成片：{exportIsRealAudio ? "真实 AI 旁白" : "Mock 音频"}
+                </span>
+              </div>
+              <div className="real-image-provider-line">
+                <strong>
+                  当前 Audio Provider：
+                  {realAudioProviderDescriptor?.display_name ?? "Qwen3-TTS 0.6B CustomVoice"}
+                </strong>
+                <span>Provider ID：{REAL_AUDIO_PROVIDER_ID}</span>
+                <span>语言：Chinese</span>
+                <span>
+                  状态：
+                  {realAudioProviderDescriptor
+                    ? realAudioProviderDescriptor.available
+                      ? "可启动"
+                      : realAudioProviderDescriptor.configured
+                        ? "等待 GPU 交接"
+                        : "配置不完整"
+                    : "等待后端报告"}
+                </span>
+                {realAudioProviderDescriptor?.detail && (
+                  <span className="image-provider-detail">{realAudioProviderDescriptor.detail}</span>
+                )}
+              </div>
+              <fieldset className="speaker-selector" disabled={busy !== null || generationInProgress}>
+                <legend>整段成片使用同一个旁白音色</legend>
+                <label className={audioSpeaker === "Serena" ? "is-selected" : ""}>
+                  <input
+                    type="radio"
+                    name="audio-speaker"
+                    value="Serena"
+                    checked={audioSpeaker === "Serena"}
+                    onChange={() => {
+                      setAudioSpeaker("Serena");
+                      setAudioRequestError(null);
+                    }}
+                  />
+                  <span><strong>Serena（默认）</strong><small>年轻、温暖、节奏较快</small></span>
+                </label>
+                <label className={audioSpeaker === "Vivian" ? "is-selected" : ""}>
+                  <input
+                    type="radio"
+                    name="audio-speaker"
+                    value="Vivian"
+                    checked={audioSpeaker === "Vivian"}
+                    onChange={() => {
+                      setAudioSpeaker("Vivian");
+                      setAudioRequestError(null);
+                    }}
+                  />
+                  <span><strong>Vivian</strong><small>稳重、明亮、节奏较慢</small></span>
+                </label>
+              </fieldset>
+              <div className={`gpu-handoff-notice ${gpuHandoffRequired ? "needs-action" : "is-ready"}`} role="status">
+                <strong>GPU 分阶段运行</strong>
+                <span>
+                  {gpuHandoffRequired
+                    ? "检测到文本 Qwen、ComfyUI 或其他冲突状态。请自行停止相关模型并释放 GPU；平台不会结束外部进程。"
+                    : "后端会在入队和执行前复查 8081、8188 与 GPU；TTS 只在独立有界子进程中顺序生成，不与 Qwen 或 ComfyUI 同驻。"}
+                </span>
+              </div>
+              <dl className="real-image-facts">
+                <div><dt>真实画面来源</dt><dd>{sourceImageJob ? `Job ${sourceImageJob.id.slice(0, 8)}` : "没有可复用的成功 M4-B Job"}</dd></div>
+                <div><dt>本次音色</dt><dd>{audioSpeaker}</dd></div>
+                <div><dt>旁白进度</dt><dd>{audioDisplayJob ? `${jobAudioCompletedCount(audioDisplayJob)}/${jobAudioTotalCount(audioDisplayJob, scriptShots.length)}` : `0/${scriptShots.length}`}</dd></div>
+                <div><dt>延长镜头</dt><dd>{audioDisplayJob ? `${audioExtendedShotCount} 个` : "生成后报告"}</dd></div>
+                <div><dt>TTS 总耗时</dt><dd>{jobAudioGenerationSeconds(audioDisplayJob)?.toFixed(1) ?? "生成后报告"}{jobAudioGenerationSeconds(audioDisplayJob) !== null ? " 秒" : ""}</dd></div>
+              </dl>
+              {!sourceImageJob && (
+                <p className="provider-warning">请先完成一个真实 Animagine 画面 Job；真实旁白入口不会重新生成剧本或图片。</p>
+              )}
+              {!realAudioProviderConfigured && (
+                <p className="provider-warning">真实 Audio Provider 尚未配置完整，请检查独立 Qwen3-TTS 环境与固定模型文件。</p>
+              )}
+              <div className="real-image-actions">
+                <button
+                  className="button button-primary"
+                  type="button"
+                  onClick={() => void startRealAudioGeneration()}
+                  disabled={
+                    busy !== null ||
+                    generationInProgress ||
+                    !sourceImageJob ||
+                    gpuHandoffRequired ||
+                    !realAudioProviderConfigured
+                  }
+                >
+                  {busy === "real-audio"
+                    ? "正在提交真实旁白任务…"
+                    : audioGenerationInProgress
+                      ? `正在生成旁白 ${jobAudioCompletedCount(activeJob)}/${jobAudioTotalCount(activeJob, scriptShots.length)}`
+                      : gpuHandoffRequired
+                        ? "请先释放 GPU"
+                        : "为当前真实动漫画面生成AI旁白"}
+                </button>
+                <button
+                  className="button button-ghost"
+                  type="button"
+                  disabled={providerChecking || busy !== null}
+                  onClick={() => void refreshProviderStatus()}
+                >
+                  {providerChecking ? "正在检查…" : "重新检查 Provider"}
+                </button>
+              </div>
+              {audioRequestError && (
+                <FailureCard
+                  detail={audioRequestError}
+                  retrying={busy === "real-audio"}
+                  onRetry={() => void startRealAudioGeneration()}
+                />
+              )}
+            </section>
+
             <div className="shot-grid">
               {[...scriptShots]
                 .sort((left, right) => shotNumber(left, 0) - shotNumber(right, 0))
@@ -1940,6 +2360,37 @@ export default function App() {
                       (sourceShotId && image.shot_id === sourceShotId) ||
                       numberValue(image.shot_index) === sequence,
                   );
+                  const generatedAudio = generatedAudioShots.find(
+                    (audio) =>
+                      (sourceShotId && audio.shot_id === sourceShotId) ||
+                      numberValue(audio.shot_index) === sequence,
+                  );
+                  const timing = audioTimingShots.find(
+                    (item) =>
+                      (sourceShotId && item.shot_id === sourceShotId) ||
+                      numberValue(item.shot_index) === sequence,
+                  );
+                  const audioDuration =
+                    numberValue(generatedAudio?.audio_duration_seconds) ??
+                    numberValue(generatedAudio?.duration_seconds) ??
+                    numberValue(timing?.audio_duration_seconds) ??
+                    numberValue(timing?.audio_duration);
+                  const sourceTimingDuration =
+                    numberValue(timing?.source_shot_duration_seconds) ??
+                    numberValue(timing?.source_duration_seconds) ??
+                    numberValue(timing?.source_shot_duration) ??
+                    shot.duration_seconds;
+                  const renderedTimingDuration =
+                    numberValue(timing?.rendered_shot_duration_seconds) ??
+                    numberValue(timing?.rendered_duration_seconds) ??
+                    numberValue(timing?.rendered_shot_duration);
+                  const extendedBy = numberValue(timing?.extended_by_seconds) ?? 0;
+                  const hasRealAudio =
+                    Boolean(generatedAudio) &&
+                    generatedAudio?.provider_id === REAL_AUDIO_PROVIDER_ID &&
+                    (generatedAudio?.status === "SUCCEEDED" ||
+                      generatedAudio?.status === "REUSED") &&
+                    Boolean(textValue(generatedAudio?.audio_sha256));
                   const thumbnailUrl = imageAssetUrl(textValue(generatedImage?.image_url) ?? undefined);
                   const imageStatus =
                     textValue(generatedImage?.status) ?? (thumbnailUrl ? "SUCCEEDED" : "PENDING");
@@ -1961,7 +2412,7 @@ export default function App() {
                     : "Mock 已准备";
                   return (
                     <article
-                      className={`shot-card ${hasRealImage ? "has-real-image" : ""}`}
+                      className={`shot-card ${hasRealImage ? "has-real-image" : ""} ${hasRealAudio ? "has-real-audio" : ""}`}
                       key={shot.id ?? shot.shot_id ?? `${shot.title}-${index}`}
                     >
                       <div className="shot-art" data-shot={(index % 4) + 1}>
@@ -1985,6 +2436,16 @@ export default function App() {
                         <h3>{shot.title}</h3>
                         <p>{shot.visual_description}</p>
                         <blockquote>“{shot.narration}”</blockquote>
+                        <div className={`shot-audio-summary ${hasRealAudio ? "is-real" : "is-mock"}`}>
+                          <span>{hasRealAudio ? `真实旁白 · ${jobAudioSpeaker(audioDisplayJob) ?? "未报告音色"}` : "音频 · Mock 或待生成"}</span>
+                          {audioDuration !== null && <span>WAV {audioDuration.toFixed(2)} 秒</span>}
+                          {renderedTimingDuration !== null && (
+                            <span>
+                              镜头 {sourceTimingDuration.toFixed(2)} → {renderedTimingDuration.toFixed(2)} 秒
+                              {extendedBy > 0.0005 ? `（延长 ${extendedBy.toFixed(2)} 秒）` : ""}
+                            </span>
+                          )}
+                        </div>
                         <dl className="shot-details">
                           <div>
                             <dt>Camera</dt>
@@ -1999,6 +2460,14 @@ export default function App() {
                               <dt>真实图片追溯</dt>
                               <dd>
                                 seed {numberValue(generatedImage.seed) ?? "未报告"} · {numberValue(generatedImage.generation_seconds)?.toFixed(1) ?? "—"} 秒
+                              </dd>
+                            </div>
+                          )}
+                          {generatedAudio && (
+                            <div>
+                              <dt>真实旁白追溯</dt>
+                              <dd>
+                                {numberValue(generatedAudio.generation_seconds)?.toFixed(1) ?? "—"} 秒生成 · RTF {numberValue(generatedAudio.real_time_factor)?.toFixed(2) ?? "—"}
                               </dd>
                             </div>
                           )}
@@ -2047,7 +2516,11 @@ export default function App() {
               <div>
                 <p className="eyebrow">播放与下载</p>
                 <h2 ref={resultTitleRef} tabIndex={-1}>
-                  {exportIsRealImage ? "真实动漫成片" : "Mock 视觉成片"}
+                  {exportIsRealAudio
+                    ? "真实动漫配音成片"
+                    : exportIsRealImage
+                      ? "真实动漫成片"
+                      : "Mock 视觉成片"}
                 </h2>
               </div>
             </div>
@@ -2056,10 +2529,20 @@ export default function App() {
                 下方仍是上一版 Mock 视觉成片；新的真实动漫画面尚未完成，不会提前标记为真实模型输出。
               </p>
             )}
+            {audioGenerationInProgress && !exportIsRealAudio && (
+              <p className="previous-export-notice">
+                下方仍是上一版成片，真实 AI 旁白尚未完成；在新 Job 成功前不会把 Mock 音频标记为真实配音。
+              </p>
+            )}
             <div className="result-status-summary" aria-label="成片状态">
               <span className="result-ready">● 已生成</span>
               <span className={`result-provider-badge ${exportIsRealImage ? "is-real" : "is-mock"}`}>
                 {exportIsRealImage ? "真实模型 · Animagine XL 4.0" : "Mock 视觉"}
+              </span>
+              <span className={`result-provider-badge ${exportIsRealAudio ? "is-real" : "is-mock"}`}>
+                {exportIsRealAudio
+                  ? `真实旁白 · Qwen3-TTS · ${exportAudioSpeaker ?? "未报告音色"}`
+                  : "Mock 音频"}
               </span>
               <span>{detail.latest_export.duration_seconds?.toFixed(2) ?? "—"} 秒</span>
               <span>{scriptShots.length} 个镜头</span>
@@ -2079,8 +2562,18 @@ export default function App() {
               <span>剧本：{scriptProviderUsed}</span>
               {exportIsRealImage && (
                 <span>
-                  图像耗时：{jobImageGenerationSeconds(exportJob)?.toFixed(1) ?? "未报告"} 秒
+                  图像耗时：{jobImageGenerationSeconds(sourceImageJob ?? exportJob)?.toFixed(1) ?? "未报告"} 秒
                 </span>
+              )}
+              {exportIsRealAudio && <span>TTS 耗时：{exportAudioGenerationSeconds?.toFixed(1) ?? "未报告"} 秒</span>}
+              {exportIsRealAudio && exportSourceDuration !== null && (
+                <span>源计划：{exportSourceDuration.toFixed(2)} 秒</span>
+              )}
+              {exportIsRealAudio && exportRenderedDuration !== null && (
+                <span>渲染计划：{exportRenderedDuration.toFixed(2)} 秒</span>
+              )}
+              {exportIsRealAudio && exportAudioExtension !== null && (
+                <span>旁白延长：{exportAudioExtension.toFixed(2)} 秒</span>
               )}
             </div>
             <div className="result-grid">
@@ -2100,9 +2593,15 @@ export default function App() {
                   <div><dt>Script Source</dt><dd title={scriptSourceUsed}>{scriptSourceUsed}</dd></div>
                   <div><dt>Image Provider</dt><dd title={imageProviderUsed}>{imageProviderUsed}</dd></div>
                   <div><dt>视觉来源</dt><dd>{exportIsRealImage ? "真实本地模型" : "Mock 确定性保底"}</dd></div>
-                  {exportIsRealImage && <div><dt>Base seed</dt><dd>{jobBaseSeed(exportJob) ?? "未报告"}</dd></div>}
-                  {exportIsRealImage && <div><dt>真实关键帧</dt><dd>{jobImageCompletedCount(exportJob)}/{jobImageTotalCount(exportJob, scriptShots.length)} 张</dd></div>}
+                  {exportIsRealImage && <div><dt>Base seed</dt><dd>{jobBaseSeed(sourceImageJob ?? exportJob) ?? "未报告"}</dd></div>}
+                  {exportIsRealImage && <div><dt>真实关键帧</dt><dd>{jobImageCompletedCount(sourceImageJob ?? exportJob)}/{jobImageTotalCount(sourceImageJob ?? exportJob, scriptShots.length)} 张</dd></div>}
                   <div><dt>Audio Provider</dt><dd title={audioProviderUsed}>{audioProviderUsed}</dd></div>
+                  <div><dt>音频来源</dt><dd>{exportIsRealAudio ? "真实本地 Qwen3-TTS" : "Mock 确定性保底"}</dd></div>
+                  {exportIsRealAudio && <div><dt>旁白音色</dt><dd>{exportAudioSpeaker ?? "未报告"}</dd></div>}
+                  {exportIsRealAudio && <div><dt>语言</dt><dd>{exportAudioLanguage ?? "未报告"}</dd></div>}
+                  {exportIsRealAudio && exportSourceDuration !== null && <div><dt>源计划时长</dt><dd>{exportSourceDuration.toFixed(3)} 秒</dd></div>}
+                  {exportIsRealAudio && exportRenderedDuration !== null && <div><dt>渲染计划时长</dt><dd>{exportRenderedDuration.toFixed(3)} 秒</dd></div>}
+                  {exportIsRealAudio && exportAudioExtension !== null && <div><dt>旁白延长</dt><dd>{exportAudioExtension.toFixed(3)} 秒</dd></div>}
                   <div><dt>Video</dt><dd title={videoSourceUsed}>{videoSourceUsed}</dd></div>
                   <div>
                     <dt>SHA-256</dt>
@@ -2127,7 +2626,9 @@ export default function App() {
         <aside className={`task-shortcut shortcut-${latestVisibleJob.status.toLowerCase()}`} aria-live="polite">
           {latestVisibleJob.status === "QUEUED" || latestVisibleJob.status === "RUNNING" ? (
             <span>
-              {isRealImageJob(latestVisibleJob)
+              {isRealAudioJob(latestVisibleJob)
+                ? `正在生成真实旁白 ${jobAudioCompletedCount(latestVisibleJob)}/${jobAudioTotalCount(latestVisibleJob, scriptShots.length)}`
+                : isRealImageJob(latestVisibleJob)
                 ? `正在生成真实图片 ${jobImageCompletedCount(latestVisibleJob)}/${jobImageTotalCount(latestVisibleJob, scriptShots.length)}`
                 : "正在生成短片"}
               {` · ${Math.max(0, Math.min(100, Math.round(latestVisibleJob.progress)))}%`}
@@ -2147,8 +2648,8 @@ export default function App() {
       )}
 
       <footer>
-        <span>纸鹤工坊 · M4-B 真实动漫关键帧纵向链路</span>
-        <span>Mock 始终可辨识；Qwen 与 ComfyUI 在 8GB 显存下分阶段运行</span>
+        <span>纸鹤工坊 · M5-B 真实动漫旁白纵向链路</span>
+        <span>Mock 始终可辨识；Qwen、ComfyUI 与 Qwen3-TTS 在 8GB 显存下分阶段运行</span>
       </footer>
     </div>
   );

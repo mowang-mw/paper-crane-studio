@@ -23,11 +23,13 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 
 ## 当前阶段
 
-**M0、M1、M2、M3、M4-A 与 M4-B 已完成。** M4-B 已把 `ComfyUI + Animagine XL 4.0 Opt` 集成为正式 `ImageProvider`：从成功 Job 的受控 ScriptV1 快照创建新的真实图像 Job，不调用 Qwen；一个 Job 只启动一次有界 ComfyUI，按镜头顺序生成 3—5 张 PNG，再交给公共 FFmpeg 管线制作带 Mock 音轨和烧录中文字幕的 MP4。
+**M0、M1、M2、M3、M4-A、M4-B、M5-A 与 M5-B 均已完成。** M4-B 已把 `ComfyUI + Animagine XL 4.0 Opt` 集成为正式 `ImageProvider`。M5-A 随后证明 `Qwen3-TTS-12Hz-0.6B-CustomVoice` 能在独立 Python 3.12 环境中全本地生成 Serena 与 Vivian 中文 WAV。M5-B 在此基础上增加正式 `Qwen3TTSAudioProvider`：从成功的 M4-B Job 复用冻结的 ScriptV1 与真实 PNG，不再次调用文本 Qwen、不启动 ComfyUI，一个音频 Job 只加载一次 TTS 模型并按镜头顺序生成旁白，最终由 FFmpeg 合成真实语音、真实关键帧和烧录中文字幕。
 
 M3 的全部 Mock + FFmpeg 离线保底仍然保留，并接入本地 `Qwen3-4B Q4_K_M`、`llama.cpp` Script Provider、Provider 即时健康检查和前端显式选择。生成任务可选择自动 3—5 镜头或固定 3/4/5 镜头，默认固定 4；故事去除首尾空白后硬限制为 10—3000 字符，界面建议 50—1000 字符。真实文本或真实图像 Provider 失败都不会静默改用 Mock 并伪装成功。
 
-RTX 4060 8GB 模式固定采用分阶段 GPU 工作流：先用 Qwen 生成并保存 ScriptV1，再停止 `llama-server`、释放 8081 和显存，最后启动真实图像 Job。API 入队和 Worker 执行前都会检查冲突；平台只报告 `GPU_HANDOFF_REQUIRED`，不会擅自结束用户进程。三镜头真实 E2E 已复用 `llamacpp` 来源 ScriptV1，ScriptProvider 调用为 0；三张图均为 1024×576、24 步，图像阶段 51.266 秒，无 OOM，最终 20.021333 秒 MP4 完整解码并完成中文字幕抽帧。
+RTX 4060 8GB 模式固定采用分阶段 GPU 工作流：先用 Qwen 生成并保存 ScriptV1，再停止 `llama-server`；随后由 ComfyUI 生成并保存真实 PNG，进程退出并释放 8188/显存后，才允许一次性 Qwen3-TTS 子进程进入 GPU。API 入队和 Worker 执行前都会检查 8081、8188、已知模型进程和整卡显存；默认前置占用超过 2048 MiB 即报告 `GPU_HANDOFF_REQUIRED`。平台不会擅自结束用户进程，也不会把真实 Provider 失败静默改成 Mock 成功。
+
+M5-B 已使用来源 M4-B Job `11c1b83a-f5b7-4511-b7db-2e1056ef2160` 完成真实 Serena 三镜头 E2E，生成 Job 为 `511262cc-ccf3-4038-878d-2b0037d737ee`。三段 WAV 时长为 2.960 / 4.000 / 3.920 秒；源计划与渲染计划均为 20.000 秒，最终 H.264/AAC MP4 为 20.021333 秒。一次模型加载、无 OOM、无 CPU offload、无 Mock 音频；总墙钟 88.235 秒，整卡显存由 675 MiB 升至峰值 3001 MiB，结束后回落到 674 MiB。
 
 媒体业务时长与编码时长现已分开验收：ScriptV1 计划总时长仍严格限制为 20—40 秒；最终 MP4 允许一个视频帧、一个 AAC 采样帧与小量封装舍入共同决定的量化容差。`MEDIA_RENDER` 失败任务手动重试时会优先从来源 Job 的严格 ScriptV1 与已有 MP4 恢复，不调用 ScriptProvider、不改变镜头，并记录 `resumed_from_stage=MEDIA_RENDER`。自动镜头 Prompt 现明确要求覆盖开端、主要发展和结局；这只是提示增强，尚未实现独立语义覆盖评分。
 
@@ -44,9 +46,10 @@ RTX 4060 8GB 模式固定采用分阶段 GPU 工作流：先用 Qwen 生成并�
 | 系统内存 | 约 31.6GB | 可做有限 CPU offload，但不能把大量内存交换当作稳定方案 |
 | Python | 3.11.15，Conda 环境 `anime-platform` | FastAPI 0.116.1、SQLAlchemy 2.0.43、Pydantic 2.13.4、Uvicorn 0.35.0 已锁定并实测 |
 | 图像运行环境 | 项目内独立 `.venv-comfyui`：Python 3.13.3、PyTorch 2.11.0+cu128、CUDA runtime 12.8 | 与 `anime-platform` 隔离；不把 PyTorch 或 ComfyUI 依赖装入后端环境 |
+| TTS 运行环境 | 项目内独立 `.venv-qwen3-tts`：Python 3.12.13、qwen-tts 0.1.1、PyTorch 2.11.0+cu128、CUDA runtime 12.8、SDPA | Python 3.11 后端不直接导入 qwen-tts；每个真实音频 Job 启动一次有界子进程，单次加载后顺序生成全部镜头 |
 | Node.js / npm | 24.15.0 / 11.12.1 | `package-lock.json` 已锁定 React 19.2.8、Vite 7.3.6、TypeScript 5.9.3，生产构建通过 |
 | FFmpeg | Conda 环境内 8.0 | 本轮只读预检确认 libx264/libopenh264/h264_nvenc、AAC、drawtext、zoompan、concat、xfade；未发现 subtitles/ass（构建未启用 libass）。基础 PATH 不可见，须激活 `anime-platform` 或配置已验证绝对路径 |
-| 可用模型服务 | 项目内本地 `llama.cpp + Qwen3-4B Q4_K_M` 文本链路；按 Job 有界启动的 `ComfyUI + Animagine XL 4.0 Opt` 图像链路；无真实视频或语音模型 API | Qwen 与 ComfyUI 不得同时驻留 8GB GPU；全 Mock 离线链路仍是无条件基线 |
+| 可用模型服务 | 项目内本地 `llama.cpp + Qwen3-4B Q4_K_M` 文本链路；按 Job 有界启动的 `ComfyUI + Animagine XL 4.0 Opt` 图像链路；一次性子进程运行的本地 `Qwen3-TTS 0.6B CustomVoice` 音频链路；无真实视频模型 API | 三类 GPU 模型严格分阶段、不得同时驻留；全 Mock 离线链路仍是无条件基线，真实任务失败不静默回退 |
 
 
 ## M1 本地运行
@@ -227,7 +230,52 @@ python scripts\m4_real_image_e2e.py
 - 本次真实 E2E 汇总：`data/projects/36d4bdd5-0e88-4509-a2f5-eba7727fd38b/exports/11c1b83a-f5b7-4511-b7db-2e1056ef2160/m4b-e2e-summary.json`
 - 本次成片与抽帧：同一目录下的 `short_11c1b83a-f5b7-4511-b7db-2e1056ef2160.mp4` 与 `e2e-frames/`
 
-M4-B 只提供共享角色外观标签的基础提示一致性，不等于严格角色一致性；本阶段没有 IP-Adapter、ControlNet、LoRA、TTS 或视频生成模型。详见 [M4-B ImageProvider 实施记录](docs/m4-image-provider-implementation.md)。
+M4-B 只提供共享角色外观标签的基础提示一致性，不等于严格角色一致性；M4-B 当时仍使用 Mock 音频，且没有 IP-Adapter、ControlNet、LoRA 或视频生成模型。详见 [M4-B ImageProvider 实施记录](docs/m4-image-provider-implementation.md)。
+
+## M5-B 本地真实中文旁白运行
+
+M5-B 不把 Qwen3-TTS 启动成常驻 Web 服务，也不把 Python 3.12/PyTorch 依赖装进 `anime-platform`。后端通过 `Qwen3TTSAudioProvider` 写入受控请求，再使用参数列表和 `shell=False` 启动 `.venv-qwen3-tts\python.exe scripts\qwen3_tts_job_runner.py`。同一 3—5 镜头 Job 只加载一次模型、单并发顺序生成全部 WAV，完成或失败后统一退出。运行器固定离线读取本地 revision，不使用云 API、声音克隆、真人参考声音或 VoiceDesign。
+
+音色策略固定为：
+
+- `Serena`：年轻、温暖、节奏较快，是默认选择。
+- `Vivian`：稳重、明亮、节奏较慢，可由用户在创建 Job 前选择。
+- 一个 Job 的所有镜头使用同一音色和 `Chinese`；`speaker`、`language` 与 Provider ID 写入不可变 `request_json`，手动重试沿用原快照。
+
+交互运行前应先完成并保留一个成功的 M4-B 真实图像 Job，然后停止 `llama-server` 和任何 ComfyUI 进程，确认 8081、8188 与推理显存已释放。保持 API、唯一 Worker 和前端运行，在真实镜头区域选择音色并点击“为当前真实动漫画面生成AI旁白”。该按钮调用：
+
+```text
+POST /api/projects/{project-id}/render-real-audio
+```
+
+请求只引用 `source_image_job_id`；后端从该 M4-B Job 派生并冻结 `source_script_job_id`、ScriptV1 与真实 PNG 清单。新的 `GENERATE_REAL_AUDIO_VIDEO` Job 明确记录 `script_provider=reused`、`image_provider=reused` 和 `audio_provider=qwen3-tts-0.6b-customvoice`，不会再次请求文本 Qwen、重新生成图片或启动 ComfyUI。
+
+真实语音不强塞进原镜头时长。源 ScriptV1 的 `duration_seconds` 保持不变，独立 `MediaTimingPlan` 按每段 WAV 实测时长计算：
+
+```text
+rendered_shot_duration = ceil_to_24fps(
+  max(source_shot_duration, audio_duration + 0.20 + 0.35)
+)
+```
+
+短旁白在尾部补静音，长旁白透明延长静态关键帧镜头；不截断、不循环、不自动变速。源 ScriptV1 仍受 20—40 秒业务约束，最终渲染计划允许因旁白延长，但默认不得超过 60 秒。超过时 Job 以 `AUDIO_TIMING_EXCEEDS_LIMIT` 失败，页面建议选择节奏更快的 Serena 或缩短旁白，不伪造成功。
+
+Job 追溯目录包括逐镜头 WAV/request/result/text、TTS stdout/stderr、`audio_generation_report.json` 与 `timing_plan.json`；Export manifest 记录音色、语言、每段 WAV 的时长/耗时/SHA256、来源 Script/PNG、源计划/渲染计划/编码时长和烧录字幕。前端在真实音频成功前继续把旧成片标为 Mock 音频，不会提前显示“真实配音”。
+
+M5-A 冒烟可重复执行：
+
+```powershell
+<CONDA_ROOT>\envs\anime-platform\python.exe scripts\m5_tts_smoke_test.py
+```
+
+M5-B 自动回归与真实三镜头 E2E：
+
+```powershell
+conda run -n anime-platform python -m pytest -q
+conda run -n anime-platform python scripts\m5_real_audio_e2e.py --source-image-job-id 11c1b83a-f5b7-4511-b7db-2e1056ef2160 --speaker Serena
+```
+
+真实输出位于 `data/projects/36d4bdd5-0e88-4509-a2f5-eba7727fd38b/exports/511262cc-ccf3-4038-878d-2b0037d737ee/`：MP4 SHA256 为 `f55e6ea61fe6638a40ce9ab4950a6e15618b4d2b617bbf680b35adc17f6eb911`，同目录 `m5b-e2e-summary.json` 保存逐段 WAV、TimingPlan、ffprobe、完整解码、字幕抽帧、显存与清理证据。详见 [M5-A TTS 模型冒烟记录](docs/m5-tts-model-spike.md)与 [M5-B AudioProvider 实施记录](docs/m5-audio-provider-implementation.md)。
 
 ## 人工可用性测试修复
 
@@ -290,6 +338,8 @@ M4-B 只提供共享角色外观标签的基础提示一致性，不等于严格
 - [M3 实施记录](docs/m3-implementation-report.md)
 - [M4-A 图像模型冒烟记录](docs/m4-image-model-spike.md)
 - [M4-B ImageProvider 实施记录](docs/m4-image-provider-implementation.md)
+- [M5-A TTS 模型冒烟记录](docs/m5-tts-model-spike.md)
+- [M5-B AudioProvider 实施记录](docs/m5-audio-provider-implementation.md)
 - [ScriptV1 契约](docs/script-v1-schema.md)
 - [当前环境](ENVIRONMENT.md)
 

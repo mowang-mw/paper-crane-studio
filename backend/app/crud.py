@@ -209,6 +209,11 @@ def retry_failed_job(session: Session, failed_job: GenerationJob) -> GenerationJ
         # 来源 Job 中已经完成的 PNG，并从第一张缺失或损坏图片继续。
         request_json.pop("resumed_from_stage", None)
         request_json["resume_image_from_job_id"] = failed_job.id
+    elif failed_job.job_type == "GENERATE_REAL_AUDIO_VIDEO":
+        # 音频重试冻结原音色、语言和所有上游来源，只允许复用已通过
+        # WAV 哈希/解码/文本校验的产物继续，不读取前端当前选择。
+        request_json.pop("resumed_from_stage", None)
+        request_json["resume_audio_from_job_id"] = failed_job.id
     return create_job(
         session,
         project=project,

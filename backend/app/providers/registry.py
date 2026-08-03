@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from ..config import Settings
+from ..services.audio_jobs import audio_gpu_handoff_status
 from ..services.image_jobs import gpu_handoff_status
 
 
@@ -98,6 +99,7 @@ def check_llamacpp(settings: Settings) -> dict[str, Any]:
 
 def provider_registry(settings: Settings) -> dict[str, Any]:
     image_status = check_comfyui_image(settings)
+    audio_status = check_qwen3_tts_audio(settings)
     return {
         "default_script_provider": settings.script_provider,
         "checked_at": utc_now(),
@@ -128,6 +130,77 @@ def provider_registry(settings: Settings) -> dict[str, Any]:
             },
             image_status,
         ],
+        "default_audio_provider": settings.audio_provider,
+        "audio_providers": [
+            {
+                "provider_id": "mock",
+                "display_name": "Mock 音频",
+                "available": True,
+                "configured": True,
+                "model_id": "deterministic-pcm-wave",
+                "source_type": "MOCK",
+                "detail": "确定性提示音离线保底，不代表真实中文旁白。",
+                "requires_gpu_handoff": False,
+                "speakers": ["Serena", "Vivian"],
+                "default_speaker": "Serena",
+                "language": "Chinese",
+            },
+            audio_status,
+        ],
+    }
+
+
+def check_qwen3_tts_audio(settings: Settings) -> dict[str, Any]:
+    """轻量检查固定环境与 revision；实际 Job 启动前才完整核对权重哈希。"""
+
+    python_path = Path(settings.qwen_tts_python)
+    runner_path = Path(settings.qwen_tts_runner)
+    model_path = Path(settings.qwen_tts_model_path)
+    root_weight = model_path / "model.safetensors"
+    tokenizer_weight = model_path / "speech_tokenizer" / "model.safetensors"
+    required = (
+        python_path.is_file(),
+        runner_path.is_file(),
+        root_weight.is_file(),
+        tokenizer_weight.is_file(),
+    )
+    configured = all(required)
+    revision_ok = False
+    if configured:
+        metadata = sorted(model_path.rglob("*.metadata"))
+        revisions: set[str] = set()
+        try:
+            for path in metadata:
+                with path.open("r", encoding="utf-8") as handle:
+                    revisions.add(handle.readline().strip())
+            revision_ok = bool(metadata) and revisions == {
+                settings.qwen_tts_model_revision
+            }
+        except OSError:
+            revision_ok = False
+    handoff_status = audio_gpu_handoff_status(settings)
+    handoff = bool(handoff_status["conflict"])
+    available = configured and revision_ok and not handoff
+    if not configured:
+        detail = "独立 Qwen3-TTS 环境、运行器或固定模型文件缺失。"
+    elif not revision_ok:
+        detail = "本地模型下载 metadata 与固定 Hugging Face revision 不一致。"
+    elif handoff:
+        detail = "需要先停止 Qwen/ComfyUI 并释放 GPU；平台不会结束外部进程。"
+    else:
+        detail = "固定本地模型已就绪；真实旁白由一次性离线子进程生成。"
+    return {
+        "provider_id": "qwen3-tts-0.6b-customvoice",
+        "display_name": "真实 AI 旁白 · Qwen3-TTS 0.6B",
+        "available": available,
+        "configured": configured and revision_ok,
+        "model_id": settings.qwen_tts_model_id,
+        "source_type": "LOCAL_MODEL",
+        "detail": detail,
+        "requires_gpu_handoff": handoff,
+        "speakers": ["Serena", "Vivian"],
+        "default_speaker": settings.qwen_tts_default_speaker,
+        "language": settings.qwen_tts_language,
     }
 
 

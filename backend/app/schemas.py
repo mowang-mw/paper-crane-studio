@@ -120,6 +120,15 @@ class RealImageRenderRequest(BaseModel):
     base_seed: int | None = Field(default=None, ge=0, le=2**63 - 6)
 
 
+class RealAudioRenderRequest(BaseModel):
+    source_image_job_id: str = Field(min_length=1, max_length=36)
+    audio_provider: Literal["qwen3-tts-0.6b-customvoice"] = (
+        "qwen3-tts-0.6b-customvoice"
+    )
+    speaker: Literal["Serena", "Vivian"] = "Serena"
+    language: Literal["Chinese"] = "Chinese"
+
+
 class ProviderStatusRead(BaseModel):
     provider_id: Literal["mock", "llamacpp"]
     display_name: str
@@ -142,12 +151,28 @@ class ImageProviderStatusRead(BaseModel):
     requires_gpu_handoff: bool = False
 
 
+class AudioProviderStatusRead(BaseModel):
+    provider_id: Literal["mock", "qwen3-tts-0.6b-customvoice"]
+    display_name: str
+    available: bool
+    configured: bool
+    model_id: str
+    source_type: Literal["MOCK", "LOCAL_MODEL"]
+    detail: str | None = None
+    requires_gpu_handoff: bool = False
+    speakers: list[Literal["Serena", "Vivian"]]
+    default_speaker: Literal["Serena", "Vivian"]
+    language: Literal["Chinese"]
+
+
 class ProvidersRead(BaseModel):
     default_script_provider: Literal["mock", "llamacpp"]
     checked_at: datetime
     providers: list[ProviderStatusRead]
     default_image_provider: Literal["mock", "comfyui-animagine-xl-4"]
     image_providers: list[ImageProviderStatusRead]
+    default_audio_provider: Literal["mock", "qwen3-tts-0.6b-customvoice"]
+    audio_providers: list[AudioProviderStatusRead]
 
 
 class HealthRead(BaseModel):

@@ -182,6 +182,126 @@ class AudioPlan:
     parameters: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class AudioGenerationOptions:
+    """一次真实旁白 Job 的不可变参数快照。"""
+
+    speaker: str = "Serena"
+    language: str = "Chinese"
+    base_seed: int = 20_260_803
+    model_load_timeout_seconds: float = 300.0
+    generation_timeout_seconds: float = 300.0
+    job_timeout_seconds: float = 1_800.0
+
+    def __post_init__(self) -> None:
+        if not self.speaker.strip():
+            raise ValueError("speaker 不得为空")
+        if not self.language.strip():
+            raise ValueError("language 不得为空")
+        if type(self.base_seed) is not int or not 0 <= self.base_seed < 2**63 - 6:
+            raise ValueError("base_seed 必须是 0 到 2^63-6 之间的整数")
+        for name in (
+            "model_load_timeout_seconds",
+            "generation_timeout_seconds",
+            "job_timeout_seconds",
+        ):
+            if float(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} 必须大于 0")
+        if self.job_timeout_seconds < (
+            self.model_load_timeout_seconds + self.generation_timeout_seconds
+        ):
+            raise ValueError("job_timeout_seconds 必须覆盖模型加载和至少一次生成")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "speaker": self.speaker,
+            "language": self.language,
+            "base_seed": self.base_seed,
+            "model_load_timeout_seconds": self.model_load_timeout_seconds,
+            "generation_timeout_seconds": self.generation_timeout_seconds,
+            "job_timeout_seconds": self.job_timeout_seconds,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AudioGenerationRequest:
+    """生成一个镜头旁白所需的严格输入；正文直接来自 ScriptV1。"""
+
+    project_id: str
+    job_id: str
+    source_script_job_id: str
+    source_image_job_id: str
+    script: ScriptV1
+    shot: Shot
+    output_dir: Path
+    options: AudioGenerationOptions
+
+    def __post_init__(self) -> None:
+        if not self.project_id.strip() or not self.job_id.strip():
+            raise ValueError("project_id 和 job_id 不得为空")
+        if not self.source_script_job_id.strip() or not self.source_image_job_id.strip():
+            raise ValueError("source_script_job_id 和 source_image_job_id 不得为空")
+        if self.shot not in self.script.shots:
+            raise ValueError("AudioGenerationRequest 的 shot 不属于给定 ScriptV1")
+        if not self.shot.narration.strip():
+            raise ValueError("真实 TTS 旁白不得为空")
+        object.__setattr__(self, "output_dir", Path(self.output_dir).resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedAudioAsset:
+    """AudioProvider 返回的真实 PCM WAV 与完整追溯。"""
+
+    provider_id: str
+    model_id: str
+    model_revision: str
+    model_sha256: str
+    shot_id: str
+    audio_path: Path
+    trace_path: Path
+    text: str
+    speaker: str
+    language: str
+    seed: int
+    sample_rate: int
+    channels: int
+    sample_width_bytes: int
+    duration_seconds: float
+    generation_seconds: float
+    real_time_factor: float
+    peak_amplitude: float
+    rms: float
+    audio_sha256: str
+    warnings: tuple[str, ...] = ()
+    reused: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "model_sha256": self.model_sha256,
+            "shot_id": self.shot_id,
+            "audio_path": str(self.audio_path),
+            "trace_path": str(self.trace_path),
+            "text": self.text,
+            "speaker": self.speaker,
+            "language": self.language,
+            "seed": self.seed,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "sample_width_bytes": self.sample_width_bytes,
+            "duration_seconds": self.duration_seconds,
+            "generation_seconds": self.generation_seconds,
+            "real_time_factor": self.real_time_factor,
+            "peak_amplitude": self.peak_amplitude,
+            "rms": self.rms,
+            "audio_sha256": self.audio_sha256,
+            "warnings": list(self.warnings),
+            "reused": self.reused,
+        }
+
+
 class ScriptProvider(ABC):
     provider_id: str
 
@@ -233,6 +353,29 @@ class AudioProvider(ABC):
     @abstractmethod
     def plan(self, *, shot: ScriptShot) -> AudioPlan:
         raise NotImplementedError
+
+    def generate(self, *, request: AudioGenerationRequest) -> GeneratedAudioAsset:
+        """生成真实旁白；仅规划型 Provider 可保留默认的不支持行为。"""
+
+        raise NotImplementedError(f"{self.provider_id} AudioProvider 不支持旁白生成")
+
+    def generate_batch(
+        self,
+        *,
+        requests: tuple[AudioGenerationRequest, ...],
+        reusable_assets: tuple[GeneratedAudioAsset, ...] = (),
+        progress_callback: Callable[[int, int, GeneratedAudioAsset], None] | None = None,
+    ) -> tuple[GeneratedAudioAsset, ...]:
+        """默认顺序实现；本地模型 Provider 应覆写以只加载一次模型。"""
+
+        del reusable_assets
+        generated: list[GeneratedAudioAsset] = []
+        for request in requests:
+            asset = self.generate(request=request)
+            generated.append(asset)
+            if progress_callback:
+                progress_callback(len(generated), len(requests), asset)
+        return tuple(generated)
 
 
 def script_result_from_v1(

@@ -209,3 +209,18 @@ Qwen 官方 README 推荐创建独立 Python 3.12 环境后安装 `qwen-tts`。�
 ## 13. 是否建议进入 M5-B
 
 从本地运行、显存、技术音频完整性和可回收性看，建议进入范围受控的 M5-B `AudioProvider` 集成，但应先由项目成员人工试听 Serena 与 Vivian，选择默认音色并记录主观理由。M5-B 应继续保留 Mock 音频离线保底、使用独立子进程和单 GPU 分阶段运行，不允许与 Qwen 文本模型或 Animagine 同时驻留，也不应加入声音克隆、VoiceDesign 或实时服务承诺。
+
+## 14. M5-B 承接边界
+
+M5-B 按上述建议把本模型接到正式平台契约，但不改变 M5-A 的实测结论边界：
+
+- `Serena` 作为默认旁白音色；`Vivian` 作为用户创建 Job 前可选的第二个预置音色。一个 Job 内所有镜头共用同一音色，语言固定为 `Chinese`。
+- Python 3.11 的 `anime-platform` 后端不直接导入 `qwen_tts`。`Qwen3TTSAudioProvider` 启动独立 `.venv-qwen3-tts` 一次性子进程；一个 3—5 镜头 Job 只加载一次模型，随后单并发顺序生成全部镜头。
+- 音频 Job 只能复用成功 M4-B Job 已冻结的 ScriptV1 与已验收真实 PNG；不再次调用文本 Qwen，不启动 ComfyUI，也不重新生成图片。
+- 每个镜头直接使用原始 `shot.narration`，不改写文本。真实 WAV 经过完整解码、非静音与 SHA256 校验后才能参与媒体合成。
+- 独立 `MediaTimingPlan` 保持源 ScriptV1 时长不可变，并用 `max(源镜头时长, WAV 时长 + 0.20 秒 lead-in + 0.35 秒 lead-out)` 向上对齐到 24 fps 帧边界。旁白较长时允许透明延长镜头，不截断、不循环、不自动变速；最终渲染计划默认硬上限为 60 秒。
+- Qwen 文本、ComfyUI/Animagine 和 Qwen3-TTS 在 8GB GPU 上严格分阶段。发现 8081、8188 或相应模型冲突时只返回 `GPU_HANDOFF_REQUIRED`，平台不终止外部进程。
+- 真实 TTS 失败保持 Job `FAILED`，不会静默产生 Mock WAV。Mock 音频仍作为另一条显式工程保底路径存在，但不能冒充真实旁白。
+- M5-B 仍不涉及声音克隆、真人参考声音、VoiceDesign、云 API、多角色对白分配、背景音乐模型或实时 TTS 服务。
+
+M5-B 已完成真实 Serena 三镜头 E2E：Job `511262cc-ccf3-4038-878d-2b0037d737ee` 只加载一次模型，三段 WAV 分别为 2.960 秒 / 8.953 秒生成 / RTF 3.024662、4.000 秒 / 11.391 秒 / RTF 2.847750、3.920 秒 / 14.312 秒 / RTF 3.651020。源与渲染计划均为 20.000 秒，MP4 编码时长 20.021333 秒；总墙钟 88.235 秒，GPU-wide 峰值 3001 MiB，无 OOM、CPU offload 或 Mock 音频。M5-A 双音色冒烟的约 5.5 RTF 与本次短句 E2E 的 2.85—3.65 RTF 都是各自实测，不据此承诺固定性能。

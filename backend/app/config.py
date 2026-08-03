@@ -24,7 +24,7 @@ class Settings:
     data_dir: Path | None = None
     database_url: str | None = None
     api_prefix: str = "/api"
-    stage: str = "M4-B"
+    stage: str = "M5-B"
     worker_poll_seconds: float = 1.0
     script_provider: str = "mock"
     llama_server_base_url: str = "http://127.0.0.1:8081"
@@ -62,6 +62,33 @@ class Settings:
     image_sampler: str = "euler_ancestral"
     image_scheduler: str = "normal"
     image_base_seed: int = 20_260_802
+    audio_provider: str = "mock"
+    qwen_tts_python: Path | None = None
+    qwen_tts_runner: Path | None = None
+    qwen_tts_model_path: Path | None = None
+    qwen_tts_model_id: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    qwen_tts_model_revision: str = (
+        "85e237c12c027371202489a0ec509ded67b5e4b5"
+    )
+    qwen_tts_model_sha256: str = (
+        "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb"
+    )
+    qwen_tts_tokenizer_sha256: str = (
+        "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+    )
+    qwen_tts_model_license: str = "Apache-2.0"
+    qwen_tts_package_version: str = "0.1.1"
+    qwen_tts_default_speaker: str = "Serena"
+    qwen_tts_language: str = "Chinese"
+    qwen_tts_seed: int = 20_260_803
+    qwen_tts_model_load_timeout_seconds: float = 300.0
+    qwen_tts_shot_timeout_seconds: float = 300.0
+    qwen_tts_job_timeout_seconds: float = 1_200.0
+    qwen_tts_gpu_release_timeout_seconds: float = 60.0
+    audio_gpu_handoff_max_used_mib: int = 2_048
+    audio_lead_in_seconds: float = 0.20
+    audio_lead_out_seconds: float = 0.35
+    audio_rendered_max_seconds: float = 60.0
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -82,6 +109,21 @@ class Settings:
         comfyui_model_path = Path(
             self.comfyui_model_path
             or root_dir / "models" / "image" / "animagine-xl-4.0-opt.safetensors"
+        ).resolve()
+        qwen_tts_python = Path(
+            self.qwen_tts_python
+            or root_dir / ".venv-qwen3-tts" / "python.exe"
+        ).resolve()
+        qwen_tts_runner = Path(
+            self.qwen_tts_runner
+            or root_dir / "scripts" / "qwen3_tts_job_runner.py"
+        ).resolve()
+        qwen_tts_model_path = Path(
+            self.qwen_tts_model_path
+            or root_dir
+            / "models"
+            / "audio"
+            / "Qwen3-TTS-12Hz-0.6B-CustomVoice"
         ).resolve()
         provider = self.script_provider.strip().lower()
         if provider not in {"mock", "llamacpp"}:
@@ -134,6 +176,34 @@ class Settings:
             raise ValueError("真实图像 CFG 必须大于 0")
         if self.image_base_seed < 0:
             raise ValueError("IMAGE_BASE_SEED 不得为负数")
+        audio_provider = self.audio_provider.strip().lower()
+        if audio_provider not in {"mock", "qwen3-tts-0.6b-customvoice"}:
+            raise ValueError(
+                "AUDIO_PROVIDER 只允许 mock 或 qwen3-tts-0.6b-customvoice"
+            )
+        if self.qwen_tts_default_speaker not in {"Serena", "Vivian"}:
+            raise ValueError("QWEN_TTS_DEFAULT_SPEAKER 只允许 Serena 或 Vivian")
+        if self.qwen_tts_language != "Chinese":
+            raise ValueError("M5-B 的 QWEN_TTS_LANGUAGE 固定为 Chinese")
+        if self.qwen_tts_seed < 0:
+            raise ValueError("QWEN_TTS_SEED 不得为负数")
+        if any(
+            value <= 0
+            for value in (
+                self.qwen_tts_model_load_timeout_seconds,
+                self.qwen_tts_shot_timeout_seconds,
+                self.qwen_tts_job_timeout_seconds,
+                self.qwen_tts_gpu_release_timeout_seconds,
+                self.audio_rendered_max_seconds,
+            )
+        ):
+            raise ValueError("Qwen3-TTS 超时与最终媒体上限必须大于 0")
+        if self.audio_gpu_handoff_max_used_mib <= 0:
+            raise ValueError("AUDIO_GPU_HANDOFF_MAX_USED_MIB 必须大于 0")
+        if self.qwen_tts_job_timeout_seconds < self.qwen_tts_shot_timeout_seconds:
+            raise ValueError("Qwen3-TTS Job 总超时不得小于单镜头超时")
+        if self.audio_lead_in_seconds < 0 or self.audio_lead_out_seconds < 0:
+            raise ValueError("真实旁白 lead-in/lead-out 不得为负数")
         object.__setattr__(self, "root_dir", root_dir)
         object.__setattr__(self, "data_dir", data_dir)
         object.__setattr__(self, "database_url", database_url)
@@ -144,6 +214,10 @@ class Settings:
         object.__setattr__(self, "comfyui_root", comfyui_root)
         object.__setattr__(self, "comfyui_python", comfyui_python)
         object.__setattr__(self, "comfyui_model_path", comfyui_model_path)
+        object.__setattr__(self, "audio_provider", audio_provider)
+        object.__setattr__(self, "qwen_tts_python", qwen_tts_python)
+        object.__setattr__(self, "qwen_tts_runner", qwen_tts_runner)
+        object.__setattr__(self, "qwen_tts_model_path", qwen_tts_model_path)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -244,6 +318,79 @@ class Settings:
             image_sampler=os.environ.get("IMAGE_SAMPLER", "euler_ancestral"),
             image_scheduler=os.environ.get("IMAGE_SCHEDULER", "normal"),
             image_base_seed=int(os.environ.get("IMAGE_BASE_SEED", "20260802")),
+            audio_provider=os.environ.get("AUDIO_PROVIDER", "mock"),
+            qwen_tts_python=Path(
+                os.environ.get(
+                    "QWEN_TTS_PYTHON",
+                    root / ".venv-qwen3-tts" / "python.exe",
+                )
+            ),
+            qwen_tts_runner=Path(
+                os.environ.get(
+                    "QWEN_TTS_RUNNER",
+                    root / "scripts" / "qwen3_tts_job_runner.py",
+                )
+            ),
+            qwen_tts_model_path=Path(
+                os.environ.get(
+                    "QWEN_TTS_MODEL_PATH",
+                    root
+                    / "models"
+                    / "audio"
+                    / "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                )
+            ),
+            qwen_tts_model_id=os.environ.get(
+                "QWEN_TTS_MODEL_ID",
+                "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            ),
+            qwen_tts_model_revision=os.environ.get(
+                "QWEN_TTS_MODEL_REVISION",
+                "85e237c12c027371202489a0ec509ded67b5e4b5",
+            ),
+            qwen_tts_model_sha256=os.environ.get(
+                "QWEN_TTS_MODEL_SHA256",
+                "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb",
+            ),
+            qwen_tts_tokenizer_sha256=os.environ.get(
+                "QWEN_TTS_TOKENIZER_SHA256",
+                "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+            ),
+            qwen_tts_model_license=os.environ.get(
+                "QWEN_TTS_MODEL_LICENSE", "Apache-2.0"
+            ),
+            qwen_tts_package_version=os.environ.get(
+                "QWEN_TTS_PACKAGE_VERSION", "0.1.1"
+            ),
+            qwen_tts_default_speaker=os.environ.get(
+                "QWEN_TTS_DEFAULT_SPEAKER", "Serena"
+            ),
+            qwen_tts_language=os.environ.get("QWEN_TTS_LANGUAGE", "Chinese"),
+            qwen_tts_seed=int(os.environ.get("QWEN_TTS_SEED", "20260803")),
+            qwen_tts_model_load_timeout_seconds=float(
+                os.environ.get("QWEN_TTS_MODEL_LOAD_TIMEOUT_SECONDS", "300")
+            ),
+            qwen_tts_shot_timeout_seconds=float(
+                os.environ.get("QWEN_TTS_SHOT_TIMEOUT_SECONDS", "300")
+            ),
+            qwen_tts_job_timeout_seconds=float(
+                os.environ.get("QWEN_TTS_JOB_TIMEOUT_SECONDS", "1200")
+            ),
+            qwen_tts_gpu_release_timeout_seconds=float(
+                os.environ.get("QWEN_TTS_GPU_RELEASE_TIMEOUT_SECONDS", "60")
+            ),
+            audio_gpu_handoff_max_used_mib=int(
+                os.environ.get("AUDIO_GPU_HANDOFF_MAX_USED_MIB", "2048")
+            ),
+            audio_lead_in_seconds=float(
+                os.environ.get("AUDIO_LEAD_IN_SECONDS", "0.20")
+            ),
+            audio_lead_out_seconds=float(
+                os.environ.get("AUDIO_LEAD_OUT_SECONDS", "0.35")
+            ),
+            audio_rendered_max_seconds=float(
+                os.environ.get("AUDIO_RENDERED_MAX_SECONDS", "60")
+            ),
             cors_origins=origins,
         )
 

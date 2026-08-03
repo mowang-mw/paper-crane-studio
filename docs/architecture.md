@@ -50,7 +50,7 @@ flowchart LR
     PR --> MT[Text Providers\nMock / llama.cpp]
     PR --> MI[Image Providers\nMock / ComfyUI Animagine]
     PR --> MV[Video Providers\nMock / FFmpeg Motion / Future Model]
-    PR --> MA[TTS Providers\nMock / Local / Remote]
+    PR --> MA[TTS Providers\nMock / Qwen3-TTS]
 
     MT --> TMP
     MI --> TMP
@@ -59,10 +59,13 @@ flowchart LR
 
     MT --> QW[Qwen3-4B\n8081]
     MI --> CU[有界 ComfyUI\n8188 / lowvram]
+    MA --> QT[一次性 Qwen3-TTS 子进程\n独立 Python 3.12 / SDPA]
     QW -.8GB GPU 分阶段互斥.-> CU
+    CU -.8GB GPU 分阶段互斥.-> QT
+    QW -.8GB GPU 分阶段互斥.-> QT
 ```
 
-图中的 Provider 只能把输出写入系统分配的当前 Job 受控目录；P0 Mock 路径使用临时目录再登记素材，M4-B 真实图像路径使用 `data/projects/<project>/jobs/<job>/images/` 保存逐镜头 PNG 和追溯，均不能写任意用户路径。FFmpeg Exporter 是媒体合成服务，不伪装成“大模型”；“从真实关键帧产生镜头片段”的 M4-B 路径明确记录为 `FFMPEG_KEYFRAME_MOTION`，图像来源仍是 `REAL_LOCAL_MODEL`，Mock 音轨也单独标记。
+图中的 Provider 只能把输出写入系统分配的当前 Job 受控目录；P0 Mock 路径使用临时目录再登记素材，M4-B 真实图像路径使用 `jobs/<job>/images/`，M5-B 真实旁白路径使用 `jobs/<job>/audio/`，均不能写任意用户路径。FFmpeg Exporter 是媒体合成服务，不伪装成“大模型”；真实关键帧、真实语音和 Mock 素材分别记录来源，不能因为最终都由 FFmpeg 编码就混淆 Provider 身份。
 
 ## 3. 进程与部署边界
 
@@ -112,6 +115,37 @@ sequenceDiagram
 
 API 与 Worker 都执行 GPU 交接检查，以覆盖“入队后、执行前又启动 Qwen”的竞争窗口。发现 8081 监听或 `llama-server` 进程时返回 `GPU_HANDOFF_REQUIRED`；平台不杀外部进程、不强行启动 ComfyUI，也不把任务改成 Mock。ComfyUI 只绑定回环地址 8188，由 Worker 的有界上下文负责启动和结束，不需要用户手工常驻。
 
+### 3.2 M5-B 的一次性 TTS 子进程边界
+
+M5-B 在 M4-B 后增加第三个 GPU 阶段。成功真实图像 Job 已经冻结 ScriptV1 与 PNG，用户停止 Qwen、确认 ComfyUI 已退出后，才创建 `GENERATE_REAL_AUDIO_VIDEO` 子 Job。FastAPI 校验 8081/8188、已知模型进程、整卡显存和来源 Job，Worker 执行前再次校验；默认前置显存占用阈值为可配置的 2048 MiB。冲突只返回 `GPU_HANDOFF_REQUIRED`，不杀用户进程。
+
+Python 3.11 后端不导入 `qwen_tts` 或 PyTorch。`Qwen3TTSAudioProvider` 通过参数列表、`shell=False` 启动 `.venv-qwen3-tts` 中的 Python 3.12 和 `scripts/qwen3_tts_job_runner.py`。一次子进程对应一个 3—5 镜头 Job：固定离线本地模型、只加载一次、单并发顺序生成所有缺失 WAV；模型加载、单镜头和 Job 总时长分别有界。父进程持续读取进度文件，捕获 stdout/stderr，并在成功、错误或超时后等待和回收自己启动的进程。它不启动 Gradio/FastAPI 服务，也不与 Qwen 或 ComfyUI 同驻 GPU。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI
+    participant W as 单 Worker
+    participant DB as SQLite / 受控文件
+    participant T as 一次性 Qwen3-TTS
+    participant F as FFmpeg / ffprobe
+
+    U->>API: POST /projects/{id}/render-real-audio
+    API->>DB: 校验成功 M4-B Job、冻结 ScriptV1/PNG 来源
+    API->>DB: 入队 GENERATE_REAL_AUDIO_VIDEO
+    W->>W: 复查 8081/8188；Script/Image 调用数=0
+    W->>T: Popen 一次，离线加载 0.6B CustomVoice
+    loop 按 ScriptV1 顺序生成缺失旁白
+        T-->>W: WAV + result + progress
+        W->>DB: 完整解码、非静音、SHA256、进度
+    end
+    W-->>T: 等待退出并检查显存释放
+    W->>W: 计算 MediaTimingPlan
+    W->>F: 复用真实 PNG + 完整 WAV + 烧录中文字幕
+    F-->>W: H.264/AAC MP4、ffprobe、manifest
+    W->>DB: Job SUCCEEDED 与 Export/Asset
+```
+
 ## 4. 模块划分
 
 以下是下一阶段建议的逻辑模块，不代表本阶段已经创建代码目录：
@@ -140,6 +174,7 @@ API 与 Worker 都执行 GPU 交接检查，以覆盖“入队后、执行前又
 - 剧本、角色、场景和分镜采用表单或卡片编辑，不做自由时间线。
 - 显示每个阶段的进入条件、缺失项、revision 和过期资产。
 - 显示关键帧候选并让用户明确选择，不因重新生成覆盖旧选择。
+- M5-B 在成功真实图像 Job 下提供 Serena（默认）/Vivian 音色选择、逐段音频进度、延长镜头和真实/Mock 音频徽标；Job 入队后不再用当前 UI 值覆盖快照。
 - 以 1—2 秒轮询 Job；SSE 是加分项，不作为第一版依赖。
 - 对错误显示用户可执行建议，例如“密钥未配置”“显存不足，请切换 Mock”“字幕滤镜不可用”。
 - 在资产、Job 和导出页面持续显示 `MOCK`、`DETERMINISTIC_FALLBACK`、`LOCAL_MODEL`、`REMOTE_API`、`USER_UPLOAD`、`DEMO_FIXTURE` 或 `SYSTEM_DERIVED`。
@@ -151,6 +186,7 @@ API 与 Worker 都执行 GPU 交接检查，以覆盖“入队后、执行前又
 - 把已审核剧本规范化到 Character、Scene、Shot 表，避免同时维护另一份权威 `script_json`。
 - P0 创建带必要业务快照的 Job，并立即返回 `202 Accepted` 与 Job ID；请求指纹和客户端幂等键为增强。
 - 检查下游门禁并解释具体缺项。
+- M5-B 只接受成功 M4-B 来源，服务端派生 Script/Image 来源关系并冻结快照；不相信客户端自行声明上游 Provider。
 - 提供受控素材下载，校验 Project 与 Asset 归属。
 - 返回 Provider 能力和 `configured: true/false`，绝不返回密钥值。
 - 对日志、Provider 原始错误和命令参数做脱敏。
@@ -171,6 +207,7 @@ API 与 Worker 都执行 GPU 交接检查，以覆盖“入队后、执行前又
 | `GET/PATCH /api/v1/projects/{id}` | 查看或编辑项目 |
 | `POST /api/v1/projects/{id}/script-jobs` | 创建结构化剧本 Job |
 | `POST /api/projects/{id}/render-real-images` | M4-B：复用成功 Job 的 ScriptV1，创建真实图像成片子 Job；不调用 ScriptProvider |
+| `POST /api/projects/{id}/render-real-audio` | M5-B：复用成功 M4-B Job 的 ScriptV1 与真实 PNG，选择 Serena/Vivian 创建真实旁白成片子 Job；不调用 ScriptProvider/ImageProvider |
 | `PUT /api/v1/projects/{id}/script` | 保存审核后的角色、场景和分镜 |
 | `POST /api/v1/shots/{id}/keyframe-jobs` | 生成关键帧候选 |
 | `POST /api/v1/shots/{id}/selected-keyframe` | 选择关键帧 |
@@ -293,7 +330,35 @@ GeneratedImageAsset
 
 `ComfyUIJobSession` 使用参数列表和 `subprocess.Popen(shell=False)` 启动，固定 `--lowvram`、`--preview-method none`、禁用自定义节点和内存数据库。启动、HTTP、单图与 Job 分别设超时；上下文 `finally` 先发送受控终止信号，失败后才升级为进程树终止，并检查 8188 是否释放。模型 OOM 直接形成 `GPU_OOM`，不会自动降低分辨率/步数，也不会回退 Mock。
 
-### 7.6 Provider 选择与降级
+### 7.6 M5-B AudioProvider 实际契约
+
+M5-B 保留 `MockAudioProvider`，并新增 ID 固定为 `qwen3-tts-0.6b-customvoice` 的 `Qwen3TTSAudioProvider`。正式强类型 DTO 为：
+
+```text
+AudioGenerationRequest
+  project_id, job_id, ScriptV1, shot, output_dir,
+  AudioGenerationOptions
+
+AudioGenerationOptions
+  speaker, language, base_seed,
+  model_load_timeout_seconds, generation_timeout_seconds,
+  job_timeout_seconds
+
+GeneratedAudioAsset
+  provider_id, model_id, model_revision, model_sha256,
+  shot_id, audio_path, trace_path, text, speaker, language,
+  seed, sample_rate, channels, sample_width_bytes,
+  duration_seconds, generation_seconds, real_time_factor,
+  peak_amplitude, rms, audio_sha256, warnings, reused
+```
+
+来源 `parent_job_id`、`source_script_job_id`、`source_image_job_id`、Provider 选择、`speaker` 和 `language` 位于不可变 Job 快照与音频来源快照中。Provider 只接受已校验 ScriptV1 的 `shot.narration`，不改写文本。Serena 是默认音色；Vivian 可在创建 Job 前选择。一个 Job 内音色固定，语言固定为 `Chinese`，手动重试复制原快照。
+
+`generate_batch()` 校验同一 Project/Job、连续 3—5 镜头及相同参数，然后为所有缺失镜头只启动一个 runner。runner 固定 `bfloat16`、`cuda:0`、PyTorch SDPA 和 Hugging Face/Transformers 离线模式；协议明确 `cloud_api_used=false`、`voice_cloning_used=false`。它加载一次 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 固定 revision，顺序调用预置 CustomVoice，不接受参考声音或 VoiceDesign。
+
+加载前完整核对独立环境、revision metadata、根权重与 speech tokenizer 的 SHA256。每段 WAV 必须完整解码、PCM 参数有效、非静音、无明显全幅削波且 SHA256 与结果一致。显式重试只复用 Provider/model/revision、speaker/language、原文、seed、WAV 哈希/解码与 trace 均匹配的旧资产；缺失或损坏处继续，不能静默切到 Mock。
+
+### 7.7 Provider 选择与降级
 
 Provider 由项目或 Job 显式指定，例如：
 
@@ -301,10 +366,10 @@ Provider 由项目或 Job 显式指定，例如：
 TEXT: llamacpp 或 mock（用户明确选择）
 IMAGE: comfyui-animagine-xl-4 或 mock（分别创建、明确标识）
 VIDEO: 真实 PNG -> ffmpeg_motion；Mock PNG/几何画面 -> Mock FFmpeg 链路
-TTS: mock_tts（M4-B 不接入真实 TTS）
+TTS: qwen3-tts-0.6b-customvoice 或 mock（分别创建、明确标识）
 ```
 
-工程保底默认直接选择 Mock / FFmpeg；真实模型路径由用户显式触发。M4-B 不实现自动链式 fallback：真实 Provider 失败必须保持 FAILED，不能生成 Mock 图再标记成功。完整多次调用历史仍是增强项；无论自动还是手动，`INVALID_REQUEST`、许可证未确认或内容策略拒绝都不能通过换 Provider 规避限制，最终来源必须可见。
+工程保底默认直接选择 Mock / FFmpeg；真实模型路径由用户显式触发。M4-B/M5-B 不实现自动链式 fallback：真实图像或 TTS 失败必须保持 FAILED，不能生成 Mock 图/音频再标记成功。完整多次调用历史仍是增强项；无论自动还是手动，`INVALID_REQUEST`、许可证未确认或内容策略拒绝都不能通过换 Provider 规避限制，最终来源必须可见。
 
 ## 8. 后台任务机制
 
@@ -336,11 +401,21 @@ M4-B 使用 `GENERATE_REAL_IMAGE_VIDEO` Job。入队请求保存来源成功 Job
 
 对 FAILED Job 的显式手动重试仍创建新的 QUEUED Job，并记录 `retry_of_job_id` 与 `resume_image_from_job_id`。Provider 只复用同时满足 Provider/model、镜头 ID、参数、seed、正负提示、模型/图片哈希、PNG 完整解码/尺寸以及工作流/trace 存在性的图片；损坏或不一致的镜头从第一个缺口继续生成。重试不调用 Qwen、不修改 ScriptV1、不静默换成 Mock。原失败 Job 保持不变，M4-B 仍不宣称通用 Worker 崩溃自动恢复。
 
-### 8.4 稳定后目标状态机与机制
+### 8.4 M5-B 子 Job、时序计划与手动恢复
+
+M5-B 使用 `GENERATE_REAL_AUDIO_VIDEO` Job。API 只接受当前项目内 `SUCCEEDED` 的 `GENERATE_REAL_IMAGE_VIDEO` 来源，校验其 Provider 为 Animagine、ScriptV1 快照与 3—5 张 PNG 完整。新 Job 保存 `parent_job_id`、来源 Script/Image Job、两类来源 Provider与哈希、`script_provider=reused`、`image_provider=reused`、`audio_provider=qwen3-tts-0.6b-customvoice`、统一 speaker/language、模型固定 revision、超时和媒体参数。Worker 不创建 ScriptProvider 或 ImageProvider，也不启动 ComfyUI。
+
+音频阶段逐段更新 `completed_audio_count`、当前 shot、WAV 时长/耗时/RTF/SHA256 与可复用状态。同一子进程只加载一次模型并顺序生成；失败结构记录错误码、失败镜头、完成数量、音色、日志路径、GPU 交接与是否可重试。主要错误边界为 `GPU_HANDOFF_REQUIRED`、`TTS_ENV_NOT_FOUND`、`TTS_MODEL_NOT_FOUND`、`TTS_MODEL_HASH_MISMATCH`、`TTS_PROCESS_START_FAILED`、`TTS_MODEL_LOAD_TIMEOUT`、`TTS_GENERATION_TIMEOUT`、`TTS_GENERATION_FAILED`、`AUDIO_OUTPUT_MISSING`、`AUDIO_DECODE_FAILED`、`AUDIO_SILENT`、`AUDIO_TIMING_EXCEEDS_LIMIT` 和 `MEDIA_RENDER`。
+
+源 ScriptV1 不被改写。全部 WAV 校验后生成独立 `MediaTimingPlan`：每镜头以 `max(source_shot_duration, audio_duration + lead_in + lead_out)` 再向上对齐到 24 fps 帧边界。默认 lead-in 0.20 秒、lead-out 0.35 秒；短音频补静音，长音频延长关键帧镜头，不截断、不循环、不变速。ScriptV1 源总时长仍须为 20—40 秒，渲染总时长默认上限 60 秒；最终媒体验收比较编码时长与渲染计划，而不是源计划。
+
+手动重试创建新 Job 并复制原音色、语言与来源；合法旧 WAV 可复用，缺失/损坏 WAV 从首个缺口继续。重试不调用 Qwen 文本、不调用 Animagine、不静默回退 Mock。若 WAV 已齐全而媒体失败，恢复路径只重做 TimingPlan/FFmpeg 或媒体验收。
+
+### 8.5 稳定后目标状态机与机制
 
 目标状态机可扩展 `RETRY_WAIT`、`CANCEL_REQUESTED`、`CANCELLED`，并加入多领取者 CAS、租约、心跳、启动恢复、协作取消和自动退避。这些机制连同取消/成功竞争线性化语义保留为目标设计，但不属于 P0。
 
-### 8.5 目标设计：自动重试与取消
+### 8.6 目标设计：自动重试与取消
 
 | 场景 | 自动重试 | 处理 |
 |---|---|---|
@@ -355,7 +430,7 @@ M4-B 使用 `GENERATE_REAL_IMAGE_VIDEO` Job。入队请求保存来源成功 Job
 
 取消采用协作语义：轮询式任务在阶段边界检查；本地模型优先在独立子进程或本地服务中运行。Windows 上可靠终止进程树需使用 Job Object 或明确管理全部子进程，执行 `terminate -> 短超时 -> kill`；普通进程句柄只保证直接进程。FFmpeg 用受控进程句柄终止。远程 HTTP 取消不保证撤销服务端计算或费用。取消前的临时文件不成为 READY Asset。
 
-### 8.6 目标设计：幂等与进度
+### 8.7 目标设计：幂等与进度
 
 - `client_idempotency_key` 只表示一次用户操作：数据库对 `(project_id, client_idempotency_key)` 建唯一约束；相同键且请求指纹相同则返回已有 Job，相同键但请求不同则返回冲突。
 - `request_fingerprint` 是规范化输入、业务 revision、所选输入 Asset 哈希、提示词版本、请求的 Provider 策略和非敏感参数的 SHA-256，只用于审计、比较和可选缓存提示，不设唯一约束。相同输入的主动重新生成用新客户端键，因此会保留独立 Job、候选和历史。
@@ -387,6 +462,15 @@ data/
           comfyui.stdout.log
           comfyui.stderr.log
           image_generation_report.json
+          audio/
+            shot-01.wav
+            shot-01.request.json
+            shot-01.result.json
+            shot-01.text.txt
+          tts.stdout.log
+          tts.stderr.log
+          audio_generation_report.json
+          timing_plan.json
       assets/
         image/<asset_uuid>.png
         audio/<asset_uuid>.wav
@@ -404,7 +488,7 @@ data/
 
 版本化提示词模板属于源代码，例如未来的 `backend/app/prompts/script/v1.*`，不放进可变 `data/`。合法演示 fixture 放在独立 `demo/fixtures/`，只提交自制或已明确许可的小文件。
 
-上图 `jobs/` 是 M4-B 已实现的受控图像追溯目录；数据库仍保存相对于 `data/` 的路径，前端通过项目归属校验后的 Asset URL 读取 PNG。ComfyUI 自身的 output/temp/user 子目录也限制在当前 Job 下，并在 `.gitignore` 覆盖的数据根目录内。模型权重、`.venv-comfyui`、`tools/ComfyUI` 和所有生成图片均不得进入 Git 追踪。
+上图 `jobs/` 同时承载 M4-B 图像与 M5-B 音频追溯；数据库仍保存相对于 `data/` 的路径。ComfyUI 的 output/temp/user 和 TTS 的 WAV/request/result/log 均限制在所属 Job 下并被 `.gitignore` 覆盖。模型权重、`.venv-comfyui`、`.venv-qwen3-tts`、下载缓存、生成图片与 WAV 均不得进入 Git 追踪。
 
 ### 9.2 P0 归档规则
 
@@ -430,6 +514,10 @@ data/
 M4-B 复用上述公共层的 `render_image_project_short()` 入口，并在进入 FFmpeg 前额外强校验：关键帧数量与 shot 一一对应、Provider/model 全部一致且非 Mock、每张图是单视频流 PNG、完整解码成功、尺寸与记录一致、SHA256 与追溯一致。每张 1024×576 PNG 先按比例放大和裁切，再应用轻微、确定性的 `zoompan` Ken Burns 运镜；左上角镜头信息降低遮罩不透明度，旁白仍通过独立 UTF-8 LF `textfile` 烧录。音频继续使用确定性 Mock WAV 并编码为 AAC，最终规格保持 1280×720、24 fps、H.264、AAC、`yuv420p`。
 
 真实图像 manifest 使用 `m4.real-image-export.v1`，记录 `script_provider`、`source_script_job_id`、`image_provider`、`audio_provider`、每镜头真实 PNG 路径/SHA256/seed/提示词追溯、`subtitle_rendering=burned_in`、计划与编码时长及媒体量化容差。`image_provider` 只能来自被验证的真实关键帧，不得因为媒体渲染仍用了 FFmpeg 或 Mock 音轨就被覆盖为 Mock。
+
+M5-B 的真实音频入口在 FFmpeg 前额外校验每个 WAV 与 shot 一一对应、Provider/model/revision/speaker/language 一致、完整解码、非静音、SHA256 匹配。输入 WAV 采样率先探测，再重采样为最终 48kHz AAC；旁白从 lead-in 后开始，尾部只补静音，不循环或裁剪。已有真实 PNG 按 `rendered_shot_duration` 延长并继续应用确定性 Ken Burns 运镜；中文字幕仍由 UTF-8 LF `textfile` + drawtext 烧录，时间覆盖主要旁白播放区。
+
+M5-B Export 固定 1280×720、24 fps、H.264、AAC、`yuv420p`。Manifest 必须同时记录 `source_planned_duration_seconds`、`rendered_planned_duration_seconds`、`encoded_duration_seconds`、延长量和 `timing_plan_path`，并保存每段 WAV 路径/SHA256/时长/耗时、speaker/language、Script/Image 来源以及 `subtitle_rendering=burned_in`。编码时长容差以渲染计划为基准；不得把原 ScriptV1 20—40 秒上限偷偷放宽，也不得因合法真实语音延长而误判失败。
 
 FFmpeg 官方文档分别描述了 [`zoompan`、`xfade`、`drawtext` 与 `subtitles` 滤镜](https://ffmpeg.org/ffmpeg-filters.html)、[concat demuxer](https://ffmpeg.org/ffmpeg-formats.html#concat-1) 和 [ffprobe JSON 输出](https://ffmpeg.org/ffprobe.html)。本轮通过 `conda run -n anime-platform` 只读枚举：8.0 构建有 drawtext/libfreetype/libharfbuzz/fontconfig 和所需运镜/编码能力，但没有 libass，也未列 `subtitles/ass`；因此 P0 已固定为 drawtext 路线，实际文字烧录 smoke test 仍是编码入口验收。
 
@@ -465,6 +553,19 @@ M4-B 在通用错误类别之上保留更可操作的图像阶段码：
 | `GPU_OOM` | 明确报告 OOM；M4-B 不自动降低分辨率/步数、不切 Mock |
 | `MEDIA_RENDER` | 图片已经完成但 FFmpeg/ffprobe 失败；保留图片追溯，手动重试不调用 Qwen |
 
+M5-B 的音频阶段码进一步区分环境、模型、生成、WAV 与媒体错误：
+
+| 错误码 | 含义与处理 |
+|---|---|
+| `GPU_HANDOFF_REQUIRED` | 8081/8188 或文本/图像模型仍在运行；用户释放 GPU 后重试，平台不杀进程 |
+| `TTS_ENV_NOT_FOUND` / `TTS_PROCESS_START_FAILED` | 独立 Python/runner 缺失或子进程无法启动；不改用后端 Python 直接加载 |
+| `TTS_MODEL_NOT_FOUND` / `TTS_MODEL_HASH_MISMATCH` | 固定 revision 权重缺失或关键 SHA256 不符；立即停止，不下载或换模 |
+| `TTS_MODEL_LOAD_TIMEOUT` / `TTS_GENERATION_TIMEOUT` | 加载、单镜头或 Job 有界超时；记录阶段、shot、完成数和日志 |
+| `TTS_GENERATION_FAILED` / `AUDIO_OUTPUT_MISSING` | 模型或输出协议失败；合法旧 WAV 可在手动重试时复用 |
+| `AUDIO_DECODE_FAILED` / `AUDIO_SILENT` | WAV 无法完整解码或低于非静音阈值；不得进入 FFmpeg |
+| `AUDIO_TIMING_EXCEEDS_LIMIT` | 真实旁白使渲染计划超过默认 60 秒；不截断，建议 Serena 或缩短旁白 |
+| `MEDIA_RENDER` | WAV 已完成但 FFmpeg/ffprobe 失败；保留 Script/PNG/WAV，不调用上游模型 |
+
 ## 12. 可追溯机制
 
 每个 Job attempt 保存不可变快照。Job 另存 `executor_kind` 与 `executor_id_snapshot`：生成任务为 `PROVIDER`，EXPORT_VIDEO 为 `MEDIA_SERVICE/ffmpeg_exporter`，后者的 Provider/model 字段为 null/N/A，绝不伪装为模型调用：
@@ -481,6 +582,8 @@ M4-B 在通用错误类别之上保留更可操作的图像阶段码：
 Export manifest 进一步快照镜头顺序、字幕区间、依赖规则版本/指纹、相关 revision 与 Asset 哈希、FFmpeg/ffprobe 版本、脱敏参数和验证结果。上游后来修改时，历史 Export 保持其执行终态，同时写入失效时间和原因，其输出 Asset 转为 STALE；这样即使未来模板或模型配置改变，仍能解释旧成片是如何产生的。记录 seed 只表示“发出并保存该值”，除非 Provider 明确支持，否则不承诺字节级复现。
 
 M4-B 还把来源 ScriptV1 独立冻结到新 Job 的 `script-source.json` 并记录文件 SHA256，因此即使来源 Job 后来不再处于页面焦点，也能证明真实图片使用了哪份剧本。Job request/result、逐图 result、Job 级图像报告和 Export manifest 均保存 `source_script_job_id`、来源文本 Provider、`script_provider_calls=0`、ImageProvider/model SHA、base/shot seed、正负提示、每张耗时与图片 SHA；Mock Script → ComfyUI 也必须如实显示 `source_script_provider=mock`。严格角色一致性尚未实现的警告作为追溯事实保留，不能用固定 seed 或重复标签冒充已解决。
+
+M5-B 再冻结来源 Script/Image Job、ScriptV1 SHA 与逐图路径/SHA，明确 `script_provider=reused`、`image_provider=reused`、两类模型调用数为 0。Job request/result、逐镜头 request/result/text、`audio_generation_report.json`、`timing_plan.json` 与 Export manifest 保存真实 AudioProvider/model/revision/关键模型 SHA、speaker、language、原文、seed、WAV 参数/时长/耗时/RTF/SHA256、复用状态和 GPU/进程摘要。模型原文与最终保存 ScriptV1 不被静默裁剪；TimingPlan 是独立派生记录，不伪装成 ScriptV1 修改。
 
 ## 13. 配置与密钥安全
 
@@ -507,8 +610,9 @@ M4-B 还把来源 ScriptV1 独立冻结到新 Job 的 `script-source.json` 并�
 | FFmpeg + ffprobe | 确定性视频兜底和成熟媒体工具链 | 已枚举 H.264/AAC/drawtext 等能力并排除 libass；须在 Conda 环境完成实际编码 fixture |
 | Provider / Adapter | 隔离模型差异，支持 Mock、本地和远程 | 强类型接口、契约测试、显式 fallback |
 | ComfyUI 本地 API + Animagine XL 4.0 Opt | M4-A 已在 8GB GPU 验证内置节点工作流，M4-B 可在不导入 PyTorch 到后端环境的前提下正式服务化 | 独立 `.venv-comfyui`、`--lowvram`、单 Job 有界启动、与 Qwen GPU 互斥、禁止自定义节点 |
+| Qwen3-TTS 0.6B CustomVoice + PyTorch SDPA | M5-A 已验证 Serena/Vivian 本地中文 WAV；M5-B 可在 Python 3.11 后端不导入 qwen-tts 的前提下正式集成 | 独立 `.venv-qwen3-tts`、一次性子进程、一次加载顺序生成、与文本/图像模型 GPU 互斥、禁止克隆与云 API |
 
-不选择 Redis/Celery 是因为单用户、单 Worker 的负载不需要额外运维；不选择微服务或 Kubernetes 是因为它们不改善当前范围演示成功率。ComfyUI 已在 M4-A 以独立环境验证，并在 M4-B 仅作为 `ComfyUIImageProvider` 后端接入；它不拥有业务数据库、不改变 ScriptV1/Asset/Job 契约，也不作为需要人工常驻的第四个平台进程。Ollama 仍未引入。
+不选择 Redis/Celery 是因为单用户、单 Worker 的负载不需要额外运维；不选择微服务或 Kubernetes 是因为它们不改善当前范围演示成功率。ComfyUI 与 Qwen3-TTS 都通过独立环境与受控进程边界接入，不拥有业务数据库、不改变 ScriptV1/Asset/Job 契约，也不成为人工常驻的平台服务。Ollama 仍未引入。
 
 ## 15. 实施与后续验证顺序
 
@@ -519,4 +623,6 @@ M4-B 还把来源 ScriptV1 独立冻结到新 Job 的 `script-source.json` 并�
 5. 工程保底通过后立即按既有候选接入一个真实文本模型，不等待某个固定日期。
 6. M4-A 已完成单张 Animagine 冒烟；M4-B 实现 ScriptV1 快照复用、3—5 张顺序生成、真实 PNG 媒体管线和平台交互。
 7. `scripts/m4_real_image_e2e.py` 已完成一次真实三镜头 E2E：复用 `llamacpp` 来源 ScriptV1且文本调用为 0，ComfyUI 单次启动、顺序生成三张 1024×576/24-step PNG，无 OOM/降级/Mock 图；全卡采样峰值 7332 MiB，最终 20.021333 秒 MP4 完整解码和中文字幕抽帧通过，进程退出、8188 释放、显存回落约 383 MiB。逐图证据见 M4-B 实施记录。
-8. 本轮停止在 M4-B。角色一致性高级方案、IP-Adapter、ControlNet、LoRA、真实 TTS 和视频生成不在本阶段；真实视频仍不进入成功关键路径。
+8. M5-A 已完成 Qwen3-TTS 0.6B Serena/Vivian 双音色真实冒烟；M5-B 实现来源 Script/PNG 复用、正式 AudioProvider、一次加载顺序生成、MediaTimingPlan 与真实旁白 FFmpeg 合成。
+9. M5-B 已完成 Serena 真实三镜头 E2E：来源 M4-B Job `11c1b83a-f5b7-4511-b7db-2e1056ef2160`，新 Job `511262cc-ccf3-4038-878d-2b0037d737ee`；模型一次加载并顺序生成三段真实 WAV，零 Script/Image 调用、零 Mock 音频。源/渲染计划均为 20.000 秒，最终 MP4 20.021333 秒且完整解码；总墙钟 88.235 秒，GPU-wide 峰值 3001 MiB，无 OOM/CPU offload，进程退出、显存回落且 8000/8081/8188 全部释放。
+10. 本轮停止在 M5-B。声音克隆、VoiceDesign、多角色对白、背景音乐模型、实时 TTS、M6 视频生成及高级角色一致性均不进入本阶段。

@@ -1,4 +1,4 @@
-"""《纸鹤的夜航》M0/M1 确定性 Mock 媒体流水线。"""
+"""M0—M5 确定性 Mock、真实关键帧与真实旁白媒体流水线。"""
 
 from __future__ import annotations
 
@@ -636,6 +636,10 @@ def _normalize_project_shots(
 
 
 _REAL_IMAGE_SOURCE_TYPE = "REAL_LOCAL_MODEL"
+_REAL_AUDIO_SOURCE_TYPE = "REAL_LOCAL_TTS"
+_AUDIO_LEAD_IN_SECONDS = 0.20
+_AUDIO_LEAD_OUT_SECONDS = 0.35
+_DEFAULT_RENDERED_DURATION_LIMIT_SECONDS = 60.0
 
 
 def _required_keyframe_text(
@@ -791,6 +795,371 @@ def _validate_real_keyframes(
             f"providers={sorted(provider_ids)}, models={sorted(model_ids)}"
         )
     return by_shot
+
+
+def _trace_mapping(value: Any, *, label: str) -> dict[str, Any]:
+    """把 Provider dataclass 或普通字典收敛为只读追溯字典。"""
+
+    if isinstance(value, dict):
+        return dict(value)
+    serializer = getattr(value, "as_dict", None)
+    if callable(serializer):
+        serialized = serializer()
+        if isinstance(serialized, dict):
+            return dict(serialized)
+    raise MediaToolError(f"{label} 必须是对象或提供 as_dict()")
+
+
+def _required_trace_text(
+    payload: dict[str, Any],
+    field: str,
+    *,
+    label: str,
+) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise MediaToolError(f"{label} 缺少非空字段 {field}")
+    return value.strip()
+
+
+def _trace_number(
+    payload: dict[str, Any],
+    names: tuple[str, ...],
+    *,
+    label: str,
+) -> float:
+    for name in names:
+        value = payload.get(name)
+        if type(value) in (int, float):
+            parsed = float(value)
+            if math.isfinite(parsed):
+                return parsed
+    raise MediaToolError(f"{label} 缺少有限数值字段 {'/'.join(names)}")
+
+
+def _probe_real_audio_asset(
+    *,
+    tools: MediaTools,
+    root: Path,
+    shot: dict[str, Any],
+    original: Any,
+    expected_provider_id: str,
+    command_log: list[str],
+) -> dict[str, Any]:
+    """完整验证单镜真实 WAV；绝不接纳 Mock 或损坏的缓存音频。"""
+
+    shot_id = str(shot["shot_id"])
+    label = f"真实旁白 {shot_id}"
+    asset = _trace_mapping(original, label=label)
+    if _required_trace_text(asset, "shot_id", label=label) != shot_id:
+        raise MediaToolError(f"{label} 的 shot_id 与剧本不一致")
+    provider_id = _required_trace_text(asset, "provider_id", label=label)
+    if provider_id != expected_provider_id or provider_id.lower() == "mock":
+        raise MediaToolError(
+            f"{label} Provider 不符：预期 {expected_provider_id}，实际 {provider_id}"
+        )
+    model_id = _required_trace_text(asset, "model_id", label=label)
+    model_revision = _required_trace_text(asset, "model_revision", label=label)
+    speaker = _required_trace_text(asset, "speaker", label=label)
+    language = _required_trace_text(asset, "language", label=label)
+    text = asset.get("text")
+    if not isinstance(text, str) or text != str(shot["subtitle_text"]):
+        raise MediaToolError(f"{label} 文本与 ScriptV1 旁白不完全一致")
+
+    audio_value = asset.get("audio_path", asset.get("path"))
+    if not isinstance(audio_value, (str, os.PathLike)) or not str(audio_value):
+        raise MediaToolError(f"{label} 缺少 audio_path")
+    audio_path = Path(audio_value).expanduser().resolve()
+    if not audio_path.is_file() or audio_path.stat().st_size <= 44:
+        raise MediaToolError(f"{label} WAV 不存在或为空：{audio_path}")
+    if audio_path.suffix.lower() != ".wav":
+        raise MediaToolError(f"{label} 必须是 WAV：{audio_path}")
+    expected_sha256 = _required_trace_text(
+        asset,
+        "audio_sha256" if "audio_sha256" in asset else "sha256",
+        label=label,
+    ).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise MediaToolError(f"{label} audio_sha256 格式无效")
+    actual_sha256 = sha256_file(audio_path)
+    if actual_sha256 != expected_sha256:
+        raise MediaToolError(
+            f"{label} SHA-256 不符：记录 {expected_sha256}，实际 {actual_sha256}"
+        )
+
+    probe = ffprobe_json(tools, audio_path, command_log=command_log)
+    streams = probe.get("streams")
+    audio_streams = (
+        [item for item in streams if item.get("codec_type") == "audio"]
+        if isinstance(streams, list)
+        else []
+    )
+    video_streams = (
+        [item for item in streams if item.get("codec_type") == "video"]
+        if isinstance(streams, list)
+        else []
+    )
+    if len(audio_streams) != 1 or video_streams:
+        raise MediaToolError(f"{label} 必须只包含一个音频流")
+    audio_stream = audio_streams[0]
+    if audio_stream.get("codec_name") != "pcm_s16le":
+        raise MediaToolError(
+            f"{label} 必须是 PCM16 WAV，实际 {audio_stream.get('codec_name')}"
+        )
+    try:
+        sample_rate = int(audio_stream["sample_rate"])
+        channels = int(audio_stream["channels"])
+        actual_duration = float((probe.get("format") or {})["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MediaToolError(f"{label} ffprobe 元数据不完整") from exc
+    if sample_rate <= 0 or channels <= 0 or actual_duration <= 0:
+        raise MediaToolError(f"{label} 采样率、声道或时长无效")
+    recorded_sample_rate = asset.get("sample_rate")
+    recorded_channels = asset.get("channels")
+    if recorded_sample_rate != sample_rate or recorded_channels != channels:
+        raise MediaToolError(
+            f"{label} 采样参数与追溯不一致："
+            f"记录 {recorded_sample_rate}Hz/{recorded_channels}ch，"
+            f"实际 {sample_rate}Hz/{channels}ch"
+        )
+    recorded_duration = _trace_number(
+        asset,
+        ("duration_seconds", "audio_duration_seconds", "audio_duration"),
+        label=label,
+    )
+    sample_tolerance = max(1.0 / sample_rate, 0.000_1)
+    if abs(recorded_duration - actual_duration) > sample_tolerance:
+        raise MediaToolError(
+            f"{label} 时长与追溯不一致：记录 {recorded_duration:.6f} 秒，"
+            f"实际 {actual_duration:.6f} 秒"
+        )
+    run_command(
+        [
+            tools.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            audio_path,
+            "-map",
+            "0:a:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout_seconds=120,
+        command_log=command_log,
+    )
+
+    model_sha256 = _required_trace_text(asset, "model_sha256", label=label).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", model_sha256):
+        raise MediaToolError(f"{label} model_sha256 格式无效")
+    trace_value = asset.get("trace_path")
+    trace_path: Path | None = None
+    if trace_value not in (None, ""):
+        if not isinstance(trace_value, (str, os.PathLike)):
+            raise MediaToolError(f"{label} trace_path 格式无效")
+        trace_path = Path(trace_value).expanduser().resolve()
+        if not trace_path.is_file():
+            raise MediaToolError(f"{label} trace_path 不存在：{trace_path}")
+    warnings = asset.get("warnings", [])
+    if not isinstance(warnings, list) or not all(
+        isinstance(item, str) for item in warnings
+    ):
+        raise MediaToolError(f"{label} warnings 必须是字符串数组")
+
+    return {
+        **asset,
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "model_revision": model_revision,
+        "shot_id": shot_id,
+        "speaker": speaker,
+        "language": language,
+        "text": text,
+        "audio_path": str(audio_path),
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "duration_seconds": round(actual_duration, 6),
+        "generation_seconds": _trace_number(
+            asset, ("generation_seconds",), label=label
+        ),
+        "real_time_factor": _trace_number(
+            asset, ("real_time_factor",), label=label
+        ),
+        "audio_sha256": actual_sha256,
+        "model_sha256": model_sha256,
+        "trace_path": str(trace_path) if trace_path is not None else None,
+        "warnings": list(warnings),
+        "reused": bool(asset.get("reused", False)),
+        "source_type": _REAL_AUDIO_SOURCE_TYPE,
+        "repo_relative_audio_path": _repo_relative(root, audio_path),
+    }
+
+
+def _normalize_real_audio_assets(
+    *,
+    tools: MediaTools,
+    root: Path,
+    shots: list[dict[str, Any]],
+    audio_assets: list[Any] | tuple[Any, ...],
+    provider_id: str,
+    command_log: list[str],
+) -> dict[str, dict[str, Any]]:
+    if provider_id.lower() == "mock":
+        raise MediaToolError("真实旁白媒体入口禁止 audio provider=mock")
+    if len(audio_assets) != len(shots):
+        raise MediaToolError(
+            "真实旁白数量必须与剧本镜头数一致："
+            f"剧本 {len(shots)}，旁白 {len(audio_assets)}"
+        )
+    raw_by_id: dict[str, Any] = {}
+    for position, original in enumerate(audio_assets, start=1):
+        payload = _trace_mapping(original, label=f"第 {position} 个真实旁白")
+        shot_id = _required_trace_text(
+            payload, "shot_id", label=f"第 {position} 个真实旁白"
+        )
+        if shot_id in raw_by_id:
+            raise MediaToolError(f"真实旁白 shot_id 重复：{shot_id}")
+        raw_by_id[shot_id] = original
+    expected_ids = [str(shot["shot_id"]) for shot in shots]
+    if set(raw_by_id) != set(expected_ids):
+        raise MediaToolError(
+            "真实旁白镜头集合与剧本不一致："
+            f"预期 {expected_ids}，实际 {list(raw_by_id)}"
+        )
+    return {
+        shot_id: _probe_real_audio_asset(
+            tools=tools,
+            root=root,
+            shot=next(shot for shot in shots if str(shot["shot_id"]) == shot_id),
+            original=raw_by_id[shot_id],
+            expected_provider_id=provider_id,
+            command_log=command_log,
+        )
+        for shot_id in expected_ids
+    }
+
+
+def _normalize_media_timing_plan(
+    *,
+    shots: list[dict[str, Any]],
+    audio_by_shot: dict[str, dict[str, Any]],
+    timing_plan: Any,
+    fps: int,
+    max_total_duration_seconds: float,
+) -> tuple[list[dict[str, Any]], float, float]:
+    if isinstance(timing_plan, (list, tuple)):
+        raw_items = list(timing_plan)
+    else:
+        plan_payload = _trace_mapping(timing_plan, label="MediaTimingPlan")
+        raw_items = plan_payload.get("shots", plan_payload.get("shot_timings"))
+    if not isinstance(raw_items, (list, tuple)):
+        raise MediaToolError("MediaTimingPlan 缺少 shots 数组")
+    raw_items = list(raw_items)
+    if len(raw_items) != len(shots):
+        raise MediaToolError("MediaTimingPlan 镜头数与 ScriptV1 不一致")
+    if not math.isfinite(max_total_duration_seconds) or max_total_duration_seconds <= 0:
+        raise MediaToolError("最终渲染时长上限必须大于 0")
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for position, original in enumerate(raw_items, start=1):
+        item = _trace_mapping(original, label=f"MediaTimingPlan.shots[{position - 1}]")
+        shot_id = _required_trace_text(
+            item, "shot_id", label=f"MediaTimingPlan.shots[{position - 1}]"
+        )
+        if shot_id in by_id:
+            raise MediaToolError(f"MediaTimingPlan shot_id 重复：{shot_id}")
+        by_id[shot_id] = item
+
+    expected_ids = [str(shot["shot_id"]) for shot in shots]
+    if set(by_id) != set(expected_ids):
+        raise MediaToolError("MediaTimingPlan 镜头集合与 ScriptV1 不一致")
+
+    normalized: list[dict[str, Any]] = []
+    source_total = 0.0
+    rendered_total = 0.0
+    for shot in shots:
+        shot_id = str(shot["shot_id"])
+        item = by_id[shot_id]
+        label = f"MediaTimingPlan {shot_id}"
+        source_duration = _trace_number(
+            item,
+            ("source_shot_duration", "source_duration_seconds"),
+            label=label,
+        )
+        audio_duration = _trace_number(
+            item,
+            ("audio_duration", "audio_duration_seconds"),
+            label=label,
+        )
+        lead_in = _trace_number(item, ("lead_in_seconds",), label=label)
+        lead_out = _trace_number(item, ("lead_out_seconds",), label=label)
+        rendered_duration = _trace_number(
+            item,
+            ("rendered_shot_duration", "rendered_duration_seconds"),
+            label=label,
+        )
+        extended_by = _trace_number(
+            item,
+            ("extended_by_seconds", "extension_seconds"),
+            label=label,
+        )
+        reason = item.get("extension_reason", item.get("reason"))
+        if not isinstance(reason, str) or not reason.strip():
+            raise MediaToolError(f"{label} 缺少 extension_reason")
+        if abs(source_duration - float(shot["duration_seconds"])) > 1e-6:
+            raise MediaToolError(f"{label} 源镜头时长与 ScriptV1 不一致")
+        actual_audio_duration = float(audio_by_shot[shot_id]["duration_seconds"])
+        sample_rate = int(audio_by_shot[shot_id]["sample_rate"])
+        if abs(audio_duration - actual_audio_duration) > max(1 / sample_rate, 1e-4):
+            raise MediaToolError(f"{label} 音频时长与 WAV 实测不一致")
+        if abs(lead_in - _AUDIO_LEAD_IN_SECONDS) > 1e-6:
+            raise MediaToolError(f"{label} lead_in_seconds 必须为 0.20")
+        if abs(lead_out - _AUDIO_LEAD_OUT_SECONDS) > 1e-6:
+            raise MediaToolError(f"{label} lead_out_seconds 必须为 0.35")
+        raw_duration = max(source_duration, audio_duration + lead_in + lead_out)
+        expected_frames = math.ceil(raw_duration * fps - 1e-9)
+        expected_rendered = expected_frames / fps
+        if abs(rendered_duration - expected_rendered) > 1e-6:
+            raise MediaToolError(
+                f"{label} 未按 {fps}fps 帧边界向上取整："
+                f"预期 {expected_rendered:.6f}，实际 {rendered_duration:.6f}"
+            )
+        expected_extension = max(0.0, expected_rendered - source_duration)
+        if abs(extended_by - expected_extension) > 1e-6:
+            raise MediaToolError(f"{label} extended_by_seconds 与实算值不一致")
+        normalized.append(
+            {
+                **item,
+                "shot_id": shot_id,
+                "source_shot_duration": round(source_duration, 6),
+                "source_duration_seconds": round(source_duration, 6),
+                "audio_duration": round(audio_duration, 6),
+                "audio_duration_seconds": round(audio_duration, 6),
+                "lead_in_seconds": round(lead_in, 6),
+                "lead_out_seconds": round(lead_out, 6),
+                "rendered_shot_duration": round(expected_rendered, 6),
+                "rendered_duration_seconds": round(expected_rendered, 6),
+                "extended_by_seconds": round(expected_extension, 6),
+                "extension_seconds": round(expected_extension, 6),
+                "extension_reason": reason.strip(),
+            }
+        )
+        source_total += source_duration
+        rendered_total += expected_rendered
+
+    if not 20.0 <= source_total <= 40.0:
+        raise MediaToolError(
+            f"源 ScriptV1 总时长必须在 20—40 秒内，实际 {source_total:.3f} 秒"
+        )
+    if rendered_total > max_total_duration_seconds + 1e-6:
+        raise MediaToolError(
+            "AUDIO_TIMING_EXCEEDS_LIMIT："
+            f"渲染总时长 {rendered_total:.3f} 秒超过上限 "
+            f"{max_total_duration_seconds:.3f} 秒；请改用 Serena 或缩短旁白。"
+        )
+    return normalized, round(source_total, 6), round(rendered_total, 6)
 
 
 def _render_project_short(
@@ -1210,6 +1579,647 @@ def render_image_project_short(
         progress_callback=progress_callback,
         keyframes=keyframes,
     )
+
+
+def _create_real_audio_image_shot(
+    *,
+    tools: MediaTools,
+    font: Path,
+    subtitle: BurnedSubtitle,
+    shot: dict[str, Any],
+    keyframe: dict[str, Any],
+    audio: dict[str, Any],
+    timing: dict[str, Any],
+    output_path: Path,
+    command_log: list[str],
+    width: int,
+    height: int,
+    fps: int,
+) -> dict[str, Any]:
+    """把真实 PNG 与完整真实旁白合成为单镜头，不变速也不截断旁白。"""
+
+    rendered_duration = float(timing["rendered_shot_duration"])
+    audio_duration = float(timing["audio_duration"])
+    lead_in = float(timing["lead_in_seconds"])
+    lead_out = float(timing["lead_out_seconds"])
+    if lead_in + audio_duration + lead_out > rendered_duration + 1e-6:
+        raise MediaToolError(
+            f"镜头 {shot['shot_id']} 的渲染时长不足以容纳完整旁白与前后留白"
+        )
+    frame_count = int(round(rendered_duration * fps))
+    if frame_count <= 0 or abs(frame_count / fps - rendered_duration) > 1e-6:
+        raise MediaToolError(f"镜头 {shot['shot_id']} 渲染时长未对齐视频帧")
+
+    parameters = shot["generation_parameters"]
+    canvas_width = width + 64
+    canvas_height = height + 36
+    subtitle_end = lead_in + audio_duration
+    timed_subtitle_filter = (
+        subtitle.filter_expression
+        + f":enable='between(t,{lead_in:.6f},{subtitle_end:.6f})'"
+    )
+    filters = [
+        (
+            f"scale={canvas_width}:{canvas_height}:"
+            "force_original_aspect_ratio=increase"
+        ),
+        f"crop={canvas_width}:{canvas_height}",
+        "setsar=1",
+        _motion_filter(
+            str(parameters["motion"]),
+            frame_count,
+            width=width,
+            height=height,
+            fps=fps,
+        ),
+        _label_filter(
+            font,
+            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
+            24,
+            22,
+            box_opacity=0.24,
+            box_border=6,
+        ),
+        timed_subtitle_filter,
+        (
+            f"fade=t=in:st=0:d=0.35,"
+            f"fade=t=out:st={max(0.0, rendered_duration - 0.35):.6f}:d=0.35"
+        ),
+        "format=yuv420p",
+    ]
+    # 先延迟真实旁白，再只补静音到目标时长。atrim 只会移除 apad 产生的
+    # 多余静音；TimingPlan 已保证旁白末尾之后仍有 0.35 秒，不会截断语音。
+    audio_filter = (
+        f"adelay={int(round(lead_in * 1000))}:all=1,"
+        f"apad=whole_dur={rendered_duration:.6f},"
+        f"atrim=start=0:duration={rendered_duration:.6f},"
+        "asetpts=N/SR/TB,aresample=48000"
+    )
+
+    temporary = _atomic_media_target(output_path)
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-framerate",
+            str(fps),
+            "-i",
+            Path(str(keyframe["image_path"])),
+            "-i",
+            Path(str(audio["audio_path"])),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            ",".join(filters),
+            "-af",
+            audio_filter,
+            "-t",
+            f"{rendered_duration:.6f}",
+            "-r",
+            str(fps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            temporary,
+        ],
+        timeout_seconds=300,
+        command_log=command_log,
+    )
+    validation = verify_media(
+        tools,
+        temporary,
+        expected_duration_seconds=rendered_duration,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    return {
+        "video_path": output_path,
+        "validation": validation,
+        "sha256": sha256_file(output_path),
+        "narration": subtitle.narration,
+        "rendered_subtitle_text": subtitle.rendered_text,
+        "subtitle_path": subtitle.text_path,
+        "subtitle_filter": timed_subtitle_filter,
+        "subtitle_font_path": subtitle.font_path,
+        "subtitle_rendering": "burned_in",
+        "subtitle_start_seconds": round(lead_in, 6),
+        "subtitle_end_seconds": round(subtitle_end, 6),
+        "keyframe": keyframe,
+        "audio": audio,
+        "timing": timing,
+    }
+
+
+def _write_real_audio_srt(
+    timings: list[dict[str, Any]],
+    shots: list[dict[str, Any]],
+    target: Path,
+) -> None:
+    def stamp(value: float) -> str:
+        milliseconds = int(round(value * 1000))
+        hours, remainder = divmod(milliseconds, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        seconds, millis = divmod(remainder, 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    lines: list[str] = []
+    shot_start = 0.0
+    for index, (timing, shot) in enumerate(zip(timings, shots, strict=True), start=1):
+        subtitle_start = shot_start + float(timing["lead_in_seconds"])
+        subtitle_end = subtitle_start + float(timing["audio_duration"])
+        lines.extend(
+            [
+                str(index),
+                f"{stamp(subtitle_start)} --> {stamp(subtitle_end)}",
+                str(shot["subtitle_text"]),
+                "",
+            ]
+        )
+        shot_start += float(timing["rendered_shot_duration"])
+    target.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def render_real_audio_project_short(
+    *,
+    root: Path,
+    project_id: str,
+    project_title: str,
+    shots: list[dict[str, Any]],
+    keyframes: list[Any] | tuple[Any, ...],
+    audio_assets: list[Any] | tuple[Any, ...],
+    timing_plan: Any,
+    output_dir: Path,
+    output_filename: str | None = None,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+    font_path: Path | None = None,
+    provider_id: str = "qwen3-tts-0.6b-customvoice",
+    generation_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    max_total_duration_seconds: float = _DEFAULT_RENDERED_DURATION_LIMIT_SECONDS,
+    timing_plan_path: Path | None = None,
+) -> dict[str, Any]:
+    """用复用真实 PNG、逐镜真实中文 WAV 与 FFmpeg 生成 M5-B 成片。"""
+
+    root = root.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shot_dir = output_dir / "shots"
+    subtitle_dir = output_dir / "subtitles"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    resolved_timing_plan_path = (
+        Path(timing_plan_path).resolve()
+        if timing_plan_path is not None
+        else None
+    )
+    if (
+        resolved_timing_plan_path is not None
+        and not resolved_timing_plan_path.is_file()
+    ):
+        raise MediaToolError(f"timing_plan_path 不存在：{resolved_timing_plan_path}")
+    if not 3 <= len(shots) <= 5:
+        raise MediaToolError(f"真实旁白短片必须包含 3—5 个镜头，实际 {len(shots)}")
+    if not keyframes:
+        raise MediaToolError("真实旁白短片缺少复用的真实 PNG")
+
+    normalized_keyframes = [
+        _trace_mapping(item, label=f"第 {index} 个真实关键帧")
+        for index, item in enumerate(keyframes, start=1)
+    ]
+    image_provider_id = _required_trace_text(
+        normalized_keyframes[0],
+        "provider_id",
+        label="第 1 个真实关键帧",
+    )
+    normalized_shots = _normalize_project_shots(
+        shots,
+        width=width,
+        height=height,
+        fps=fps,
+        provider_id=image_provider_id,
+    )
+    tools = resolve_media_tools()
+    font = (font_path or find_chinese_font()).resolve()
+    if not font.is_file():
+        raise MediaToolError(f"配置的中文字体不存在：{font}")
+    requested_name = output_filename or f"{_safe_file_stem(project_id, 'm5_export')}.mp4"
+    if (
+        Path(requested_name).name != requested_name
+        or Path(requested_name).suffix.lower() != ".mp4"
+    ):
+        raise MediaToolError("output_filename 必须是当前目录下的 .mp4 文件名")
+
+    command_log: list[str] = []
+    keyframes_by_shot = _validate_real_keyframes(
+        tools=tools,
+        shots=normalized_shots,
+        keyframes=normalized_keyframes,
+        command_log=command_log,
+    )
+    actual_image_provider_id = next(iter(keyframes_by_shot.values()))["provider_id"]
+    if actual_image_provider_id.lower() == "mock":
+        raise MediaToolError("真实旁白短片禁止复用 Mock 图片")
+    for shot in normalized_shots:
+        shot["provider_id"] = actual_image_provider_id
+        shot["source_type"] = _REAL_IMAGE_SOURCE_TYPE
+        shot["generation_parameters"]["visual_provider_id"] = (
+            actual_image_provider_id
+        )
+        shot["generation_parameters"]["image_source_type"] = (
+            "REUSED_REAL_LOCAL_MODEL"
+        )
+        shot["generation_parameters"]["audio_provider_id"] = provider_id
+        shot["generation_parameters"]["audio_source_type"] = (
+            _REAL_AUDIO_SOURCE_TYPE
+        )
+
+    audio_by_shot = _normalize_real_audio_assets(
+        tools=tools,
+        root=root,
+        shots=normalized_shots,
+        audio_assets=audio_assets,
+        provider_id=provider_id,
+        command_log=command_log,
+    )
+    speaker_values = {str(item["speaker"]) for item in audio_by_shot.values()}
+    language_values = {str(item["language"]) for item in audio_by_shot.values()}
+    model_values = {str(item["model_id"]) for item in audio_by_shot.values()}
+    revision_values = {
+        str(item["model_revision"]) for item in audio_by_shot.values()
+    }
+    model_sha256_values = {
+        str(item["model_sha256"]) for item in audio_by_shot.values()
+    }
+    if any(
+        len(values) != 1
+        for values in (
+            speaker_values,
+            language_values,
+            model_values,
+            revision_values,
+            model_sha256_values,
+        )
+    ):
+        raise MediaToolError(
+            "同一真实旁白 Job 不得混用音色、语言、模型、revision 或模型哈希"
+        )
+    if not speaker_values <= {"Serena", "Vivian"}:
+        raise MediaToolError("M5-B 真实旁白音色只允许 Serena 或 Vivian")
+    if language_values != {"Chinese"}:
+        raise MediaToolError("M5-B 真实旁白 language 必须为 Chinese")
+    normalized_timings, source_total, rendered_total = (
+        _normalize_media_timing_plan(
+            shots=normalized_shots,
+            audio_by_shot=audio_by_shot,
+            timing_plan=timing_plan,
+            fps=fps,
+            max_total_duration_seconds=float(max_total_duration_seconds),
+        )
+    )
+
+    shot_outputs: list[dict[str, Any]] = []
+    for index, (shot, timing) in enumerate(
+        zip(normalized_shots, normalized_timings, strict=True),
+        start=1,
+    ):
+        shot_id = str(shot["shot_id"])
+        shot_stem = f"shot-{index:02d}"
+        subtitle = prepare_burned_subtitle(
+            narration=str(shot["subtitle_text"]),
+            text_path=subtitle_dir / f"{shot_stem}.txt",
+            width=width,
+            height=height,
+            font_path=font,
+        )
+        generated = _create_real_audio_image_shot(
+            tools=tools,
+            font=font,
+            subtitle=subtitle,
+            shot=shot,
+            keyframe=keyframes_by_shot[shot_id],
+            audio=audio_by_shot[shot_id],
+            timing=timing,
+            output_path=shot_dir / f"{shot_stem}.mp4",
+            command_log=command_log,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        shot_outputs.append(generated)
+        if progress_callback:
+            progress_callback(65 + int(index * 25 / len(normalized_shots)))
+
+    concat_path = output_dir / "shots.ffconcat"
+    concat_lines = ["ffconcat version 1.0"]
+    for generated in shot_outputs:
+        path_text = generated["video_path"].resolve().as_posix().replace("'", r"'\''")
+        concat_lines.append(f"file '{path_text}'")
+    concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+    output_path = output_dir / requested_name
+    temporary = _atomic_media_target(output_path)
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            temporary,
+        ],
+        timeout_seconds=240,
+        command_log=command_log,
+    )
+    validation = verify_media(
+        tools,
+        temporary,
+        expected_duration_seconds=rendered_total,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    if progress_callback:
+        progress_callback(94)
+
+    subtitle_sidecar = output_dir / "subtitles.srt"
+    _write_real_audio_srt(normalized_timings, normalized_shots, subtitle_sidecar)
+    digest = sha256_file(output_path)
+
+    shot_manifest: list[dict[str, Any]] = []
+    for shot, generated in zip(normalized_shots, shot_outputs, strict=True):
+        keyframe = dict(generated["keyframe"])
+        keyframe["image_path"] = _repo_relative(
+            root, Path(str(keyframe["image_path"]))
+        )
+        for trace_field in ("workflow_path", "trace_path"):
+            trace_value = keyframe.get(trace_field)
+            if isinstance(trace_value, str) and trace_value:
+                keyframe[trace_field] = _repo_relative(root, Path(trace_value))
+        audio = generated["audio"]
+        timing = generated["timing"]
+        audio_trace_path = audio.get("trace_path")
+        shot_manifest.append(
+            {
+                "shot_id": shot["shot_id"],
+                "sequence_no": shot["sequence_no"],
+                "title": shot["title"],
+                "visual_description": shot["visual_description"],
+                "duration_seconds": timing["rendered_shot_duration"],
+                "source_shot_duration": timing["source_shot_duration"],
+                "source_duration_seconds": timing["source_duration_seconds"],
+                "rendered_shot_duration": timing["rendered_shot_duration"],
+                "rendered_duration_seconds": timing["rendered_duration_seconds"],
+                "extended_by_seconds": timing["extended_by_seconds"],
+                "extension_seconds": timing["extension_seconds"],
+                "extension_reason": timing["extension_reason"],
+                "lead_in_seconds": timing["lead_in_seconds"],
+                "lead_out_seconds": timing["lead_out_seconds"],
+                "subtitle": shot["subtitle_text"],
+                "narration": shot["subtitle_text"],
+                "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
+                "subtitle_text_path": _repo_relative(
+                    root, generated["subtitle_path"]
+                ),
+                "rendered_subtitle_text": generated["rendered_subtitle_text"],
+                "subtitle_start_seconds": generated["subtitle_start_seconds"],
+                "subtitle_end_seconds": generated["subtitle_end_seconds"],
+                "font_path": str(generated["subtitle_font_path"]),
+                "subtitle_rendering": "burned_in",
+                "subtitle_filter": generated["subtitle_filter"],
+                "clip_path": _repo_relative(root, generated["video_path"]),
+                "clip_sha256": generated["sha256"],
+                "clip_validation": generated["validation"],
+                "keyframe": keyframe,
+                "keyframe_path": keyframe["image_path"],
+                "keyframe_sha256": keyframe["image_sha256"],
+                "image_provider": keyframe["provider_id"],
+                "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+                "audio_provider": audio["provider_id"],
+                "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
+                "audio_model_id": audio["model_id"],
+                "audio_model_revision": audio["model_revision"],
+                "speaker": audio["speaker"],
+                "language": audio["language"],
+                "audio_text": audio["text"],
+                "audio_path": audio["repo_relative_audio_path"],
+                "audio_sha256": audio["audio_sha256"],
+                "audio_duration": audio["duration_seconds"],
+                "audio_duration_seconds": audio["duration_seconds"],
+                "audio_sample_rate": audio["sample_rate"],
+                "audio_channels": audio["channels"],
+                "audio_sample_width_bytes": audio.get("sample_width_bytes"),
+                "audio_seed": audio.get("seed"),
+                "audio_peak_amplitude": audio.get("peak_amplitude"),
+                "audio_rms": audio.get("rms"),
+                "audio_generation_seconds": audio["generation_seconds"],
+                "audio_real_time_factor": audio["real_time_factor"],
+                "audio_model_sha256": audio["model_sha256"],
+                "audio_trace_path": (
+                    _repo_relative(root, Path(audio_trace_path))
+                    if isinstance(audio_trace_path, str) and audio_trace_path
+                    else None
+                ),
+                "audio_warnings": list(audio["warnings"]),
+                "audio_reused": bool(audio["reused"]),
+            }
+        )
+
+    context = dict(generation_context or {})
+    provider_trace = context.get("providers", {})
+    if not isinstance(provider_trace, dict):
+        provider_trace = {}
+    else:
+        provider_trace = dict(provider_trace)
+    configured_image_provider = provider_trace.get("image_provider")
+    if (
+        configured_image_provider is not None
+        and str(configured_image_provider) != actual_image_provider_id
+    ):
+        raise MediaToolError(
+            "generation_context.providers.image_provider 与复用关键帧 Provider 不一致"
+        )
+    configured_audio_provider = provider_trace.get("audio_provider")
+    if (
+        configured_audio_provider is not None
+        and str(configured_audio_provider) != provider_id
+    ):
+        raise MediaToolError(
+            "generation_context.providers.audio_provider 与真实旁白 Provider 不一致"
+        )
+    provider_trace.update(
+        {
+            "image_provider": actual_image_provider_id,
+            "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+            "audio_provider": provider_id,
+            "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
+            "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+        }
+    )
+    context["providers"] = provider_trace
+    context["timing_plan"] = {
+        "source_planned_duration_seconds": source_total,
+        "rendered_planned_duration_seconds": rendered_total,
+        "max_total_duration_seconds": float(max_total_duration_seconds),
+        "path": (
+            _repo_relative(root, resolved_timing_plan_path)
+            if resolved_timing_plan_path is not None
+            else None
+        ),
+    }
+    script_provider = str(provider_trace.get("script_provider", "reused"))
+    extension_total = round(rendered_total - source_total, 6)
+    manifest = {
+        "manifest_version": "m5.real-audio-export.v1",
+        "project": {"id": project_id, "title": project_title},
+        "generation_context": context,
+        "script_provider": script_provider,
+        "image_provider": actual_image_provider_id,
+        "audio_provider": provider_id,
+        "audio_model_id": next(iter(model_values)),
+        "audio_model_revision": next(iter(revision_values)),
+        "audio_model_sha256": next(iter(model_sha256_values)),
+        "speaker": next(iter(speaker_values)),
+        "language": next(iter(language_values)),
+        "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
+        "media_spec": {
+            "resolution": f"{width}x{height}",
+            "frame_rate": fps,
+            "source_planned_duration_seconds": source_total,
+            "rendered_planned_duration_seconds": rendered_total,
+            "planned_duration_seconds": rendered_total,
+            "encoded_duration_seconds": validation["encoded_duration_seconds"],
+            "actual_duration_seconds": validation["encoded_duration_seconds"],
+            "duration_delta_seconds": validation["duration_delta_seconds"],
+            "duration_tolerance_seconds": validation[
+                "duration_tolerance_seconds"
+            ],
+            "duration_validation": validation["duration_validation"],
+            "extended_by_seconds": extension_total,
+            "max_total_duration_seconds": float(max_total_duration_seconds),
+            "timing_plan_path": (
+                _repo_relative(root, resolved_timing_plan_path)
+                if resolved_timing_plan_path is not None
+                else None
+            ),
+        },
+        "pipeline": {
+            "provider_id": provider_id,
+            "source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            "script_provider": script_provider,
+            "image_provider": actual_image_provider_id,
+            "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+            "audio_provider": provider_id,
+            "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
+            "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            "visual_method": (
+                "reused validated real PNG keyframes -> FFmpeg deterministic "
+                "Ken Burns/fade"
+            ),
+            "audio_method": (
+                "Qwen3-TTS CustomVoice PCM16 WAV -> lead-in/silence padding -> "
+                "FFmpeg 48kHz AAC"
+            ),
+            "audio_speed_changed": False,
+            "audio_truncated": False,
+            "mock_audio_used": False,
+            "subtitle_method": "FFmpeg drawtext + independent UTF-8 LF textfile",
+            "subtitle_rendering": "burned_in",
+            "chinese_font_path": str(font),
+            "network_required": False,
+            "cloud_api_used": False,
+            "api_key_required": False,
+            "model_weights_required": True,
+        },
+        "shot_count": len(shot_manifest),
+        "shots": shot_manifest,
+        "timing_plan": {
+            "source_planned_duration_seconds": source_total,
+            "rendered_planned_duration_seconds": rendered_total,
+            "extended_by_seconds": extension_total,
+            "max_total_duration_seconds": float(max_total_duration_seconds),
+            "shots": normalized_timings,
+        },
+        "output": {
+            "file_path": _repo_relative(root, output_path),
+            "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
+            "file_size_bytes": output_path.stat().st_size,
+            "sha256": digest,
+        },
+        "ffprobe_validation": {
+            **validation,
+            "rendered_planned_duration_seconds": rendered_total,
+        },
+        "safe_command_log": command_log,
+    }
+    manifest_path = output_dir / "manifest.json"
+    _atomic_json(manifest_path, manifest)
+    if progress_callback:
+        progress_callback(97)
+    return {
+        "status": "PASS",
+        "output_path": str(output_path),
+        "manifest_path": str(manifest_path),
+        "subtitle_path": str(subtitle_sidecar),
+        "font_path": str(font),
+        "sha256": digest,
+        "validation": {
+            **validation,
+            "source_planned_duration_seconds": source_total,
+            "rendered_planned_duration_seconds": rendered_total,
+        },
+        "source_planned_duration_seconds": source_total,
+        "rendered_planned_duration_seconds": rendered_total,
+        "extended_by_seconds": extension_total,
+        "shots": shot_outputs,
+        "manifest": manifest,
+    }
 
 
 def resume_mock_project_short(

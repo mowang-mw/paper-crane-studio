@@ -241,26 +241,69 @@ def validate_planned_encoded_duration(
             f"实际 {planned:.6f} 秒"
         )
 
+    trace = validate_expected_encoded_duration(
+        expected_duration_seconds=planned,
+        encoded_duration_seconds=encoded,
+        video_fps=video_fps,
+        audio_sample_rate=audio_sample_rate,
+        audio_frame_samples=audio_frame_samples,
+        small_epsilon_seconds=small_epsilon_seconds,
+    )
+    return {
+        "planned_duration_seconds": trace["expected_duration_seconds"],
+        "encoded_duration_seconds": trace["encoded_duration_seconds"],
+        "duration_delta_seconds": trace["duration_delta_seconds"],
+        "duration_tolerance_seconds": trace["duration_tolerance_seconds"],
+        "duration_validation": trace["duration_validation"],
+        "video_frame_duration_seconds": trace["video_frame_duration_seconds"],
+        "audio_frame_duration_seconds": trace["audio_frame_duration_seconds"],
+    }
+
+
+def validate_expected_encoded_duration(
+    *,
+    expected_duration_seconds: float,
+    encoded_duration_seconds: float,
+    video_fps: float,
+    audio_sample_rate: int,
+    audio_frame_samples: int = AAC_FRAME_SAMPLES,
+    small_epsilon_seconds: float = MEDIA_DURATION_EPSILON_SECONDS,
+) -> dict[str, float | str]:
+    """验证派生媒体时长，不把剧本 20—40 秒边界误用于渲染时轴。
+
+    ``expected_duration_seconds`` 是已经由上层业务规则批准的渲染时长。
+    M5 的真实旁白可能让静态关键帧镜头延长，因此该函数只处理视频帧、
+    AAC 帧和容器舍入造成的物理量化偏差。调用方仍须单独验证源剧本时长
+    以及最终渲染时长上限。
+    """
+
+    expected = float(expected_duration_seconds)
+    encoded = float(encoded_duration_seconds)
+    if not math.isfinite(expected) or not math.isfinite(encoded):
+        raise MediaToolError("期望渲染时长和编码时长必须是有限数值")
+    if expected <= 0:
+        raise MediaToolError("期望渲染时长必须大于 0")
+
     tolerance = media_duration_tolerance_seconds(
         video_fps=video_fps,
         audio_sample_rate=audio_sample_rate,
         audio_frame_samples=audio_frame_samples,
         small_epsilon_seconds=small_epsilon_seconds,
     )
-    delta = encoded - planned
+    delta = encoded - expected
     if abs(delta) > tolerance:
         raise MediaToolError(
             "编码时长超出媒体帧量化容差："
-            f"计划 {planned:.6f} 秒，编码 {encoded:.6f} 秒，"
+            f"期望渲染 {expected:.6f} 秒，编码 {encoded:.6f} 秒，"
             f"差值 {delta:+.6f} 秒，允许 ±{tolerance:.6f} 秒"
         )
     validation = (
         "passed_exactly"
-        if math.isclose(planned, encoded, rel_tol=0.0, abs_tol=1e-6)
+        if math.isclose(expected, encoded, rel_tol=0.0, abs_tol=1e-6)
         else "passed_with_media_tolerance"
     )
     return {
-        "planned_duration_seconds": round(planned, 6),
+        "expected_duration_seconds": round(expected, 6),
         "encoded_duration_seconds": round(encoded, 6),
         "duration_delta_seconds": round(delta, 6),
         "duration_tolerance_seconds": round(tolerance, 6),
@@ -283,6 +326,7 @@ def verify_media(
     min_duration: float | None = None,
     max_duration: float | None = None,
     planned_duration_seconds: float | None = None,
+    expected_duration_seconds: float | None = None,
     expected_video_codec: str = "h264",
     expected_audio_codec: str = "aac",
     command_log: list[str] | None = None,
@@ -333,6 +377,8 @@ def verify_media(
         raise MediaToolError("ffprobe 未返回可解析的音频采样率") from exc
 
     duration_trace: dict[str, float | str] = {}
+    if planned_duration_seconds is not None and expected_duration_seconds is not None:
+        raise MediaToolError("剧本计划时长与期望渲染时长只能提供一个")
     if planned_duration_seconds is not None:
         if min_duration is not None or max_duration is not None:
             raise MediaToolError("计划时长校验不能与 min/max_duration 同时使用")
@@ -342,9 +388,21 @@ def verify_media(
             video_fps=fps,
             audio_sample_rate=audio_sample_rate,
         )
+    elif expected_duration_seconds is not None:
+        if min_duration is not None or max_duration is not None:
+            raise MediaToolError("期望渲染时长校验不能与 min/max_duration 同时使用")
+        duration_trace = validate_expected_encoded_duration(
+            expected_duration_seconds=expected_duration_seconds,
+            encoded_duration_seconds=duration,
+            video_fps=fps,
+            audio_sample_rate=audio_sample_rate,
+        )
     else:
         if min_duration is None or max_duration is None:
-            raise MediaToolError("必须提供 planned_duration_seconds 或完整时长区间")
+            raise MediaToolError(
+                "必须提供 planned_duration_seconds、expected_duration_seconds "
+                "或完整时长区间"
+            )
         if not min_duration <= duration <= max_duration:
             raise MediaToolError(
                 f"时长不符：要求 {min_duration:.3f}—{max_duration:.3f} 秒，"
