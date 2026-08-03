@@ -3,6 +3,8 @@ import type {
   ExportRecord,
   GenerationJob,
   HealthStatus,
+  ImageProviderId,
+  ImageProviderStatus,
   Project,
   ProjectDetail,
   ProvidersStatus,
@@ -107,6 +109,10 @@ function isScriptProviderId(value: unknown): value is ScriptProviderId {
   return value === "mock" || value === "llamacpp";
 }
 
+function isImageProviderId(value: unknown): value is ImageProviderId {
+  return value === "mock" || value === "comfyui-animagine-xl-4";
+}
+
 function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -126,6 +132,22 @@ function normalizeProvider(value: unknown): ScriptProviderStatus | null {
   };
 }
 
+function normalizeImageProvider(value: unknown): ImageProviderStatus | null {
+  if (!isRecord(value) || !isImageProviderId(value.provider_id)) return null;
+  const fallbackName =
+    value.provider_id === "mock" ? "Mock 视觉" : "Animagine XL 4.0（ComfyUI）";
+  return {
+    provider_id: value.provider_id,
+    display_name: optionalText(value.display_name) ?? fallbackName,
+    available: value.available === true,
+    configured: typeof value.configured === "boolean" ? value.configured : null,
+    model_id: optionalText(value.model_id),
+    source_type: optionalText(value.source_type) ?? "UNKNOWN",
+    detail: optionalText(value.detail),
+    requires_gpu_handoff: value.requires_gpu_handoff === true,
+  };
+}
+
 export async function getHealth(): Promise<HealthStatus> {
   return request<HealthStatus>("/health");
 }
@@ -140,12 +162,21 @@ export async function getProviders(): Promise<ProvidersStatus> {
         .map(normalizeProvider)
         .filter((item): item is ScriptProviderStatus => item !== null)
     : [];
+  const imageProviders = Array.isArray(payload.image_providers)
+    ? payload.image_providers
+        .map(normalizeImageProvider)
+        .filter((item): item is ImageProviderStatus => item !== null)
+    : [];
   return {
     default_script_provider: isScriptProviderId(payload.default_script_provider)
       ? payload.default_script_provider
       : null,
+    default_image_provider: isImageProviderId(payload.default_image_provider)
+      ? payload.default_image_provider
+      : null,
     checked_at: optionalText(payload.checked_at),
     providers,
+    image_providers: imageProviders,
   };
 }
 
@@ -204,6 +235,23 @@ export async function generateProject(
   );
 }
 
+export async function renderRealImages(
+  projectId: string,
+  sourceScriptJobId: string,
+  baseSeed?: number,
+): Promise<GenerationJob> {
+  return unwrapJob(
+    await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-images`, {
+      method: "POST",
+      body: JSON.stringify({
+        source_script_job_id: sourceScriptJobId,
+        image_provider: "comfyui-animagine-xl-4",
+        ...(baseSeed === undefined ? {} : { base_seed: baseSeed }),
+      }),
+    }),
+  );
+}
+
 export async function getJob(jobId: string): Promise<GenerationJob> {
   return unwrapJob(await request<unknown>(`/jobs/${encodeURIComponent(jobId)}`));
 }
@@ -222,6 +270,10 @@ function absoluteMediaUrl(value: string | undefined): string | null {
   if (!value.startsWith("/")) return null;
   const apiUrl = new URL(API_BASE, window.location.origin);
   return new URL(value, apiUrl.origin).toString();
+}
+
+export function imageAssetUrl(value: string | undefined): string | null {
+  return absoluteMediaUrl(value);
 }
 
 export function exportUrls(projectId: string, record: ExportRecord): {

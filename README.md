@@ -23,7 +23,11 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 
 ## 当前阶段
 
-**M0、M1、M2 以及 M3 本地真实文本模型纵向链路已经实现。** M3 保留全部 Mock + FFmpeg 离线保底，并接入本地 `Qwen3-4B Q4_K_M`、`llama.cpp` Script Provider、Provider 即时健康检查和前端显式选择。生成任务可选择自动 3—5 镜头或固定 3/4/5 镜头，默认固定 4；故事去除首尾空白后硬限制为 10—3000 字符，界面建议 50—1000 字符。真实模型失败会显示分阶段中文诊断、首次与唯一修复错误及建议，不会静默伪装为 Mock 成功。
+**M0、M1、M2、M3、M4-A 与 M4-B 已完成。** M4-B 已把 `ComfyUI + Animagine XL 4.0 Opt` 集成为正式 `ImageProvider`：从成功 Job 的受控 ScriptV1 快照创建新的真实图像 Job，不调用 Qwen；一个 Job 只启动一次有界 ComfyUI，按镜头顺序生成 3—5 张 PNG，再交给公共 FFmpeg 管线制作带 Mock 音轨和烧录中文字幕的 MP4。
+
+M3 的全部 Mock + FFmpeg 离线保底仍然保留，并接入本地 `Qwen3-4B Q4_K_M`、`llama.cpp` Script Provider、Provider 即时健康检查和前端显式选择。生成任务可选择自动 3—5 镜头或固定 3/4/5 镜头，默认固定 4；故事去除首尾空白后硬限制为 10—3000 字符，界面建议 50—1000 字符。真实文本或真实图像 Provider 失败都不会静默改用 Mock 并伪装成功。
+
+RTX 4060 8GB 模式固定采用分阶段 GPU 工作流：先用 Qwen 生成并保存 ScriptV1，再停止 `llama-server`、释放 8081 和显存，最后启动真实图像 Job。API 入队和 Worker 执行前都会检查冲突；平台只报告 `GPU_HANDOFF_REQUIRED`，不会擅自结束用户进程。三镜头真实 E2E 已复用 `llamacpp` 来源 ScriptV1，ScriptProvider 调用为 0；三张图均为 1024×576、24 步，图像阶段 51.266 秒，无 OOM，最终 20.021333 秒 MP4 完整解码并完成中文字幕抽帧。
 
 媒体业务时长与编码时长现已分开验收：ScriptV1 计划总时长仍严格限制为 20—40 秒；最终 MP4 允许一个视频帧、一个 AAC 采样帧与小量封装舍入共同决定的量化容差。`MEDIA_RENDER` 失败任务手动重试时会优先从来源 Job 的严格 ScriptV1 与已有 MP4 恢复，不调用 ScriptProvider、不改变镜头，并记录 `resumed_from_stage=MEDIA_RENDER`。自动镜头 Prompt 现明确要求覆盖开端、主要发展和结局；这只是提示增强，尚未实现独立语义覆盖评分。
 
@@ -39,9 +43,10 @@ AniFlow Studio 是一个面向本地单用户的、工作流驱动的动漫概�
 | GPU | NVIDIA RTX 4060，8GB 显存 | 单 Worker 串行使用 GPU；不把重型视频模型放入成功关键路径 |
 | 系统内存 | 约 31.6GB | 可做有限 CPU offload，但不能把大量内存交换当作稳定方案 |
 | Python | 3.11.15，Conda 环境 `anime-platform` | FastAPI 0.116.1、SQLAlchemy 2.0.43、Pydantic 2.13.4、Uvicorn 0.35.0 已锁定并实测 |
+| 图像运行环境 | 项目内独立 `.venv-comfyui`：Python 3.13.3、PyTorch 2.11.0+cu128、CUDA runtime 12.8 | 与 `anime-platform` 隔离；不把 PyTorch 或 ComfyUI 依赖装入后端环境 |
 | Node.js / npm | 24.15.0 / 11.12.1 | `package-lock.json` 已锁定 React 19.2.8、Vite 7.3.6、TypeScript 5.9.3，生产构建通过 |
 | FFmpeg | Conda 环境内 8.0 | 本轮只读预检确认 libx264/libopenh264/h264_nvenc、AAC、drawtext、zoompan、concat、xfade；未发现 subtitles/ass（构建未启用 libass）。基础 PATH 不可见，须激活 `anime-platform` 或配置已验证绝对路径 |
-| 可用模型服务 | 项目内本地 `llama.cpp` + `Qwen3-4B Q4_K_M` 文本链路；无图像、视频或语音模型 API | 本地文本服务必须单独启动；全 Mock 离线链路仍是无条件基线 |
+| 可用模型服务 | 项目内本地 `llama.cpp + Qwen3-4B Q4_K_M` 文本链路；按 Job 有界启动的 `ComfyUI + Animagine XL 4.0 Opt` 图像链路；无真实视频或语音模型 API | Qwen 与 ComfyUI 不得同时驻留 8GB GPU；全 Mock 离线链路仍是无条件基线 |
 
 
 ## M1 本地运行
@@ -179,6 +184,51 @@ python scripts\m3_real_llm_test.py --desired-shot-count auto --title "雨夜的�
 
 交互生成结果位于 `data/projects/<project-id>/exports/<job-id>/`。每次真实文本调用的受控追溯目录包含 `first_raw_response.json`、可选的 `repair_raw_response.json`、`validation_report.json`、请求快照和 trace；数据库只保存路径、摘要与结构化诊断，不保存大段原始模型响应。`m3_real_llm_test.py` 的独立证据位于 `data/generated/m3/real-llm-test/<project-id>/`，包括 `script.v1.json`、MP4、manifest、Worker 日志和 `summary.json`。这些目录均属于本地生成数据，不应提交到 Git。
 
+## M4-B 本地真实图像运行
+
+M4-B 不把 ComfyUI 当作常驻平台服务。Worker 为一个真实图像 Job 启动一个受控子进程，使用 `--lowvram`、禁用预览和自定义节点，顺序生成全部镜头，并在成功或失败后回收进程树、确认 8188 释放。默认参数固定为 1024×576、batch size 1、24 steps、CFG 5、`euler_ancestral`、`normal`、denoise 1.0；不会在 OOM 后悄悄降低规格。
+
+运行前先在项目根目录核对既有 M4-A 环境，不需要也不应重新安装：
+
+```powershell
+conda activate anime-platform
+Get-FileHash -Algorithm SHA256 models\image\animagine-xl-4.0-opt.safetensors
+git -C tools\ComfyUI rev-parse HEAD
+.\.venv-comfyui\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+Get-NetTCPConnection -State Listen -LocalPort 8081,8188 -ErrorAction SilentlyContinue
+nvidia-smi
+```
+
+期望模型 SHA256 为 `6327eca98bfb6538dd7a4edce22484a1bbc57a8cff6b11d075d40da1afb847ac`，ComfyUI commit 为 `f06a187f50f896e4a0ba5be1ce1f2d2dcd13b77b`。如不一致应停止，不自动下载、换模或覆盖文件。
+
+实际交互流程：
+
+1. 按 M3 方式用 Qwen 或 Mock 成功生成结构化剧本和原始成片。
+2. 若使用 Qwen，主动停止 `llama-server`，确认 8081 不再监听且推理显存已释放；不要手动启动 ComfyUI。
+3. 保持 API、唯一 Worker 和前端运行，在成功剧本下点击“使用当前剧本生成真实动漫画面”。
+4. 页面显示真实 ImageProvider、base seed、逐张状态和缩略图；成功后播放或下载新的真实关键帧 MP4 与 manifest。
+
+该按钮调用 `POST /api/projects/{project-id}/render-real-images`，请求只引用成功来源 Job。新 Job 保存独立 ScriptV1 快照，并明确记录 `script_provider=reused`、`source_script_job_id`、来源文本 Provider、`script_provider_calls=0`、`image_provider=comfyui-animagine-xl-4` 和 `audio_provider=mock`。Mock 文本来源会按 Mock 记录，不会被包装成 Qwen。
+
+自动检查与真实三镜头 E2E 命令：
+
+```powershell
+python -m compileall backend\app backend\tests scripts
+python -m pytest backend\tests -q
+npm --prefix frontend run build
+python scripts\m4_real_image_e2e.py
+```
+
+最后一条命令是有界真实 GPU 测试：优先选择已有的成功三镜头 ScriptV1，通过 API 入队并在进程内执行一次 Worker，不启动 Qwen。真实 E2E 运行前应停止持续 Worker，以免两个 Worker 同时领取任务。M4-B 结果位置如下：
+
+- 逐镜头 PNG 与追溯：`data/projects/<project-id>/jobs/<job-id>/images/`
+- ComfyUI 日志与 Job 级图像报告：`data/projects/<project-id>/jobs/<job-id>/`
+- MP4、分镜片段、字幕与 manifest：`data/projects/<project-id>/exports/<job-id>/`
+- 本次真实 E2E 汇总：`data/projects/36d4bdd5-0e88-4509-a2f5-eba7727fd38b/exports/11c1b83a-f5b7-4511-b7db-2e1056ef2160/m4b-e2e-summary.json`
+- 本次成片与抽帧：同一目录下的 `short_11c1b83a-f5b7-4511-b7db-2e1056ef2160.mp4` 与 `e2e-frames/`
+
+M4-B 只提供共享角色外观标签的基础提示一致性，不等于严格角色一致性；本阶段没有 IP-Adapter、ControlNet、LoRA、TTS 或视频生成模型。详见 [M4-B ImageProvider 实施记录](docs/m4-image-provider-implementation.md)。
+
 ## 人工可用性测试修复
 
 在不改变 M2/M3 总体架构和视觉体系的前提下，当前交互包括：
@@ -238,6 +288,8 @@ python scripts\m3_real_llm_test.py --desired-shot-count auto --title "雨夜的�
 - [M1 实施记录](docs/m1-implementation-report.md)
 - [M2 实施记录](docs/m2-implementation-report.md)
 - [M3 实施记录](docs/m3-implementation-report.md)
+- [M4-A 图像模型冒烟记录](docs/m4-image-model-spike.md)
+- [M4-B ImageProvider 实施记录](docs/m4-image-provider-implementation.md)
 - [ScriptV1 契约](docs/script-v1-schema.md)
 - [当前环境](ENVIRONMENT.md)
 

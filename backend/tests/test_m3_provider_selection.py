@@ -50,6 +50,20 @@ def test_provider_registry_and_explicit_offline_rejection(
         "backend.app.api.projects.check_llamacpp",
         lambda _settings: dict(offline),
     )
+    image_ready = {
+        "provider_id": "comfyui-animagine-xl-4",
+        "display_name": "真实动漫视觉 · Animagine XL 4.0",
+        "available": True,
+        "configured": True,
+        "model_id": "cagliostrolab/animagine-xl-4.0",
+        "source_type": "LOCAL_MODEL",
+        "detail": "M4-A 环境已就绪；ComfyUI 将按 Job 有界启动。",
+        "requires_gpu_handoff": False,
+    }
+    monkeypatch.setattr(
+        "backend.app.providers.registry.check_comfyui_image",
+        lambda _settings: dict(image_ready),
+    )
     registry = client.get("/api/providers")
     assert registry.status_code == 200, registry.text
     payload = registry.json()
@@ -68,6 +82,12 @@ def test_provider_registry_and_explicit_offline_rejection(
     }
     assert by_id["llamacpp"]["available"] is False
     assert by_id["llamacpp"]["configured"] is False
+    assert payload["default_image_provider"] == "mock"
+    image_by_id = {
+        item["provider_id"]: item for item in payload["image_providers"]
+    }
+    assert image_by_id["mock"]["source_type"] == "MOCK"
+    assert image_by_id["comfyui-animagine-xl-4"] == image_ready
 
     project = _create_project(client)
     unavailable = client.post(

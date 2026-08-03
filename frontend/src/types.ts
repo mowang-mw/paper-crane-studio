@@ -1,5 +1,6 @@
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export type ScriptProviderId = "mock" | "llamacpp";
+export type ImageProviderId = "mock" | "comfyui-animagine-xl-4";
 export type DesiredShotCount = 3 | 4 | 5 | null;
 
 export interface ScriptProviderStatus {
@@ -15,8 +16,21 @@ export interface ScriptProviderStatus {
 
 export interface ProvidersStatus {
   default_script_provider: ScriptProviderId | null;
+  default_image_provider: ImageProviderId | null;
   checked_at: string | null;
   providers: ScriptProviderStatus[];
+  image_providers: ImageProviderStatus[];
+}
+
+export interface ImageProviderStatus {
+  provider_id: ImageProviderId;
+  display_name: string;
+  available: boolean;
+  configured: boolean | null;
+  model_id: string | null;
+  source_type: string;
+  detail?: string | null;
+  requires_gpu_handoff?: boolean;
 }
 
 export interface ScriptCharacter {
@@ -65,6 +79,11 @@ export interface GenerationRequestSnapshot {
   project_id?: string;
   output?: { width?: number; height?: number; fps?: number };
   script_provider?: ScriptProviderId;
+  source_script_job_id?: string;
+  reuse_script_from_job_id?: string;
+  image_provider?: ImageProviderId;
+  base_seed?: number;
+  image_options?: Record<string, unknown>;
   desired_shot_count?: DesiredShotCount;
   story_char_count?: number;
   retry_of_job_id?: string;
@@ -127,10 +146,46 @@ export interface GenerationErrorDetail {
   model_id?: string;
   raw_response_path?: string;
   repair_response_path?: string;
+  validation_report_path?: string;
+  shot_id?: string;
+  failed_shot_id?: string;
+  shot_index?: number;
+  failed_shot_index?: number;
+  completed_images?: number;
+  image_completed_count?: number;
+  completed_image_count?: number;
+  total_images?: number;
+  image_total_count?: number;
+  total_image_count?: number;
+  retryable?: boolean;
+  requires_qwen_shutdown?: boolean;
+  oom?: boolean;
+  log_path?: string;
+  log_paths?: string[] | Record<string, string>;
+  [key: string]: unknown;
+}
+
+export type ImageShotStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | string;
+
+export interface GeneratedImageShot {
+  shot_id: string;
+  shot_index?: number;
+  status?: ImageShotStatus;
+  provider_id?: string;
+  model_id?: string;
+  image_url?: string;
+  image_path?: string;
+  width?: number;
+  height?: number;
+  seed?: number;
+  generation_seconds?: number;
+  image_sha256?: string;
+  warnings?: string[];
   [key: string]: unknown;
 }
 
 export interface GenerationResult {
+  stage?: string;
   script_provider?: string;
   script_source_type?: string;
   script_model_id?: string;
@@ -154,6 +209,22 @@ export interface GenerationResult {
   media_reused?: boolean;
   reencoded?: boolean;
   image_provider?: string;
+  image_model_id?: string;
+  image_shots?: GeneratedImageShot[];
+  completed_images?: number;
+  image_completed_count?: number;
+  completed_image_count?: number;
+  total_images?: number;
+  image_total_count?: number;
+  total_image_count?: number;
+  current_shot_id?: string;
+  current_shot_index?: number;
+  image_generation_seconds?: number;
+  image_generation_total_seconds?: number;
+  generation_seconds_total?: number;
+  base_seed?: number;
+  script_source_job_id?: string;
+  source_script_job_id?: string;
   audio_provider?: string;
   video_source_type?: string;
   source_type?: string;

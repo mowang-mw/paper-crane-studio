@@ -47,8 +47,8 @@ flowchart LR
     FF --> TMP
     EX -.只读已选素材.-> FS
 
-    PR --> MT[Text Providers\nMock / Local / Remote]
-    PR --> MI[Image Providers\nMock / Local / Remote]
+    PR --> MT[Text Providers\nMock / llama.cpp]
+    PR --> MI[Image Providers\nMock / ComfyUI Animagine]
     PR --> MV[Video Providers\nMock / FFmpeg Motion / Future Model]
     PR --> MA[TTS Providers\nMock / Local / Remote]
 
@@ -56,9 +56,13 @@ flowchart LR
     MI --> TMP
     MV --> TMP
     MA --> TMP
+
+    MT --> QW[Qwen3-4B\n8081]
+    MI --> CU[有界 ComfyUI\n8188 / lowvram]
+    QW -.8GB GPU 分阶段互斥.-> CU
 ```
 
-图中的 Provider 只能把输出写入当前 Job 的临时目录，最终归档必须由 Asset Manager 校验后完成。FFmpeg Exporter 是媒体合成服务，不伪装成“大模型”；只有“从关键帧产生镜头片段”的 `FfmpegMotionVideoProvider` 实现 VideoProvider 契约，并明确标记为 `DETERMINISTIC_FALLBACK`。
+图中的 Provider 只能把输出写入系统分配的当前 Job 受控目录；P0 Mock 路径使用临时目录再登记素材，M4-B 真实图像路径使用 `data/projects/<project>/jobs/<job>/images/` 保存逐镜头 PNG 和追溯，均不能写任意用户路径。FFmpeg Exporter 是媒体合成服务，不伪装成“大模型”；“从真实关键帧产生镜头片段”的 M4-B 路径明确记录为 `FFMPEG_KEYFRAME_MOTION`，图像来源仍是 `REAL_LOCAL_MODEL`，Mock 音轨也单独标记。
 
 ## 3. 进程与部署边界
 
@@ -70,6 +74,43 @@ flowchart LR
 | 可选模型服务 | 通过本机回环 HTTP 提供模型推理 | 不访问业务数据库、不决定工作流 |
 
 开发期可以分别启动三个进程。FastAPI 的 `--reload` 不得顺带拉起 Worker，否则 Windows 重载会产生重复 Worker。第一版默认绑定 `127.0.0.1`，不把系统暴露到局域网或公网。
+
+### 3.1 M4-B 的 GPU 分阶段边界
+
+RTX 4060 Laptop 8GB 无法把 M3 Qwen 与 M4 Animagine 同时作为常驻 GPU 服务。M4-B 因而采用两个独立 Job，而不是在一个 Worker 调用中先后热切换两个模型：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI
+    participant DB as SQLite / 受控文件
+    participant W as 单 Worker
+    participant Q as llama.cpp / Qwen
+    participant C as 有界 ComfyUI
+    participant F as FFmpeg / ffprobe
+
+    U->>API: 先创建文本/Mock 成片 Job
+    W->>Q: 可选：生成 ScriptV1
+    W->>DB: 保存成功 Job、最终 ScriptV1 与追溯
+    U-->>Q: 若已启动，主动停止 Qwen
+    U->>API: POST /projects/{id}/render-real-images
+    API->>API: 检查 8081 / llama-server 冲突
+    API->>DB: 校验来源 Job并冻结 ScriptV1 快照
+    API->>DB: 入队 GENERATE_REAL_IMAGE_VIDEO
+    W->>W: 再次检查 GPU 交接；ScriptProvider 调用数=0
+    W->>C: Popen 启动一次，lowvram，单并发
+    loop 按 ScriptV1 顺序生成 3—5 镜头
+        W->>C: 提交一个内置节点工作流
+        C-->>W: PNG + history
+        W->>DB: 校验、SHA-256、登记关键帧与进度
+    end
+    W-->>C: finally 回收进程树并确认 8188 释放
+    W->>F: 真实 PNG 运镜 + Mock 音频 + 中文字幕
+    F-->>W: H.264/AAC MP4、ffprobe 与 manifest
+    W->>DB: Job SUCCEEDED 与 Export/Asset
+```
+
+API 与 Worker 都执行 GPU 交接检查，以覆盖“入队后、执行前又启动 Qwen”的竞争窗口。发现 8081 监听或 `llama-server` 进程时返回 `GPU_HANDOFF_REQUIRED`；平台不杀外部进程、不强行启动 ComfyUI，也不把任务改成 Mock。ComfyUI 只绑定回环地址 8188，由 Worker 的有界上下文负责启动和结束，不需要用户手工常驻。
 
 ## 4. 模块划分
 
@@ -129,6 +170,7 @@ flowchart LR
 | `POST /api/v1/projects` | 新建项目 |
 | `GET/PATCH /api/v1/projects/{id}` | 查看或编辑项目 |
 | `POST /api/v1/projects/{id}/script-jobs` | 创建结构化剧本 Job |
+| `POST /api/projects/{id}/render-real-images` | M4-B：复用成功 Job 的 ScriptV1，创建真实图像成片子 Job；不调用 ScriptProvider |
 | `PUT /api/v1/projects/{id}/script` | 保存审核后的角色、场景和分镜 |
 | `POST /api/v1/shots/{id}/keyframe-jobs` | 生成关键帧候选 |
 | `POST /api/v1/shots/{id}/selected-keyframe` | 选择关键帧 |
@@ -143,6 +185,7 @@ flowchart LR
 | `POST /api/v1/jobs/{id}/cancel` | 稳定后增强：请求取消 |
 | `POST /api/v1/jobs/{id}/retry` | 从终态 Job 创建显式重试 |
 | `GET /api/v1/assets/{id}/content` | 受控读取素材 |
+| `GET /api/projects/{project_id}/assets/{asset_id}/content` | M4-B：按项目归属受控读取真实 PNG 缩略图 |
 | `GET /api/v1/providers` | 查询 Provider 能力和健康状态 |
 | `GET /api/v1/exports/{id}` | 查询、播放或下载导出与 manifest |
 
@@ -216,18 +259,52 @@ sanitized_raw_metadata
 
 Mock 输出必须是后续模块能够真实读取的文件格式，不能只返回假 URL 或空文件。
 
-### 7.5 Provider 选择与降级
+### 7.5 M4-B ImageProvider 实际契约
 
-默认策略由项目或 Job 显式指定，例如：
+M4-B 在通用 `ImageProvider` 上冻结了独立于 ScriptProvider 的强类型 DTO：
 
 ```text
-TEXT: qwen_local -> mock_text
-IMAGE: animagine_local -> mock_image
-VIDEO: configured_video_model -> ffmpeg_motion
-TTS: configured_tts -> mock_tts
+ImageGenerationRequest
+  project_id, job_id, ScriptV1, shot, characters, scene,
+  output_dir, ImageGenerationOptions
+
+ImageGenerationOptions
+  width, height, steps, cfg, sampler, scheduler, denoise,
+  batch_size, base_seed, lowvram,
+  startup_timeout_seconds, generation_timeout_seconds,
+  job_timeout_seconds, http_timeout_seconds
+
+GeneratedImageAsset
+  provider_id, model_id, shot_id, image_path, width, height,
+  seed, positive_prompt, negative_prompt, generation_seconds,
+  image_sha256, model_sha256, workflow_path, trace_path,
+  warnings, reused
 ```
 
-工程保底默认直接选择 Mock / FFmpeg；真实模型接入后允许用户显式切换。自动链式 fallback 与完整多次调用历史是增强项；无论自动还是手动，`INVALID_REQUEST`、许可证未确认或内容策略拒绝都不能通过换 Provider 规避限制，最终来源必须可见。
+正式实现包括：
+
+- `MockImageProvider` 继续服务于 M0—M3 的确定性离线保底，其输出不能被真实图像入口冒充或混用。
+- `ComfyUIImageProvider` 的 ID 固定为 `comfyui-animagine-xl-4`，模型 ID 与 SHA256 来自配置快照；运行前重新计算权重 SHA256，不匹配则拒绝加载。
+- `generate_batch()` 只接受同一 Project、同一 Job、相同参数、按 index 连续排序的 3—5 个镜头；进程内锁和单 Worker共同把并发固定为 1。
+- 一个 Job 只创建一个 `ComfyUIJobSession`，在同一进程中按顺序提交镜头工作流，避免每张图重复启动和加载模型；如重试时所有镜头均已验证可复用，则无需再次启动 ComfyUI。
+- 每张图的 seed 为 `base_seed + shot.index`，不使用 Python 运行时 `hash()`；手动重试复制原请求快照并验证旧图，因此 seed 不变。
+- 正向提示按“质量标签、项目风格、共享角色外观锚点、场景、镜头视觉描述、`image_prompt`、构图、横向动漫关键帧”分层构造。相同 Character 的核心外观锚点逐字复用，但这只是基础提示一致性，不是严格角色一致性。
+- 负向提示、原始中文字段、最终英文标签、工作流、参数、seed、模型/图片哈希和警告全部落盘。当前中文转英文是可审计的确定性标签映射，不是额外 LLM 翻译，也不新增模型调用。
+
+`ComfyUIJobSession` 使用参数列表和 `subprocess.Popen(shell=False)` 启动，固定 `--lowvram`、`--preview-method none`、禁用自定义节点和内存数据库。启动、HTTP、单图与 Job 分别设超时；上下文 `finally` 先发送受控终止信号，失败后才升级为进程树终止，并检查 8188 是否释放。模型 OOM 直接形成 `GPU_OOM`，不会自动降低分辨率/步数，也不会回退 Mock。
+
+### 7.6 Provider 选择与降级
+
+Provider 由项目或 Job 显式指定，例如：
+
+```text
+TEXT: llamacpp 或 mock（用户明确选择）
+IMAGE: comfyui-animagine-xl-4 或 mock（分别创建、明确标识）
+VIDEO: 真实 PNG -> ffmpeg_motion；Mock PNG/几何画面 -> Mock FFmpeg 链路
+TTS: mock_tts（M4-B 不接入真实 TTS）
+```
+
+工程保底默认直接选择 Mock / FFmpeg；真实模型路径由用户显式触发。M4-B 不实现自动链式 fallback：真实 Provider 失败必须保持 FAILED，不能生成 Mock 图再标记成功。完整多次调用历史仍是增强项；无论自动还是手动，`INVALID_REQUEST`、许可证未确认或内容策略拒绝都不能通过换 Provider 规避限制，最终来源必须可见。
 
 ## 8. 后台任务机制
 
@@ -251,11 +328,19 @@ P0 不自动复活终态 Job。手动重试从 FAILED 创建一个新的 QUEUED 
 
 若开发时 Worker 被强制终止，P0 允许管理员在确认外部调用已停止后把遗留 RUNNING 标为 FAILED，再显式手动重试；不宣称自动崩溃恢复或 exactly-once。
 
-### 8.3 稳定后目标状态机与机制
+### 8.3 M4-B 子 Job、失败与手动恢复
+
+M4-B 使用 `GENERATE_REAL_IMAGE_VIDEO` Job。入队请求保存来源成功 Job ID、受控 ScriptV1 快照路径及 SHA256、来源文本 Provider/来源类型、`script_provider_calls_expected=0`、真实 ImageProvider、base seed、完整图像参数和输出规格。Worker 从该快照恢复严格 `ScriptV1`，并与当前 Project 剧本、数据库镜头及请求镜头数逐项核对；它只调用 `prepare_validated_script()` 做媒体规划，不调用 `ScriptProvider.generate()`。
+
+图片阶段每成功一张就用短事务更新 `image_completed_count`、当前镜头、图片 SHA256/seed/耗时和缩略图 Asset。主要错误边界包括 `GPU_HANDOFF_REQUIRED`、`COMFYUI_START_FAILED`、`COMFYUI_TIMEOUT`、`MODEL_NOT_FOUND`、`MODEL_HASH_MISMATCH`、`IMAGE_GENERATION_FAILED`、`IMAGE_OUTPUT_MISSING`、`IMAGE_DECODE_FAILED`、`GPU_OOM` 和 `MEDIA_RENDER`；错误结构记录失败镜头、已完成张数、是否可重试、是否需关闭 Qwen、OOM 标记和日志路径。
+
+对 FAILED Job 的显式手动重试仍创建新的 QUEUED Job，并记录 `retry_of_job_id` 与 `resume_image_from_job_id`。Provider 只复用同时满足 Provider/model、镜头 ID、参数、seed、正负提示、模型/图片哈希、PNG 完整解码/尺寸以及工作流/trace 存在性的图片；损坏或不一致的镜头从第一个缺口继续生成。重试不调用 Qwen、不修改 ScriptV1、不静默换成 Mock。原失败 Job 保持不变，M4-B 仍不宣称通用 Worker 崩溃自动恢复。
+
+### 8.4 稳定后目标状态机与机制
 
 目标状态机可扩展 `RETRY_WAIT`、`CANCEL_REQUESTED`、`CANCELLED`，并加入多领取者 CAS、租约、心跳、启动恢复、协作取消和自动退避。这些机制连同取消/成功竞争线性化语义保留为目标设计，但不属于 P0。
 
-### 8.4 目标设计：自动重试与取消
+### 8.5 目标设计：自动重试与取消
 
 | 场景 | 自动重试 | 处理 |
 |---|---|---|
@@ -270,7 +355,7 @@ P0 不自动复活终态 Job。手动重试从 FAILED 创建一个新的 QUEUED 
 
 取消采用协作语义：轮询式任务在阶段边界检查；本地模型优先在独立子进程或本地服务中运行。Windows 上可靠终止进程树需使用 Job Object 或明确管理全部子进程，执行 `terminate -> 短超时 -> kill`；普通进程句柄只保证直接进程。FFmpeg 用受控进程句柄终止。远程 HTTP 取消不保证撤销服务端计算或费用。取消前的临时文件不成为 READY Asset。
 
-### 8.5 目标设计：幂等与进度
+### 8.6 目标设计：幂等与进度
 
 - `client_idempotency_key` 只表示一次用户操作：数据库对 `(project_id, client_idempotency_key)` 建唯一约束；相同键且请求指纹相同则返回已有 Job，相同键但请求不同则返回冲突。
 - `request_fingerprint` 是规范化输入、业务 revision、所选输入 Asset 哈希、提示词版本、请求的 Provider 策略和非敏感参数的 SHA-256，只用于审计、比较和可选缓存提示，不设唯一约束。相同输入的主动重新生成用新客户端键，因此会保留独立 Job、候选和历史。
@@ -289,6 +374,19 @@ data/
     app.sqlite3
   projects/
     <project_uuid>/
+      jobs/
+        <generation_job_uuid>/
+          script-source.json
+          images/
+            shot-01.png
+            shot-01.workflow.json
+            shot-01.request.json
+            shot-01.result.json
+            shot-01.positive.txt
+            shot-01.negative.txt
+          comfyui.stdout.log
+          comfyui.stderr.log
+          image_generation_report.json
       assets/
         image/<asset_uuid>.png
         audio/<asset_uuid>.wav
@@ -305,6 +403,8 @@ data/
 ```
 
 版本化提示词模板属于源代码，例如未来的 `backend/app/prompts/script/v1.*`，不放进可变 `data/`。合法演示 fixture 放在独立 `demo/fixtures/`，只提交自制或已明确许可的小文件。
+
+上图 `jobs/` 是 M4-B 已实现的受控图像追溯目录；数据库仍保存相对于 `data/` 的路径，前端通过项目归属校验后的 Asset URL 读取 PNG。ComfyUI 自身的 output/temp/user 子目录也限制在当前 Job 下，并在 `.gitignore` 覆盖的数据根目录内。模型权重、`.venv-comfyui`、`tools/ComfyUI` 和所有生成图片均不得进入 Git 追踪。
 
 ### 9.2 P0 归档规则
 
@@ -326,6 +426,10 @@ data/
 5. Export Job 根据已审核 Shot 字幕文本和镜头区间生成 SRT/ASS、归档 `SYSTEM_DERIVED` SUBTITLE Asset。当前 FFmpeg 构建没有 `subtitles/ass`，P0 使用每条 cue 一个 `drawtext` filter：文本写 UTF-8 `textfile`，固定引用本机 `fontfile=C:\Windows\Fonts\msyh.ttc`，用 `enable` 时间表达式控制区间；参数构建器负责滤镜转义。字体文件不复制进仓库或分发。M0 先用一次性 fixture 验证中文、换行和 Windows 路径。
 6. 输出 MP4 后用 ffprobe JSON 检查容器、时长、流、`codec_name`/profile、分辨率、帧率和像素格式；实际使用的 `libx264`、`h264_nvenc` 等 encoder 由能力预检、命令参数和 manifest 记录确认，不能从输出标签反推。
 7. P0 的 Export 与 EXPORT_VIDEO Job 使用相同四态；全部媒体检查和简化归档通过后置 SUCCEEDED，任一步失败则置 FAILED 且不得留下可被当作成功成片的 READY 输出。完整重试/取消映射与失效竞争语义在增强阶段实现。
+
+M4-B 复用上述公共层的 `render_image_project_short()` 入口，并在进入 FFmpeg 前额外强校验：关键帧数量与 shot 一一对应、Provider/model 全部一致且非 Mock、每张图是单视频流 PNG、完整解码成功、尺寸与记录一致、SHA256 与追溯一致。每张 1024×576 PNG 先按比例放大和裁切，再应用轻微、确定性的 `zoompan` Ken Burns 运镜；左上角镜头信息降低遮罩不透明度，旁白仍通过独立 UTF-8 LF `textfile` 烧录。音频继续使用确定性 Mock WAV 并编码为 AAC，最终规格保持 1280×720、24 fps、H.264、AAC、`yuv420p`。
+
+真实图像 manifest 使用 `m4.real-image-export.v1`，记录 `script_provider`、`source_script_job_id`、`image_provider`、`audio_provider`、每镜头真实 PNG 路径/SHA256/seed/提示词追溯、`subtitle_rendering=burned_in`、计划与编码时长及媒体量化容差。`image_provider` 只能来自被验证的真实关键帧，不得因为媒体渲染仍用了 FFmpeg 或 Mock 音轨就被覆盖为 Mock。
 
 FFmpeg 官方文档分别描述了 [`zoompan`、`xfade`、`drawtext` 与 `subtitles` 滤镜](https://ffmpeg.org/ffmpeg-filters.html)、[concat demuxer](https://ffmpeg.org/ffmpeg-formats.html#concat-1) 和 [ffprobe JSON 输出](https://ffmpeg.org/ffprobe.html)。本轮通过 `conda run -n anime-platform` 只读枚举：8.0 构建有 drawtext/libfreetype/libharfbuzz/fontconfig 和所需运镜/编码能力，但没有 libass，也未列 `subtitles/ass`；因此 P0 已固定为 drawtext 路线，实际文字烧录 smoke test 仍是编码入口验收。
 
@@ -350,6 +454,17 @@ FFmpeg 官方文档分别描述了 [`zoompan`、`xfade`、`drawtext` 与 `subtit
 
 API 错误响应包含稳定 error code、message、job_id/trace_id 和可选 recovery action，不把堆栈、密钥、绝对路径或完整远程响应发给前端。
 
+M4-B 在通用错误类别之上保留更可操作的图像阶段码：
+
+| 错误码 | 含义与处理 |
+|---|---|
+| `GPU_HANDOFF_REQUIRED` | 8081 或 llama-server 仍占用 GPU；停止 Qwen 后手动重试，平台不杀进程 |
+| `COMFYUI_START_FAILED` / `COMFYUI_TIMEOUT` | 独立环境、8188、启动或单图/Job 超时；查看 Job 级 stdout/stderr |
+| `MODEL_NOT_FOUND` / `MODEL_HASH_MISMATCH` | 官方模型缺失或 SHA256 不符；立即停止，不下载或换模 |
+| `IMAGE_GENERATION_FAILED` / `IMAGE_OUTPUT_MISSING` / `IMAGE_DECODE_FAILED` | 记录失败 shot 和已完成张数；合法旧图可在手动重试时复用 |
+| `GPU_OOM` | 明确报告 OOM；M4-B 不自动降低分辨率/步数、不切 Mock |
+| `MEDIA_RENDER` | 图片已经完成但 FFmpeg/ffprobe 失败；保留图片追溯，手动重试不调用 Qwen |
+
 ## 12. 可追溯机制
 
 每个 Job attempt 保存不可变快照。Job 另存 `executor_kind` 与 `executor_id_snapshot`：生成任务为 `PROVIDER`，EXPORT_VIDEO 为 `MEDIA_SERVICE/ffmpeg_exporter`，后者的 Provider/model 字段为 null/N/A，绝不伪装为模型调用：
@@ -364,6 +479,8 @@ API 错误响应包含稳定 error code、message、job_id/trace_id 和可选 re
 - 应用代码版本；工作树未提交时写 `working-tree/unknown`，不得伪造 commit。
 
 Export manifest 进一步快照镜头顺序、字幕区间、依赖规则版本/指纹、相关 revision 与 Asset 哈希、FFmpeg/ffprobe 版本、脱敏参数和验证结果。上游后来修改时，历史 Export 保持其执行终态，同时写入失效时间和原因，其输出 Asset 转为 STALE；这样即使未来模板或模型配置改变，仍能解释旧成片是如何产生的。记录 seed 只表示“发出并保存该值”，除非 Provider 明确支持，否则不承诺字节级复现。
+
+M4-B 还把来源 ScriptV1 独立冻结到新 Job 的 `script-source.json` 并记录文件 SHA256，因此即使来源 Job 后来不再处于页面焦点，也能证明真实图片使用了哪份剧本。Job request/result、逐图 result、Job 级图像报告和 Export manifest 均保存 `source_script_job_id`、来源文本 Provider、`script_provider_calls=0`、ImageProvider/model SHA、base/shot seed、正负提示、每张耗时与图片 SHA；Mock Script → ComfyUI 也必须如实显示 `source_script_provider=mock`。严格角色一致性尚未实现的警告作为追溯事实保留，不能用固定 seed 或重复标签冒充已解决。
 
 ## 13. 配置与密钥安全
 
@@ -389,14 +506,17 @@ Export manifest 进一步快照镜头顺序、字幕区间、依赖规则版本/
 | 本地 `data/` | 与演示环境匹配，易于备份和检查 | 配额、路径安全、原子归档 |
 | FFmpeg + ffprobe | 确定性视频兜底和成熟媒体工具链 | 已枚举 H.264/AAC/drawtext 等能力并排除 libass；须在 Conda 环境完成实际编码 fixture |
 | Provider / Adapter | 隔离模型差异，支持 Mock、本地和远程 | 强类型接口、契约测试、显式 fallback |
+| ComfyUI 本地 API + Animagine XL 4.0 Opt | M4-A 已在 8GB GPU 验证内置节点工作流，M4-B 可在不导入 PyTorch 到后端环境的前提下正式服务化 | 独立 `.venv-comfyui`、`--lowvram`、单 Job 有界启动、与 Qwen GPU 互斥、禁止自定义节点 |
 
-不选择 Redis/Celery 是因为单用户、单 Worker 的负载不需要额外运维；不选择微服务或 Kubernetes 是因为它们不改善当前范围演示成功率；不选择 ComfyUI/Ollama 作为当前阶段依赖，是因为本阶段禁止安装，且直接的 Provider/HTTP 契约更容易控制和追溯。未来若采用这些工具，也只能作为 Provider 后端，而不能改变核心业务模型。
+不选择 Redis/Celery 是因为单用户、单 Worker 的负载不需要额外运维；不选择微服务或 Kubernetes 是因为它们不改善当前范围演示成功率。ComfyUI 已在 M4-A 以独立环境验证，并在 M4-B 仅作为 `ComfyUIImageProvider` 后端接入；它不拥有业务数据库、不改变 ScriptV1/Asset/Job 契约，也不作为需要人工常驻的第四个平台进程。Ollama 仍未引入。
 
-## 15. 下一阶段架构验证顺序
+## 15. 实施与后续验证顺序
 
 1. 在 `anime-platform` 环境运行固定 drawtext/微软雅黑 fixture，验证中文、换行、路径转义和浏览器播放；只读能力枚举已完成，libass 路线已排除。
 2. 验证 Node 24 + 选定 Vite 版本、Python 3.11 + 选定依赖的兼容性。
 3. 冻结 JSON Schema、状态枚举、OpenAPI 和目录规则。
 4. 先用纯 Mock 建立契约测试，再实现 Job 和垂直链路。
 5. 工程保底通过后立即按既有候选接入一个真实文本模型，不等待某个固定日期。
-6. 随后对一个真实图像模型做显存、连续生成、耗时和许可证验收；失败必须保存目标机证据与替代演示。真实视频不进入关键路径。
+6. M4-A 已完成单张 Animagine 冒烟；M4-B 实现 ScriptV1 快照复用、3—5 张顺序生成、真实 PNG 媒体管线和平台交互。
+7. `scripts/m4_real_image_e2e.py` 已完成一次真实三镜头 E2E：复用 `llamacpp` 来源 ScriptV1且文本调用为 0，ComfyUI 单次启动、顺序生成三张 1024×576/24-step PNG，无 OOM/降级/Mock 图；全卡采样峰值 7332 MiB，最终 20.021333 秒 MP4 完整解码和中文字幕抽帧通过，进程退出、8188 释放、显存回落约 383 MiB。逐图证据见 M4-B 实施记录。
+8. 本轮停止在 M4-B。角色一致性高级方案、IP-Adapter、ControlNet、LoRA、真实 TTS 和视频生成不在本阶段；真实视频仍不进入成功关键路径。

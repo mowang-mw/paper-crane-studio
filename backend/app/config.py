@@ -24,7 +24,7 @@ class Settings:
     data_dir: Path | None = None
     database_url: str | None = None
     api_prefix: str = "/api"
-    stage: str = "M3"
+    stage: str = "M4-B"
     worker_poll_seconds: float = 1.0
     script_provider: str = "mock"
     llama_server_base_url: str = "http://127.0.0.1:8081"
@@ -39,6 +39,29 @@ class Settings:
     llama_context_size: int = 8192
     llama_model_sha256: str | None = None
     llama_server_version: str = "unknown"
+    image_provider: str = "mock"
+    comfyui_python: Path | None = None
+    comfyui_root: Path | None = None
+    comfyui_host: str = "127.0.0.1"
+    comfyui_port: int = 8188
+    comfyui_model_path: Path | None = None
+    comfyui_model_id: str = "cagliostrolab/animagine-xl-4.0"
+    comfyui_model_sha256: str = (
+        "6327eca98bfb6538dd7a4edce22484a1bbc57a8cff6b11d075d40da1afb847ac"
+    )
+    comfyui_model_license: str = "CreativeML Open RAIL++-M"
+    comfyui_expected_commit: str = "f06a187f50f896e4a0ba5be1ce1f2d2dcd13b77b"
+    comfyui_startup_timeout_seconds: float = 240.0
+    comfyui_image_timeout_seconds: float = 600.0
+    comfyui_job_timeout_seconds: float = 3600.0
+    comfyui_http_timeout_seconds: float = 30.0
+    image_width: int = 1024
+    image_height: int = 576
+    image_steps: int = 24
+    image_cfg: float = 5.0
+    image_sampler: str = "euler_ancestral"
+    image_scheduler: str = "normal"
+    image_base_seed: int = 20_260_802
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -50,6 +73,15 @@ class Settings:
         database_url = self.database_url or _sqlite_url(data_dir / "app.db")
         model_path = Path(
             self.llama_model_path or root_dir / "models" / "text" / "Qwen3-4B-Q4_K_M.gguf"
+        ).resolve()
+        comfyui_root = Path(self.comfyui_root or root_dir / "tools" / "ComfyUI").resolve()
+        comfyui_python = Path(
+            self.comfyui_python
+            or root_dir / ".venv-comfyui" / "Scripts" / "python.exe"
+        ).resolve()
+        comfyui_model_path = Path(
+            self.comfyui_model_path
+            or root_dir / "models" / "image" / "animagine-xl-4.0-opt.safetensors"
         ).resolve()
         provider = self.script_provider.strip().lower()
         if provider not in {"mock", "llamacpp"}:
@@ -75,12 +107,43 @@ class Settings:
             raise ValueError("LLAMA_MAX_TOKENS 至少为 256")
         if self.llama_context_size < 512:
             raise ValueError("LLAMA_CONTEXT_SIZE 至少为 512")
+        image_provider = self.image_provider.strip().lower()
+        if image_provider not in {"mock", "comfyui-animagine-xl-4"}:
+            raise ValueError(
+                "IMAGE_PROVIDER 只允许 mock 或 comfyui-animagine-xl-4"
+            )
+        if self.comfyui_host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("COMFYUI_HOST 必须是本机回环地址")
+        if not 1 <= self.comfyui_port <= 65535:
+            raise ValueError("COMFYUI_PORT 必须在 1—65535 之间")
+        if any(
+            value <= 0
+            for value in (
+                self.comfyui_startup_timeout_seconds,
+                self.comfyui_image_timeout_seconds,
+                self.comfyui_job_timeout_seconds,
+                self.comfyui_http_timeout_seconds,
+            )
+        ):
+            raise ValueError("ComfyUI 所有超时必须大于 0")
+        if self.comfyui_job_timeout_seconds < self.comfyui_image_timeout_seconds:
+            raise ValueError("ComfyUI Job 总超时不得小于单图超时")
+        if self.image_width <= 0 or self.image_height <= 0 or self.image_steps <= 0:
+            raise ValueError("真实图像宽、高和 steps 必须大于 0")
+        if self.image_cfg <= 0:
+            raise ValueError("真实图像 CFG 必须大于 0")
+        if self.image_base_seed < 0:
+            raise ValueError("IMAGE_BASE_SEED 不得为负数")
         object.__setattr__(self, "root_dir", root_dir)
         object.__setattr__(self, "data_dir", data_dir)
         object.__setattr__(self, "database_url", database_url)
         object.__setattr__(self, "script_provider", provider)
         object.__setattr__(self, "llama_server_base_url", base_url)
         object.__setattr__(self, "llama_model_path", model_path)
+        object.__setattr__(self, "image_provider", image_provider)
+        object.__setattr__(self, "comfyui_root", comfyui_root)
+        object.__setattr__(self, "comfyui_python", comfyui_python)
+        object.__setattr__(self, "comfyui_model_path", comfyui_model_path)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -130,6 +193,57 @@ class Settings:
             llama_context_size=int(os.environ.get("LLAMA_CONTEXT_SIZE", "8192")),
             llama_model_sha256=os.environ.get("LLAMA_MODEL_SHA256") or None,
             llama_server_version=os.environ.get("LLAMA_SERVER_VERSION", "unknown"),
+            image_provider=os.environ.get("IMAGE_PROVIDER", "mock"),
+            comfyui_python=Path(
+                os.environ.get(
+                    "COMFYUI_PYTHON",
+                    root / ".venv-comfyui" / "Scripts" / "python.exe",
+                )
+            ),
+            comfyui_root=Path(
+                os.environ.get("COMFYUI_ROOT", root / "tools" / "ComfyUI")
+            ),
+            comfyui_host=os.environ.get("COMFYUI_HOST", "127.0.0.1"),
+            comfyui_port=int(os.environ.get("COMFYUI_PORT", "8188")),
+            comfyui_model_path=Path(
+                os.environ.get(
+                    "COMFYUI_MODEL_PATH",
+                    root / "models" / "image" / "animagine-xl-4.0-opt.safetensors",
+                )
+            ),
+            comfyui_model_id=os.environ.get(
+                "COMFYUI_MODEL_ID", "cagliostrolab/animagine-xl-4.0"
+            ),
+            comfyui_model_sha256=os.environ.get(
+                "COMFYUI_MODEL_SHA256",
+                "6327eca98bfb6538dd7a4edce22484a1bbc57a8cff6b11d075d40da1afb847ac",
+            ),
+            comfyui_model_license=os.environ.get(
+                "COMFYUI_MODEL_LICENSE", "CreativeML Open RAIL++-M"
+            ),
+            comfyui_expected_commit=os.environ.get(
+                "COMFYUI_EXPECTED_COMMIT",
+                "f06a187f50f896e4a0ba5be1ce1f2d2dcd13b77b",
+            ),
+            comfyui_startup_timeout_seconds=float(
+                os.environ.get("COMFYUI_STARTUP_TIMEOUT_SECONDS", "240")
+            ),
+            comfyui_image_timeout_seconds=float(
+                os.environ.get("COMFYUI_IMAGE_TIMEOUT_SECONDS", "600")
+            ),
+            comfyui_job_timeout_seconds=float(
+                os.environ.get("COMFYUI_JOB_TIMEOUT_SECONDS", "3600")
+            ),
+            comfyui_http_timeout_seconds=float(
+                os.environ.get("COMFYUI_HTTP_TIMEOUT_SECONDS", "30")
+            ),
+            image_width=int(os.environ.get("IMAGE_WIDTH", "1024")),
+            image_height=int(os.environ.get("IMAGE_HEIGHT", "576")),
+            image_steps=int(os.environ.get("IMAGE_STEPS", "24")),
+            image_cfg=float(os.environ.get("IMAGE_CFG", "5")),
+            image_sampler=os.environ.get("IMAGE_SAMPLER", "euler_ancestral"),
+            image_scheduler=os.environ.get("IMAGE_SCHEDULER", "normal"),
+            image_base_seed=int(os.environ.get("IMAGE_BASE_SEED", "20260802")),
             cors_origins=origins,
         )
 

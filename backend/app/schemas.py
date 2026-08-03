@@ -112,6 +112,14 @@ class GenerationRequest(BaseModel):
     desired_shot_count: Literal[3, 4, 5] | None = 4
 
 
+class RealImageRenderRequest(BaseModel):
+    source_script_job_id: str = Field(min_length=1, max_length=36)
+    image_provider: Literal["comfyui-animagine-xl-4"] = (
+        "comfyui-animagine-xl-4"
+    )
+    base_seed: int | None = Field(default=None, ge=0, le=2**63 - 6)
+
+
 class ProviderStatusRead(BaseModel):
     provider_id: Literal["mock", "llamacpp"]
     display_name: str
@@ -123,10 +131,23 @@ class ProviderStatusRead(BaseModel):
     detail: str | None = None
 
 
+class ImageProviderStatusRead(BaseModel):
+    provider_id: Literal["mock", "comfyui-animagine-xl-4"]
+    display_name: str
+    available: bool
+    configured: bool
+    model_id: str
+    source_type: Literal["MOCK", "LOCAL_MODEL"]
+    detail: str | None = None
+    requires_gpu_handoff: bool = False
+
+
 class ProvidersRead(BaseModel):
     default_script_provider: Literal["mock", "llamacpp"]
     checked_at: datetime
     providers: list[ProviderStatusRead]
+    default_image_provider: Literal["mock", "comfyui-animagine-xl-4"]
+    image_providers: list[ImageProviderStatusRead]
 
 
 class HealthRead(BaseModel):

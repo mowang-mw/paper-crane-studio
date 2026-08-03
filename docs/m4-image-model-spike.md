@@ -133,7 +133,7 @@ Get-FileHash -Algorithm SHA256 models\image\animagine-xl-4.0-opt.safetensors
 
 此外还保留了本轮使用的 `extra_model_paths.yaml` 以及隔离的 ComfyUI output/temp/user 子目录。模型、环境、源码、缓存和所有生成结果均由 `.gitignore` 排除。
 
-## 10. 已知限制与 M4-B 建议
+## 10. 已知限制与 M4-B 承接
 
 - 只生成了一张最终关键帧，没有测试并发、连续五镜头或长时间服务稳定性。
 - `--lowvram` 是当前 8GB 显存设备的必要保守配置；峰值已接近显存上限。
@@ -142,4 +142,16 @@ Get-FileHash -Algorithm SHA256 models\image\animagine-xl-4.0-opt.safetensors
 - 没有测试角色一致性、ControlNet、IP-Adapter、LoRA、TTS 或视频生成。
 - 许可证允许范围不等于项目可忽略合规义务；分发模型或派生服务前仍需保留许可证与通知并复核具体使用场景。
 
-建议进入 M4-B，但应是“受控单并发 ImageProvider 集成”：复用本轮工作流和有界生命周期，默认 `lowvram`，与 Qwen GPU 互斥，保留 Mock 回退，并记录真实提示、seed、参数、模型 SHA 和显存/耗时。该建议不包含角色一致性或多模型扩展。
+M4-A 的结论支持进入 M4-B，但边界仍是“受控单并发 ImageProvider 集成”：复用本轮内置节点工作流和有界生命周期，默认 `lowvram`，与 Qwen GPU 互斥，并记录真实提示、seed、参数、模型 SHA 和显存/耗时。这里的“保留 Mock”只指平台继续拥有独立的工程保底路径；真实 Provider 失败不得在同一 Job 内静默回退 Mock。
+
+M4-B 当前工作区已据此形成以下正式设计：
+
+- `ComfyUIImageProvider` 的 ID 固定为 `comfyui-animagine-xl-4`，与 `MockImageProvider` 显式区分。
+- 从成功 Job 的受控 ScriptV1 创建新的 `GENERATE_REAL_IMAGE_VIDEO` Job，冻结来源 Job、ScriptV1 文件 SHA256、文本 Provider、base seed 和图像参数；该 Job 的 ScriptProvider 调用数固定为 0。
+- API 入队和 Worker 执行前都检查 8081/`llama-server`，只提示用户释放 Qwen，不结束用户进程。
+- 一个 Job 只创建一次有界 ComfyUI 会话，按 index 顺序生成 3—5 张图，并发为 1；正常或异常都回收进程树并验证 8188 释放。
+- 默认继续使用 M4-A 实测成功的 1024×576、24 steps、CFG 5、`euler_ancestral`、`normal`、denoise 1.0 和 `lowvram=true`，不做静默自动降级。
+- 公共 FFmpeg 管线先校验真实 PNG 的完整解码、尺寸、SHA256、Provider/model 与镜头对应关系，再做确定性 Ken Burns 运镜、Mock 音轨、中文字幕烧录和 H.264/AAC MP4 导出。
+- 共享角色外观锚点只提供基础提示一致性，不等于严格角色一致性；M4-B 仍不包含 IP-Adapter、ControlNet、LoRA、TTS 或视频生成。
+
+单元测试和伪 ComfyUI 测试不启动 GPU。真实三镜头 E2E 已由 `python scripts\m4_real_image_e2e.py` 有界执行：复用 `llamacpp` 来源 ScriptV1、文本调用 0 次，三图均为 1024×576/24 steps，ComfyUI 启动 1 次，图像阶段 51.266 秒，无 OOM、无降级、无 Mock 图片；全卡采样峰值 7332 MiB。最终 20.021333 秒 H.264/AAC MP4 完整解码通过，8188 已释放，结束显存约 383 MiB。逐图 seed、耗时、SHA256 和路径见 [M4-B ImageProvider 实施记录](m4-image-provider-implementation.md)。

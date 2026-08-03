@@ -81,10 +81,11 @@ def create_job(
     project: Project,
     request_json: dict[str, Any] | None = None,
     provider_id: str = "mock",
+    job_type: str = "GENERATE_SHORT_VIDEO",
 ) -> GenerationJob:
     job = GenerationJob(
         project_id=project.id,
-        job_type="GENERATE_SHORT_VIDEO",
+        job_type=job_type,
         status=JobStatus.QUEUED,
         progress=0,
         provider_id=provider_id,
@@ -195,17 +196,25 @@ def retry_failed_job(session: Session, failed_job: GenerationJob) -> GenerationJ
         else None
     )
     if (
+        failed_job.job_type == "GENERATE_SHORT_VIDEO"
+        and
         isinstance(generation_error, dict)
         and generation_error.get("stage") == "MEDIA_RENDER"
     ):
         # Worker 必须从来源 Job 的严格 ScriptV1 与已有媒体继续；
         # 追溯缺失时明确失败，绝不退回 ScriptProvider。
         request_json["resumed_from_stage"] = "MEDIA_RENDER"
+    elif failed_job.job_type == "GENERATE_REAL_IMAGE_VIDEO":
+        # 真实图像重试始终复用最初 ScriptV1 快照和固定 seed；Worker 会验证
+        # 来源 Job 中已经完成的 PNG，并从第一张缺失或损坏图片继续。
+        request_json.pop("resumed_from_stage", None)
+        request_json["resume_image_from_job_id"] = failed_job.id
     return create_job(
         session,
         project=project,
         request_json=request_json,
         provider_id=failed_job.provider_id,
+        job_type=failed_job.job_type,
     )
 
 
@@ -261,6 +270,10 @@ def create_export(
 
 def get_export(session: Session, export_id: str) -> Export | None:
     return session.get(Export, export_id)
+
+
+def get_asset(session: Session, asset_id: str) -> Asset | None:
+    return session.get(Asset, asset_id)
 
 
 def latest_export(session: Session, project_id: str) -> Export | None:

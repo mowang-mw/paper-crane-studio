@@ -19,6 +19,7 @@ from .ffmpeg import (
     MediaTools,
     decode_media_fully,
     ffmpeg_filter_path,
+    ffprobe_json,
     find_chinese_font,
     resolve_media_tools,
     run_command,
@@ -150,13 +151,21 @@ def load_script_fixture(fixture_path: Path) -> dict[str, Any]:
     return payload
 
 
-def _label_filter(font: Path, text: str, y: int, fontsize: int = 30) -> str:
+def _label_filter(
+    font: Path,
+    text: str,
+    y: int,
+    fontsize: int = 30,
+    *,
+    box_opacity: float = 0.42,
+    box_border: int = 10,
+) -> str:
     safe_text = text.replace("\\", r"\\").replace("'", r"\'").replace(":", r"\:")
     return (
         "drawtext="
         f"fontfile={ffmpeg_filter_path(font)}:"
         f"text='{safe_text}':fontcolor=white:fontsize={fontsize}:"
-        f"x=36:y={y}:box=1:boxcolor=black@0.42:boxborderw=10"
+        f"x=36:y={y}:box=1:boxcolor=black@{box_opacity:.2f}:boxborderw={box_border}"
     )
 
 
@@ -368,6 +377,135 @@ def _create_shot(
     }
 
 
+def _create_image_shot(
+    *,
+    tools: MediaTools,
+    font: Path,
+    subtitle: BurnedSubtitle,
+    shot: dict[str, Any],
+    keyframe: dict[str, Any],
+    output_path: Path,
+    command_log: list[str],
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+) -> dict[str, Any]:
+    """把已校验真实 PNG 转为带轻微运镜、Mock 音频和烧录字幕的镜头。"""
+
+    duration = float(shot["duration_seconds"])
+    parameters = shot["generation_parameters"]
+    frame_count = int(round(duration * fps))
+    audio_path = output_path.with_suffix(".wav")
+    generate_mock_wav(audio_path, duration, float(parameters["audio_frequency_hz"]))
+
+    canvas_width = width + 64
+    canvas_height = height + 36
+    filters = [
+        (
+            f"scale={canvas_width}:{canvas_height}:"
+            "force_original_aspect_ratio=increase"
+        ),
+        f"crop={canvas_width}:{canvas_height}",
+        "setsar=1",
+        _motion_filter(
+            str(parameters["motion"]),
+            frame_count,
+            width=width,
+            height=height,
+            fps=fps,
+        ),
+        _label_filter(
+            font,
+            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
+            24,
+            22,
+            box_opacity=0.24,
+            box_border=6,
+        ),
+        subtitle.filter_expression,
+    ]
+    fade_out_start = max(0.0, duration - 0.35)
+    filters.append(f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.3f}:d=0.35")
+    filters.append("format=yuv420p")
+
+    temporary = _atomic_media_target(output_path)
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-framerate",
+            str(fps),
+            "-i",
+            Path(str(keyframe["image_path"])),
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            ",".join(filters),
+            "-af",
+            f"afade=t=in:st=0:d=0.2,afade=t=out:st={max(0.0, duration - 0.3):.3f}:d=0.3",
+            "-t",
+            f"{duration:.3f}",
+            "-r",
+            str(fps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            temporary,
+        ],
+        timeout_seconds=240,
+        command_log=command_log,
+    )
+    validation = verify_media(
+        tools,
+        temporary,
+        min_duration=duration - 0.20,
+        max_duration=duration + 0.20,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    return {
+        "video_path": output_path,
+        "audio_path": audio_path,
+        "validation": validation,
+        "sha256": sha256_file(output_path),
+        "narration": subtitle.narration,
+        "rendered_subtitle_text": subtitle.rendered_text,
+        "subtitle_path": subtitle.text_path,
+        "subtitle_filter": subtitle.filter_expression,
+        "subtitle_font_path": subtitle.font_path,
+        "subtitle_rendering": "burned_in",
+        "keyframe": keyframe,
+    }
+
+
 def _write_srt(shots: list[dict[str, Any]], target: Path) -> None:
     def stamp(value: float) -> str:
         milliseconds = int(round(value * 1000))
@@ -445,7 +583,7 @@ def _normalize_project_shots(
     provider_id: str,
 ) -> list[dict[str, Any]]:
     if not 3 <= len(shots) <= 5:
-        raise MediaToolError(f"Mock 短片必须包含 3—5 个镜头，实际 {len(shots)}")
+        raise MediaToolError(f"项目短片必须包含 3—5 个镜头，实际 {len(shots)}")
     if width < 320 or height < 180 or fps < 1:
         raise MediaToolError("媒体参数无效：分辨率至少 320x180，帧率至少 1 fps")
 
@@ -492,12 +630,170 @@ def _normalize_project_shots(
     total_duration = sum(float(shot["duration_seconds"]) for shot in normalized)
     if not 20.0 <= total_duration <= 40.0:
         raise MediaToolError(
-            f"M2 短片计划总时长必须在 20—40 秒内，实际 {total_duration:.3f} 秒"
+            f"项目短片计划总时长必须在 20—40 秒内，实际 {total_duration:.3f} 秒"
         )
     return normalized
 
 
-def render_mock_project_short(
+_REAL_IMAGE_SOURCE_TYPE = "REAL_LOCAL_MODEL"
+
+
+def _required_keyframe_text(
+    keyframe: dict[str, Any],
+    field: str,
+    *,
+    shot_id: str,
+) -> str:
+    value = keyframe.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise MediaToolError(f"真实关键帧 {shot_id} 缺少非空字段 {field}")
+    return value.strip()
+
+
+def _validate_real_keyframes(
+    *,
+    tools: MediaTools,
+    shots: list[dict[str, Any]],
+    keyframes: list[dict[str, Any]],
+    command_log: list[str],
+) -> dict[str, dict[str, Any]]:
+    """校验真实图片与追溯字段；真实入口不允许缺图或混入 Mock。"""
+
+    if len(keyframes) != len(shots):
+        raise MediaToolError(
+            "真实图片镜头数必须与剧本镜头数一致："
+            f"剧本 {len(shots)}，图片 {len(keyframes)}"
+        )
+
+    expected_ids = [str(shot["shot_id"]) for shot in shots]
+    by_shot: dict[str, dict[str, Any]] = {}
+    provider_ids: set[str] = set()
+    model_ids: set[str] = set()
+    for position, original in enumerate(keyframes, start=1):
+        if not isinstance(original, dict):
+            raise MediaToolError(f"第 {position} 个真实关键帧结果必须是对象")
+        keyframe = dict(original)
+        shot_id = _required_keyframe_text(keyframe, "shot_id", shot_id=f"#{position}")
+        if shot_id in by_shot:
+            raise MediaToolError(f"真实关键帧 shot_id 重复：{shot_id}")
+        if shot_id not in expected_ids:
+            raise MediaToolError(f"真实关键帧引用未知镜头：{shot_id}")
+
+        provider_id = _required_keyframe_text(
+            keyframe, "provider_id", shot_id=shot_id
+        )
+        if provider_id.lower() == "mock":
+            raise MediaToolError(f"真实图片入口禁止使用 Mock 关键帧：{shot_id}")
+        model_id = _required_keyframe_text(keyframe, "model_id", shot_id=shot_id)
+        source_type = str(keyframe.get("source_type", _REAL_IMAGE_SOURCE_TYPE)).strip()
+        if source_type != _REAL_IMAGE_SOURCE_TYPE:
+            raise MediaToolError(
+                f"真实关键帧 {shot_id} source_type 必须为 {_REAL_IMAGE_SOURCE_TYPE}"
+            )
+
+        seed = keyframe.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise MediaToolError(f"真实关键帧 {shot_id} seed 必须是非负整数")
+        width = keyframe.get("width")
+        height = keyframe.get("height")
+        if (
+            isinstance(width, bool)
+            or isinstance(height, bool)
+            or not isinstance(width, int)
+            or not isinstance(height, int)
+            or width <= 0
+            or height <= 0
+        ):
+            raise MediaToolError(f"真实关键帧 {shot_id} 的 width/height 必须是正整数")
+
+        image_value = _required_keyframe_text(keyframe, "image_path", shot_id=shot_id)
+        image_path = Path(image_value).expanduser().resolve()
+        if not image_path.is_file() or image_path.stat().st_size <= 0:
+            raise MediaToolError(f"真实关键帧不存在或为空：{image_path}")
+        if image_path.suffix.lower() != ".png":
+            raise MediaToolError(f"真实关键帧必须是 PNG：{image_path}")
+        expected_sha256 = _required_keyframe_text(
+            keyframe, "image_sha256", shot_id=shot_id
+        ).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise MediaToolError(f"真实关键帧 {shot_id} 的 image_sha256 格式无效")
+        actual_sha256 = sha256_file(image_path)
+        if actual_sha256 != expected_sha256:
+            raise MediaToolError(
+                f"真实关键帧 {shot_id} SHA-256 不符："
+                f"记录 {expected_sha256}，实际 {actual_sha256}"
+            )
+
+        probe = ffprobe_json(tools, image_path, command_log=command_log)
+        streams = probe.get("streams")
+        videos = (
+            [item for item in streams if item.get("codec_type") == "video"]
+            if isinstance(streams, list)
+            else []
+        )
+        if len(videos) != 1 or videos[0].get("codec_name") != "png":
+            raise MediaToolError(f"真实关键帧 {shot_id} 不是可识别的单流 PNG")
+        actual_size = (videos[0].get("width"), videos[0].get("height"))
+        if actual_size != (width, height):
+            raise MediaToolError(
+                f"真实关键帧 {shot_id} 尺寸不符："
+                f"记录 {width}x{height}，实际 {actual_size[0]}x{actual_size[1]}"
+            )
+        run_command(
+            [
+                tools.ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                image_path,
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout_seconds=60,
+            command_log=command_log,
+        )
+
+        keyframe.update(
+            {
+                "shot_id": shot_id,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "source_type": source_type,
+                "seed": seed,
+                "width": width,
+                "height": height,
+                "image_path": str(image_path),
+                "image_sha256": actual_sha256,
+            }
+        )
+        warnings = keyframe.get("warnings", [])
+        if not isinstance(warnings, list) or not all(
+            isinstance(item, str) for item in warnings
+        ):
+            raise MediaToolError(f"真实关键帧 {shot_id} warnings 必须是字符串数组")
+        keyframe["warnings"] = list(warnings)
+        by_shot[shot_id] = keyframe
+        provider_ids.add(provider_id)
+        model_ids.add(model_id)
+
+    missing = [shot_id for shot_id in expected_ids if shot_id not in by_shot]
+    if missing:
+        raise MediaToolError(f"真实图片入口缺少镜头关键帧：{missing}")
+    if len(provider_ids) != 1 or len(model_ids) != 1:
+        raise MediaToolError(
+            "同一真实图片导出不得混用多个 ImageProvider 或模型："
+            f"providers={sorted(provider_ids)}, models={sorted(model_ids)}"
+        )
+    return by_shot
+
+
+def _render_project_short(
     *,
     root: Path,
     project_id: str,
@@ -512,8 +808,9 @@ def render_mock_project_short(
     provider_id: str = "mock",
     generation_context: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    keyframes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """用 M1 的同一 FFmpeg 链路渲染一个隔离的项目导出。
+    """用同一 FFmpeg 链路渲染 Mock 画面或已校验的真实关键帧。
 
     调用方应为每个 GenerationJob 提供独立 output_dir。函数只写该目录下的
     派生文件，使用临时文件完成最终 MP4 和 manifest 的原子替换。
@@ -544,6 +841,56 @@ def render_mock_project_short(
         raise MediaToolError("output_filename 必须是当前目录下的 .mp4 文件名")
 
     command_log: list[str] = []
+    keyframes_by_shot = (
+        _validate_real_keyframes(
+            tools=tools,
+            shots=normalized_shots,
+            keyframes=keyframes,
+            command_log=command_log,
+        )
+        if keyframes is not None
+        else {}
+    )
+    real_image_mode = keyframes is not None
+
+    if real_image_mode:
+        keyframe_provider = next(iter(keyframes_by_shot.values()))["provider_id"]
+        if provider_id != keyframe_provider:
+            raise MediaToolError(
+                f"媒体入口 provider_id={provider_id} 与真实关键帧 "
+                f"Provider={keyframe_provider} 不一致"
+            )
+        configured_providers = (generation_context or {}).get("providers", {})
+        if isinstance(configured_providers, dict):
+            configured_image_provider = configured_providers.get("image_provider")
+            if (
+                configured_image_provider is not None
+                and str(configured_image_provider) != keyframe_provider
+            ):
+                raise MediaToolError(
+                    "generation_context.providers.image_provider "
+                    "与真实关键帧 Provider 不一致"
+                )
+        for shot in normalized_shots:
+            shot_provider = str(shot.get("provider_id", "")).strip()
+            visual_provider = str(
+                shot.get("generation_parameters", {}).get("visual_provider_id", "")
+            ).strip()
+            for label, value in (
+                ("provider_id", shot_provider),
+                ("generation_parameters.visual_provider_id", visual_provider),
+            ):
+                if value and value != keyframe_provider:
+                    raise MediaToolError(
+                        f"真实图片镜头 {shot['shot_id']} 的 {label}={value} "
+                        f"与关键帧 Provider={keyframe_provider} 不一致"
+                    )
+            shot["provider_id"] = keyframe_provider
+            shot["source_type"] = _REAL_IMAGE_SOURCE_TYPE
+            shot["generation_parameters"]["visual_provider_id"] = keyframe_provider
+            shot["generation_parameters"]["image_source_type"] = (
+                _REAL_IMAGE_SOURCE_TYPE
+            )
     shot_outputs: list[dict[str, Any]] = []
     for index, shot in enumerate(normalized_shots, start=1):
         shot_stem = _safe_file_stem(str(shot["shot_id"]), f"shot_{index:02d}")
@@ -554,17 +901,24 @@ def render_mock_project_short(
             height=height,
             font_path=font,
         )
-        generated = _create_shot(
-            tools=tools,
-            font=font,
-            subtitle=subtitle,
-            shot=shot,
-            output_path=shot_dir / f"{shot_stem}.mp4",
-            command_log=command_log,
-            width=width,
-            height=height,
-            fps=fps,
-        )
+        create_arguments = {
+            "tools": tools,
+            "font": font,
+            "subtitle": subtitle,
+            "shot": shot,
+            "output_path": shot_dir / f"{shot_stem}.mp4",
+            "command_log": command_log,
+            "width": width,
+            "height": height,
+            "fps": fps,
+        }
+        if real_image_mode:
+            generated = _create_image_shot(
+                **create_arguments,
+                keyframe=keyframes_by_shot[str(shot["shot_id"])],
+            )
+        else:
+            generated = _create_shot(**create_arguments)
         shot_outputs.append(generated)
         if progress_callback:
             progress_callback(10 + index * 15)
@@ -625,43 +979,81 @@ def render_mock_project_short(
     digest = sha256_file(output_path)
     shot_manifest: list[dict[str, Any]] = []
     for shot, generated in zip(normalized_shots, shot_outputs, strict=True):
-        shot_manifest.append(
-            {
-                "shot_id": shot["shot_id"],
-                "sequence_no": shot["sequence_no"],
-                "title": shot["title"],
-                "visual_description": shot["visual_description"],
-                "duration_seconds": shot["duration_seconds"],
-                "subtitle": shot["subtitle_text"],
-                "narration": shot["subtitle_text"],
-                "provider_id": shot["provider_id"],
-                "script_provider_id": shot.get("script_provider_id", provider_id),
-                "source_type": shot["source_type"],
-                "generation_parameters": shot["generation_parameters"],
-                "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
-                "subtitle_text_path": _repo_relative(root, generated["subtitle_path"]),
-                "rendered_subtitle_text": generated["rendered_subtitle_text"],
-                "font_path": str(generated["subtitle_font_path"]),
-                "subtitle_rendering": generated["subtitle_rendering"],
-                "subtitle_filter": generated["subtitle_filter"],
-                "clip_path": _repo_relative(root, generated["video_path"]),
-                "audio_path": _repo_relative(root, generated["audio_path"]),
-                "audio_sha256": sha256_file(generated["audio_path"]),
-                "clip_sha256": generated["sha256"],
-                "clip_validation": generated["validation"],
-            }
-        )
+        item = {
+            "shot_id": shot["shot_id"],
+            "sequence_no": shot["sequence_no"],
+            "title": shot["title"],
+            "visual_description": shot["visual_description"],
+            "duration_seconds": shot["duration_seconds"],
+            "subtitle": shot["subtitle_text"],
+            "narration": shot["subtitle_text"],
+            "provider_id": shot["provider_id"],
+            "script_provider_id": shot.get("script_provider_id", provider_id),
+            "source_type": shot["source_type"],
+            "generation_parameters": shot["generation_parameters"],
+            "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
+            "subtitle_text_path": _repo_relative(root, generated["subtitle_path"]),
+            "rendered_subtitle_text": generated["rendered_subtitle_text"],
+            "font_path": str(generated["subtitle_font_path"]),
+            "subtitle_rendering": generated["subtitle_rendering"],
+            "subtitle_filter": generated["subtitle_filter"],
+            "clip_path": _repo_relative(root, generated["video_path"]),
+            "audio_path": _repo_relative(root, generated["audio_path"]),
+            "audio_sha256": sha256_file(generated["audio_path"]),
+            "clip_sha256": generated["sha256"],
+            "clip_validation": generated["validation"],
+        }
+        if real_image_mode:
+            keyframe = dict(generated["keyframe"])
+            keyframe["image_path"] = _repo_relative(
+                root, Path(str(keyframe["image_path"]))
+            )
+            for trace_field in ("workflow_path", "trace_path"):
+                trace_value = keyframe.get(trace_field)
+                if isinstance(trace_value, str) and trace_value:
+                    keyframe[trace_field] = _repo_relative(root, Path(trace_value))
+            item["keyframe"] = keyframe
+            item["keyframe_path"] = keyframe["image_path"]
+            item["keyframe_sha256"] = keyframe["image_sha256"]
+        shot_manifest.append(item)
 
-    context = generation_context or {}
+    context = dict(generation_context or {})
     provider_trace = context.get("providers", {})
     if not isinstance(provider_trace, dict):
         provider_trace = {}
+    else:
+        provider_trace = dict(provider_trace)
     script_provider = str(provider_trace.get("script_provider", provider_id))
-    image_provider = str(provider_trace.get("image_provider", "mock"))
+    detected_image_provider = (
+        str(next(iter(keyframes_by_shot.values()))["provider_id"])
+        if real_image_mode
+        else "mock"
+    )
+    context_image_provider = provider_trace.get("image_provider")
+    if (
+        real_image_mode
+        and context_image_provider is not None
+        and str(context_image_provider) != detected_image_provider
+    ):
+        raise MediaToolError(
+            "generation_context.providers.image_provider 与真实关键帧 Provider 不一致"
+        )
+    image_provider = str(context_image_provider or detected_image_provider)
     audio_provider = str(provider_trace.get("audio_provider", "mock"))
     video_source_type = str(
-        provider_trace.get("video_source_type", "DETERMINISTIC_FALLBACK")
+        provider_trace.get(
+            "video_source_type",
+            "FFMPEG_KEYFRAME_MOTION" if real_image_mode else "DETERMINISTIC_FALLBACK",
+        )
     )
+    provider_trace.update(
+        {
+            "image_provider": image_provider,
+            "audio_provider": str(provider_trace.get("audio_provider", "mock")),
+            "video_source_type": video_source_type,
+        }
+    )
+    context["providers"] = provider_trace
     script_validation_warnings = context.get(
         "script_validation_warnings",
         {"unused_scene_ids": [], "unused_character_ids": []},
@@ -669,7 +1061,11 @@ def render_mock_project_short(
     if not isinstance(script_validation_warnings, dict):
         raise MediaToolError("generation_context.script_validation_warnings 必须是对象")
     manifest = {
-        "manifest_version": "m3.mixed-provider-export.v1",
+        "manifest_version": (
+            "m4.real-image-export.v1"
+            if real_image_mode
+            else "m3.mixed-provider-export.v1"
+        ),
         "project": {"id": project_id, "title": project_title},
         "generation_context": context,
         "script_provider": script_provider,
@@ -693,19 +1089,27 @@ def render_mock_project_short(
         },
         "pipeline": {
             "provider_id": provider_id,
-            "source_type": "DETERMINISTIC_FALLBACK",
+            "source_type": (
+                "REAL_IMAGE_KEYFRAME_FFMPEG_MOTION"
+                if real_image_mode
+                else "DETERMINISTIC_FALLBACK"
+            ),
             "script_provider": script_provider,
             "image_provider": image_provider,
             "audio_provider": audio_provider,
             "video_source_type": video_source_type,
-            "visual_method": "FFmpeg color/drawbox/drawtext/zoompan/fade filters",
+            "visual_method": (
+                "validated real PNG keyframes -> FFmpeg deterministic Ken Burns/fade"
+                if real_image_mode
+                else "FFmpeg color/drawbox/drawtext/zoompan/fade filters"
+            ),
             "audio_method": "Python standard-library deterministic PCM WAV -> FFmpeg AAC",
             "subtitle_method": "FFmpeg drawtext + independent UTF-8 textfile",
             "subtitle_rendering": "burned_in",
             "chinese_font_path": str(font),
             "network_required": False,
             "api_key_required": False,
-            "model_weights_required": False,
+            "model_weights_required": real_image_mode,
         },
         "shot_count": len(shot_manifest),
         "shots": shot_manifest,
@@ -733,6 +1137,79 @@ def render_mock_project_short(
         "shots": shot_outputs,
         "manifest": manifest,
     }
+
+
+def render_mock_project_short(
+    *,
+    root: Path,
+    project_id: str,
+    project_title: str,
+    shots: list[dict[str, Any]],
+    output_dir: Path,
+    output_filename: str | None = None,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+    font_path: Path | None = None,
+    provider_id: str = "mock",
+    generation_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """保持 M0—M3 行为不变的确定性 Mock 媒体入口。"""
+
+    return _render_project_short(
+        root=root,
+        project_id=project_id,
+        project_title=project_title,
+        shots=shots,
+        output_dir=output_dir,
+        output_filename=output_filename,
+        width=width,
+        height=height,
+        fps=fps,
+        font_path=font_path,
+        provider_id=provider_id,
+        generation_context=generation_context,
+        progress_callback=progress_callback,
+        keyframes=None,
+    )
+
+
+def render_image_project_short(
+    *,
+    root: Path,
+    project_id: str,
+    project_title: str,
+    shots: list[dict[str, Any]],
+    keyframes: list[dict[str, Any]],
+    output_dir: Path,
+    output_filename: str | None = None,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    fps: int = FPS,
+    font_path: Path | None = None,
+    provider_id: str = "comfyui-animagine-xl-4",
+    generation_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """用完整的一组真实 PNG 关键帧生成 MP4；禁止缺图或混用 Mock。"""
+
+    return _render_project_short(
+        root=root,
+        project_id=project_id,
+        project_title=project_title,
+        shots=shots,
+        output_dir=output_dir,
+        output_filename=output_filename,
+        width=width,
+        height=height,
+        fps=fps,
+        font_path=font_path,
+        provider_id=provider_id,
+        generation_context=generation_context,
+        progress_callback=progress_callback,
+        keyframes=keyframes,
+    )
 
 
 def resume_mock_project_short(

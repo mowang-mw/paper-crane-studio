@@ -50,7 +50,7 @@ def test_health_projects_demo_and_persistence(
         "ffmpeg_available": True,
         "ffprobe_available": True,
         "data_dir": str(settings.data_dir),
-        "stage": "M3",
+        "stage": "M4-B",
     }
     with database.engine.connect() as connection:
         assert connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"

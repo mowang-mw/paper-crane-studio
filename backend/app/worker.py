@@ -11,20 +11,37 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from . import crud
 from .config import Settings
 from .database import Database
 from .media.ffmpeg import sha256_file
 from .models import JobStatus
+from .providers.base import (
+    GeneratedImageAsset,
+    ImageGenerationOptions,
+    ImageGenerationRequest,
+    ImageProvider,
+)
+from .providers.comfyui import ComfyUIImageProvider
 from .providers.llama_cpp import LlamaCppScriptProvider
 from .providers.mock import MockAudioProvider, MockImageProvider, MockScriptProvider
 from .providers.registry import check_llamacpp
 from .script_schema import ScriptV1
 from .services.generation import GenerationService, PreparedGeneration
+from .services.image_jobs import (
+    GpuMemoryMonitor,
+    REAL_IMAGE_JOB_TYPE,
+    REAL_IMAGE_PROVIDER_ID,
+    RealImageJobError,
+    gpu_handoff_status,
+    load_script_snapshot,
+)
 
 
 Renderer = Callable[..., dict[str, Any]]
+ImageProviderFactory = Callable[[Settings], ImageProvider]
 
 
 class MediaResumeError(RuntimeError):
@@ -64,6 +81,8 @@ class Worker:
         renderer: Renderer | None = None,
         resume_renderer: Renderer | None = None,
         generation_service: GenerationService | None = None,
+        real_image_renderer: Renderer | None = None,
+        image_provider_factory: ImageProviderFactory | None = None,
     ) -> None:
         self.settings = settings or Settings.from_env()
         self.settings.ensure_directories()
@@ -72,6 +91,8 @@ class Worker:
         self.renderer = renderer
         self.resume_renderer = resume_renderer
         self.generation_service = generation_service
+        self.real_image_renderer = real_image_renderer
+        self.image_provider_factory = image_provider_factory
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -179,6 +200,52 @@ class Worker:
 
     def _process(self, job_id: str) -> None:
         # 第一个短事务只读取不可变输入快照。真实模型 HTTP 调用绝不持有 Session。
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"无法处理非 RUNNING 任务：{job_id}")
+            project = crud.get_project(session, job.project_id)
+            if project is None:
+                raise RuntimeError(f"任务所属项目不存在：{job.project_id}")
+            request_snapshot = dict(job.request_json or {})
+            if job.job_type == REAL_IMAGE_JOB_TYPE:
+                project_id = project.id
+                project_title = project.title
+                project_story = project.story
+                image_provider_id = job.provider_id
+            else:
+                image_provider_id = None
+
+            if image_provider_id is not None:
+                # 真实图片 Job 的 provider_id 描述 ImageProvider；不能再按
+                # ScriptProvider 校验，否则会误把合法任务拒绝为未知文本模型。
+                if request_snapshot.get("image_provider") != image_provider_id:
+                    raise RealImageJobError(
+                        code="IMAGE_PROVIDER_SNAPSHOT_MISMATCH",
+                        stage="IMAGE_GENERATION",
+                        summary="Job provider_id 与真实图像 Provider 快照不一致。",
+                        retryable=False,
+                    )
+                if image_provider_id != REAL_IMAGE_PROVIDER_ID:
+                    raise RealImageJobError(
+                        code="IMAGE_PROVIDER_UNSUPPORTED",
+                        stage="IMAGE_GENERATION",
+                        summary=f"不支持的真实 ImageProvider：{image_provider_id}",
+                        retryable=False,
+                    )
+                project_script_json = copy.deepcopy(project.script_json)
+
+        if image_provider_id is not None:
+            self._process_real_image_job(
+                job_id=job_id,
+                project_id=project_id,
+                project_title=project_title,
+                project_story=project_story,
+                project_script_json=project_script_json,
+                request_snapshot=request_snapshot,
+            )
+            return
+
         with self.database.session() as session:
             job = crud.get_job(session, job_id)
             if job is None or job.status != JobStatus.RUNNING:
@@ -412,6 +479,7 @@ class Worker:
             crud.set_job_progress(session, job, 20)
             job.result_json = {
                 "script_provider": prepared.script_provider,
+                "script_json": prepared.script_json,
                 "script_source_type": prepared.script_source_type,
                 "script_trace": prepared.script_trace,
                 "script_validation_warnings": prepared.script_validation_warnings,
@@ -567,6 +635,7 @@ class Worker:
                 "validation": validation,
                 "provider_id": provider_id,
                 "script_provider": prepared.script_provider,
+                "script_json": prepared.script_json,
                 "script_source_type": prepared.script_source_type,
                 "script_model_id": prepared.script_trace.get(
                     "model", "mock-script.v1"
@@ -594,6 +663,839 @@ class Worker:
             crud.mark_job_succeeded(session, job=job, result_json=result_json)
             session.commit()
         print(f"[worker] job={job_id} SUCCEEDED export={export.id}", flush=True)
+
+    def _process_real_image_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        project_title: str,
+        project_story: str,
+        project_script_json: dict[str, Any] | None,
+        request_snapshot: dict[str, Any],
+    ) -> None:
+        """复用不可变 ScriptV1，顺序生成真实 PNG，再进入公共 FFmpeg 媒体层。"""
+
+        if request_snapshot.get("script_provider_calls_expected") != 0:
+            raise RealImageJobError(
+                code="SCRIPT_REUSE_INVALID",
+                stage="SCRIPT_REUSE",
+                summary="真实图像 Job 必须明确记录文本 Provider 调用次数为 0。",
+                retryable=False,
+            )
+        script, snapshot_payload = load_script_snapshot(
+            self.settings,
+            project_id=project_id,
+            image_job_id=job_id,
+            request_snapshot=request_snapshot,
+        )
+        script_json = script.model_dump(mode="json")
+        if project_script_json != script_json:
+            raise RealImageJobError(
+                code="SCRIPT_SNAPSHOT_STALE",
+                stage="SCRIPT_REUSE",
+                summary="项目当前剧本已变化，拒绝用旧 ScriptV1 生成真实画面。",
+                retryable=False,
+            )
+        if request_snapshot.get("story_char_count") != len(project_story.strip()):
+            raise RealImageJobError(
+                code="SCRIPT_SNAPSHOT_STALE",
+                stage="SCRIPT_REUSE",
+                summary="项目故事与真实图像 Job 的请求快照不一致。",
+                retryable=False,
+            )
+        if request_snapshot.get("actual_shot_count") != len(script.shots):
+            raise RealImageJobError(
+                code="SCRIPT_SNAPSHOT_INVALID",
+                stage="SCRIPT_REUSE",
+                summary="ScriptV1 镜头数与 Job 请求快照不一致。",
+                retryable=False,
+            )
+
+        options = self._real_image_options(request_snapshot)
+        provider = self._real_image_provider()
+        if provider.provider_id != REAL_IMAGE_PROVIDER_ID:
+            raise RealImageJobError(
+                code="IMAGE_PROVIDER_SNAPSHOT_MISMATCH",
+                stage="IMAGE_GENERATION",
+                summary="注入的 ImageProvider 与 Job 请求快照不一致。",
+                retryable=False,
+            )
+
+        source_script_job_id = str(request_snapshot.get("source_script_job_id") or "")
+        source_script_provider = str(
+            request_snapshot.get("source_script_provider") or "unknown"
+        )
+        source_script_source_type = str(
+            request_snapshot.get("source_script_source_type") or "UNKNOWN"
+        )
+        source_trace = snapshot_payload.get("source_trace")
+        if not isinstance(source_trace, dict):
+            source_trace = {}
+        script_trace = {
+            "reuse_mode": "VALIDATED_SCRIPT_SNAPSHOT",
+            "source_script_job_id": source_script_job_id,
+            "source_script_provider": source_script_provider,
+            "source_script_source_type": source_script_source_type,
+            "script_provider_calls": 0,
+            "snapshot_path": request_snapshot.get("script_snapshot_path"),
+            "snapshot_sha256": request_snapshot.get("script_snapshot_sha256"),
+            "source_trace": source_trace,
+        }
+        planning_service = GenerationService(
+            # 该占位对象仅满足类型契约；prepare_validated_script 不调用 generate。
+            script_provider=MockScriptProvider(self.settings.root_dir),
+            image_provider=provider,
+            audio_provider=MockAudioProvider(),
+        )
+        prepared = planning_service.prepare_validated_script(
+            script=script,
+            provider_id="reused",
+            source_type="REUSED_VALIDATED_SCRIPT",
+            trace=script_trace,
+            desired_shot_count=len(script.shots),
+            story_char_count=len(project_story.strip()),
+        )
+
+        with self.database.session() as session:
+            database_shots = crud.list_shots(session, project_id)
+            if len(database_shots) != len(script.shots):
+                raise RealImageJobError(
+                    code="SCRIPT_SNAPSHOT_STALE",
+                    stage="SCRIPT_REUSE",
+                    summary="数据库镜头与复用 ScriptV1 数量不一致。",
+                    retryable=False,
+                )
+            database_shot_ids: dict[int, str] = {}
+            for script_shot, database_shot in zip(script.shots, database_shots):
+                if (
+                    database_shot.shot_index != script_shot.index
+                    or database_shot.title != script_shot.title
+                    or database_shot.visual_description
+                    != script_shot.visual_description
+                    or database_shot.narration != script_shot.narration
+                    or abs(
+                        float(database_shot.duration_seconds)
+                        - float(script_shot.duration_seconds)
+                    )
+                    > 1e-6
+                ):
+                    raise RealImageJobError(
+                        code="SCRIPT_SNAPSHOT_STALE",
+                        stage="SCRIPT_REUSE",
+                        summary="数据库镜头内容与复用 ScriptV1 不一致。",
+                        failed_shot_id=script_shot.id,
+                        failed_shot_index=script_shot.index,
+                        retryable=False,
+                    )
+                database_shot_ids[script_shot.index] = database_shot.id
+
+        image_dir = (
+            self.settings.project_dir(project_id) / "jobs" / job_id / "images"
+        ).resolve()
+        character_by_id = {item.id: item for item in script.characters}
+        scene_by_id = {item.id: item for item in script.scenes}
+        image_requests = tuple(
+            ImageGenerationRequest(
+                project_id=project_id,
+                job_id=job_id,
+                script=script,
+                shot=shot,
+                characters=tuple(character_by_id[item] for item in shot.character_ids),
+                scene=scene_by_id[shot.scene_id],
+                output_dir=image_dir,
+                options=options,
+            )
+            for shot in script.shots
+        )
+        reusable_assets = self._load_reusable_image_assets(
+            project_id=project_id,
+            request_snapshot=request_snapshot,
+        )
+        initial_images = [
+            {
+                "shot_id": shot.id,
+                "shot_index": shot.index,
+                "title": shot.title,
+                "status": "PENDING",
+                "provider_id": REAL_IMAGE_PROVIDER_ID,
+                "model_id": getattr(provider, "model_id", self.settings.comfyui_model_id),
+                "seed": options.base_seed + shot.index,
+            }
+            for shot in script.shots
+        ]
+        initial_result = {
+            "stage": "IMAGE_GENERATION",
+            "script_provider": "reused",
+            "source_script_provider": source_script_provider,
+            "script_source_type": "REUSED_VALIDATED_SCRIPT",
+            "source_script_source_type": source_script_source_type,
+            "source_script_job_id": source_script_job_id,
+            "script_provider_calls": 0,
+            "script_json": script_json,
+            "script_trace": prepared.script_trace,
+            "script_validation_warnings": prepared.script_validation_warnings,
+            "actual_shot_count": len(script.shots),
+            "story_char_count": len(project_story.strip()),
+            "planned_duration_seconds": prepared.planned_duration_seconds,
+            "image_provider": REAL_IMAGE_PROVIDER_ID,
+            "image_model_id": getattr(
+                provider, "model_id", self.settings.comfyui_model_id
+            ),
+            "image_model_license": self.settings.comfyui_model_license,
+            "audio_provider": "mock",
+            "base_seed": options.base_seed,
+            "image_options": options.as_dict(),
+            "image_shots": initial_images,
+            "image_completed_count": 0,
+            "image_total_count": len(script.shots),
+            "retry_of_job_id": request_snapshot.get("retry_of_job_id"),
+            "resume_image_from_job_id": request_snapshot.get(
+                "resume_image_from_job_id"
+            ),
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"真实图像准备完成时 Job 不再是 RUNNING：{job_id}")
+            crud.set_job_progress(session, job, 5)
+            job.result_json = initial_result
+            session.commit()
+
+        parsed_llama = urlparse(self.settings.llama_server_base_url)
+        handoff = gpu_handoff_status(
+            llama_host=parsed_llama.hostname or "127.0.0.1",
+            llama_port=parsed_llama.port or 8081,
+        )
+        if handoff["conflict"]:
+            raise RealImageJobError(
+                code="GPU_HANDOFF_REQUIRED",
+                stage="GPU_HANDOFF_REQUIRED",
+                summary="本机8GB显存模式需要先停止Qwen服务，再开始真实图像生成。",
+                total_image_count=len(script.shots),
+                requires_qwen_shutdown=True,
+                suggestions=[
+                    "停止 llama-server 并确认 8081 已释放。",
+                    "释放显存后手动重试；平台不会终止用户进程。",
+                ],
+            )
+
+        monitor = GpuMemoryMonitor()
+        monitor.start()
+        image_started = time.monotonic()
+        try:
+            generated_assets = provider.generate_batch(
+                requests=image_requests,
+                reusable_assets=reusable_assets,
+                progress_callback=lambda completed, total, asset: (
+                    self._record_real_image_progress(
+                        job_id=job_id,
+                        project_id=project_id,
+                        database_shot_id=database_shot_ids[
+                            next(
+                                shot.index
+                                for shot in script.shots
+                                if shot.id == asset.shot_id
+                            )
+                        ],
+                        shot_index=next(
+                            shot.index
+                            for shot in script.shots
+                            if shot.id == asset.shot_id
+                        ),
+                        total=total,
+                        asset=asset,
+                    )
+                ),
+            )
+        except Exception:
+            monitor.stop()
+            self._record_gpu_observation(job_id, monitor.summary())
+            raise
+        monitor.stop()
+        gpu_observation = monitor.summary()
+        image_generation_total_seconds = round(
+            time.monotonic() - image_started, 3
+        )
+        self._record_gpu_observation(job_id, gpu_observation)
+
+        if len(generated_assets) != len(script.shots):
+            raise RealImageJobError(
+                code="IMAGE_OUTPUT_MISSING",
+                stage="IMAGE_GENERATION",
+                summary="ImageProvider 返回的关键帧数量不完整。",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(script.shots),
+            )
+
+        job_trace_dir = image_dir.parent
+        report_path = job_trace_dir / "image_generation_report.json"
+        report: dict[str, Any] = {}
+        if report_path.is_file():
+            try:
+                loaded_report = json.loads(report_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_report, dict):
+                    report = loaded_report
+            except (OSError, json.JSONDecodeError):
+                report = {}
+        generation_context = {
+            "generation_job_id": job_id,
+            "job_type": REAL_IMAGE_JOB_TYPE,
+            "request": request_snapshot,
+            "script": {
+                "schema_version": script.schema_version,
+                "provider_id": "reused",
+                "source_script_provider": source_script_provider,
+                "source_script_job_id": source_script_job_id,
+                "script_provider_calls": 0,
+            },
+            "providers": {
+                "script_provider": "reused",
+                "source_script_provider": source_script_provider,
+                "script_source_type": "REUSED_VALIDATED_SCRIPT",
+                "image_provider": REAL_IMAGE_PROVIDER_ID,
+                "image_model_id": getattr(
+                    provider, "model_id", self.settings.comfyui_model_id
+                ),
+                "image_model_license": self.settings.comfyui_model_license,
+                "image_source_type": "REAL_LOCAL_MODEL",
+                "audio_provider": "mock",
+                "video_source_type": "FFMPEG_KEYFRAME_MOTION",
+            },
+            "script_trace": prepared.script_trace,
+            "script_validation_warnings": prepared.script_validation_warnings,
+            "source_script_job_id": source_script_job_id,
+            "actual_shot_count": len(script.shots),
+            "planned_duration_seconds": prepared.planned_duration_seconds,
+            "base_seed": options.base_seed,
+            "image_options": options.as_dict(),
+            "image_generation_total_seconds": image_generation_total_seconds,
+            "image_generation_report": self._relative_project_path(
+                report_path, project_id
+            )
+            if report_path.is_file()
+            else None,
+            "comfyui_start_count": report.get("comfyui_start_count"),
+            "sequential_generation": True,
+            "max_image_concurrency": 1,
+            "gpu_memory_observed": gpu_observation,
+            "mock_image_fallback": False,
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"图片生成完成时 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            current.update(
+                {
+                    "stage": "MEDIA_RENDER",
+                    "image_generation_total_seconds": image_generation_total_seconds,
+                    "gpu_memory_observed": gpu_observation,
+                    "comfyui_start_count": report.get("comfyui_start_count"),
+                    "image_completed_count": len(generated_assets),
+                    "image_total_count": len(generated_assets),
+                }
+            )
+            job.result_json = current
+            crud.set_job_progress(session, job, 65)
+            session.commit()
+
+        output_dir = self.settings.project_dir(project_id) / "exports" / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        renderer = self.real_image_renderer or self._default_real_image_renderer()
+        try:
+            rendered = renderer(
+                root=self.settings.root_dir,
+                project_id=project_id,
+                project_title=project_title,
+                shots=list(prepared.media_shots),
+                keyframes=[asset.as_dict() for asset in generated_assets],
+                output_dir=output_dir,
+                output_filename=f"short_{job_id}.mp4",
+                provider_id=REAL_IMAGE_PROVIDER_ID,
+                generation_context=generation_context,
+                progress_callback=lambda progress: self._set_running_job_progress(
+                    job_id, max(66, min(95, int(progress)))
+                ),
+            )
+        except Exception as exc:
+            raise RealImageJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary=f"真实关键帧媒体渲染失败：{str(exc)[:500]}",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(generated_assets),
+                log_paths={
+                    "image_generation_report": str(report_path),
+                    "comfyui_stdout": str(job_trace_dir / "comfyui.stdout.log"),
+                    "comfyui_stderr": str(job_trace_dir / "comfyui.stderr.log"),
+                },
+                suggestions=["检查 FFmpeg/FFprobe 和媒体日志后手动重试。"],
+            ) from exc
+
+        self._finish_real_image_job(
+            job_id=job_id,
+            project_id=project_id,
+            request_snapshot=request_snapshot,
+            prepared=prepared,
+            generated_assets=generated_assets,
+            rendered=rendered,
+            source_script_job_id=source_script_job_id,
+            source_script_provider=source_script_provider,
+            image_generation_total_seconds=image_generation_total_seconds,
+            gpu_observation=gpu_observation,
+            comfyui_start_count=report.get("comfyui_start_count"),
+        )
+
+    def _real_image_options(
+        self, request_snapshot: dict[str, Any]
+    ) -> ImageGenerationOptions:
+        payload = request_snapshot.get("image_options")
+        base_seed = request_snapshot.get("base_seed")
+        if not isinstance(payload, dict) or type(base_seed) is not int:
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary="真实图像 Job 缺少合法的参数或 base seed 快照。",
+                retryable=False,
+            )
+        required_ints = ("width", "height", "batch_size", "steps")
+        required_numbers = (
+            "cfg",
+            "denoise",
+            "startup_timeout_seconds",
+            "generation_timeout_seconds",
+            "job_timeout_seconds",
+            "http_timeout_seconds",
+        )
+        if any(type(payload.get(name)) is not int for name in required_ints):
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary="真实图像整数参数快照无效。",
+                retryable=False,
+            )
+        if any(
+            type(payload.get(name)) not in (int, float) for name in required_numbers
+        ):
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary="真实图像数值参数快照无效。",
+                retryable=False,
+            )
+        if payload.get("lowvram") is not True:
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary="M4-B 在 8GB 显存设备上必须使用 lowvram=true。",
+                retryable=False,
+            )
+        if not isinstance(payload.get("sampler"), str) or not isinstance(
+            payload.get("scheduler"), str
+        ):
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary="sampler 和 scheduler 参数快照无效。",
+                retryable=False,
+            )
+        try:
+            return ImageGenerationOptions(
+                width=payload["width"],
+                height=payload["height"],
+                steps=payload["steps"],
+                cfg=float(payload["cfg"]),
+                sampler=str(payload["sampler"]),
+                scheduler=str(payload["scheduler"]),
+                denoise=float(payload["denoise"]),
+                batch_size=payload["batch_size"],
+                base_seed=base_seed,
+                lowvram=True,
+                startup_timeout_seconds=float(payload["startup_timeout_seconds"]),
+                generation_timeout_seconds=float(
+                    payload["generation_timeout_seconds"]
+                ),
+                job_timeout_seconds=float(payload["job_timeout_seconds"]),
+                http_timeout_seconds=float(payload["http_timeout_seconds"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RealImageJobError(
+                code="IMAGE_OPTIONS_INVALID",
+                stage="IMAGE_GENERATION",
+                summary=f"真实图像参数快照无法通过校验：{exc}",
+                retryable=False,
+            ) from exc
+
+    def _real_image_provider(self) -> ImageProvider:
+        if self.image_provider_factory is not None:
+            return self.image_provider_factory(self.settings)
+        return ComfyUIImageProvider(
+            comfy_python=Path(self.settings.comfyui_python),
+            comfy_root=Path(self.settings.comfyui_root),
+            model_path=Path(self.settings.comfyui_model_path),
+            model_sha256=self.settings.comfyui_model_sha256,
+            host=self.settings.comfyui_host,
+            port=self.settings.comfyui_port,
+        )
+
+    def _load_reusable_image_assets(
+        self,
+        *,
+        project_id: str,
+        request_snapshot: dict[str, Any],
+    ) -> tuple[GeneratedImageAsset, ...]:
+        source_job_id = request_snapshot.get("resume_image_from_job_id")
+        if not isinstance(source_job_id, str) or not source_job_id:
+            return ()
+        with self.database.session() as session:
+            source_job = crud.get_job(session, source_job_id)
+            if (
+                source_job is None
+                or source_job.project_id != project_id
+                or source_job.job_type != REAL_IMAGE_JOB_TYPE
+                or source_job.provider_id != REAL_IMAGE_PROVIDER_ID
+            ):
+                raise RealImageJobError(
+                    code="IMAGE_RESUME_INVALID",
+                    stage="IMAGE_GENERATION",
+                    summary="真实图像重试来源 Job 不存在或来源不匹配。",
+                    retryable=False,
+                )
+            source_result = dict(source_job.result_json or {})
+        items = source_result.get("image_shots")
+        if not isinstance(items, list):
+            return ()
+        reusable: list[GeneratedImageAsset] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("status") not in {
+                "SUCCEEDED",
+                "REUSED",
+            }:
+                continue
+            try:
+                warnings = item.get("warnings", [])
+                if not isinstance(warnings, list) or not all(
+                    isinstance(value, str) for value in warnings
+                ):
+                    continue
+                reusable.append(
+                    GeneratedImageAsset(
+                        provider_id=str(item["provider_id"]),
+                        model_id=str(item["model_id"]),
+                        shot_id=str(item["shot_id"]),
+                        image_path=self._stored_project_path(
+                            str(item["image_path"]), project_id
+                        ),
+                        width=int(item["width"]),
+                        height=int(item["height"]),
+                        seed=int(item["seed"]),
+                        positive_prompt=str(item["positive_prompt"]),
+                        negative_prompt=str(item["negative_prompt"]),
+                        generation_seconds=float(item["generation_seconds"]),
+                        image_sha256=str(item["image_sha256"]),
+                        model_sha256=str(item["model_sha256"]),
+                        workflow_path=self._stored_project_path(
+                            str(item["workflow_path"]), project_id
+                        ),
+                        trace_path=self._stored_project_path(
+                            str(item["trace_path"]), project_id
+                        ),
+                        warnings=tuple(warnings),
+                        reused=True,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                # Provider 会从第一张缺失或损坏的图片继续；坏追溯不能被复用。
+                continue
+        return tuple(reusable)
+
+    def _record_real_image_progress(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        database_shot_id: str,
+        shot_index: int,
+        total: int,
+        asset: GeneratedImageAsset,
+    ) -> None:
+        relative_image = self._relative_project_path(asset.image_path, project_id)
+        relative_workflow = self._relative_project_path(
+            asset.workflow_path, project_id
+        )
+        relative_trace = self._relative_project_path(asset.trace_path, project_id)
+        serialized = {
+            **asset.as_dict(),
+            "shot_index": shot_index,
+            "status": "REUSED" if asset.reused else "SUCCEEDED",
+            "image_path": relative_image,
+            "workflow_path": relative_workflow,
+            "trace_path": relative_trace,
+            "source_type": "REAL_LOCAL_MODEL",
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"记录图片时 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            image_shots = current.get("image_shots")
+            if not isinstance(image_shots, list):
+                image_shots = []
+            existing = next(
+                (
+                    item
+                    for item in image_shots
+                    if isinstance(item, dict)
+                    and item.get("shot_id") == asset.shot_id
+                    and item.get("image_asset_id")
+                ),
+                None,
+            )
+            if existing is None:
+                database_asset = crud.create_asset(
+                    session,
+                    project_id=project_id,
+                    shot_id=database_shot_id,
+                    asset_type="KEYFRAME_IMAGE",
+                    provider_id=asset.provider_id,
+                    source_type="REAL_LOCAL_MODEL",
+                    file_path=relative_image,
+                    sha256=asset.image_sha256,
+                    metadata_json={
+                        "job_id": job_id,
+                        "shot_id": asset.shot_id,
+                        "shot_index": shot_index,
+                        "model_id": asset.model_id,
+                        "model_sha256": asset.model_sha256,
+                        "seed": asset.seed,
+                        "width": asset.width,
+                        "height": asset.height,
+                        "generation_seconds": asset.generation_seconds,
+                        "workflow_path": relative_workflow,
+                        "trace_path": relative_trace,
+                        "reused": asset.reused,
+                    },
+                )
+                serialized["image_asset_id"] = database_asset.id
+                serialized["image_url"] = (
+                    f"/api/projects/{project_id}/assets/{database_asset.id}/content"
+                )
+            else:
+                serialized["image_asset_id"] = existing.get("image_asset_id")
+                serialized["image_url"] = existing.get("image_url")
+            by_id = {
+                str(item.get("shot_id")): dict(item)
+                for item in image_shots
+                if isinstance(item, dict) and item.get("shot_id")
+            }
+            by_id[asset.shot_id] = serialized
+            ordered = sorted(
+                by_id.values(), key=lambda item: int(item.get("shot_index", 999))
+            )
+            completed_count = sum(
+                item.get("status") in {"SUCCEEDED", "REUSED"} for item in ordered
+            )
+            current.update(
+                {
+                    "stage": "IMAGE_GENERATION",
+                    "image_shots": ordered,
+                    "image_completed_count": completed_count,
+                    "image_total_count": total,
+                    "current_shot_id": asset.shot_id,
+                    "current_shot_index": shot_index,
+                }
+            )
+            job.result_json = current
+            crud.set_job_progress(session, job, 5 + int(55 * completed_count / total))
+            session.commit()
+
+    def _record_gpu_observation(
+        self, job_id: str, observation: dict[str, Any]
+    ) -> None:
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                return
+            result = dict(job.result_json or {})
+            result["gpu_memory_observed"] = observation
+            job.result_json = result
+            session.commit()
+
+    def _set_running_job_progress(self, job_id: str, progress: int) -> None:
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                return
+            crud.set_job_progress(session, job, progress)
+            session.commit()
+
+    def _finish_real_image_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        request_snapshot: dict[str, Any],
+        prepared: PreparedGeneration,
+        generated_assets: tuple[GeneratedImageAsset, ...],
+        rendered: dict[str, Any],
+        source_script_job_id: str,
+        source_script_provider: str,
+        image_generation_total_seconds: float,
+        gpu_observation: dict[str, Any],
+        comfyui_start_count: Any,
+    ) -> None:
+        output_path = Path(str(rendered.get("output_path", ""))).resolve()
+        manifest_path = Path(str(rendered.get("manifest_path", ""))).resolve()
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise RealImageJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层未生成有效 MP4。",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(generated_assets),
+            )
+        if not manifest_path.is_file() or manifest_path.stat().st_size <= 0:
+            raise RealImageJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层未生成有效 Manifest。",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(generated_assets),
+            )
+        validation = rendered.get("validation")
+        if not isinstance(validation, dict):
+            raise RealImageJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层返回结果缺少 ffprobe 验证。",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(generated_assets),
+            )
+        relative_video = self._relative_project_path(output_path, project_id)
+        relative_manifest = self._relative_project_path(manifest_path, project_id)
+        video_sha256 = sha256_file(output_path)
+        if rendered.get("sha256") not in (None, video_sha256):
+            raise RealImageJobError(
+                code="MEDIA_RENDER",
+                stage="MEDIA_RENDER",
+                summary="媒体层返回的 MP4 SHA256 与文件实算值不一致。",
+                completed_image_count=len(generated_assets),
+                total_image_count=len(generated_assets),
+            )
+        manifest_sha256 = sha256_file(manifest_path)
+        encoded_duration = float(
+            validation.get(
+                "encoded_duration_seconds", validation.get("duration_seconds")
+            )
+        )
+        planned_duration = float(
+            validation.get(
+                "planned_duration_seconds", prepared.planned_duration_seconds
+            )
+        )
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"媒体完成时真实图像 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            video_asset = crud.create_asset(
+                session,
+                project_id=project_id,
+                asset_type="EXPORT_VIDEO",
+                provider_id=REAL_IMAGE_PROVIDER_ID,
+                source_type="REAL_IMAGE_KEYFRAME_FFMPEG_MOTION",
+                file_path=relative_video,
+                sha256=video_sha256,
+                metadata_json={"job_id": job_id, "validation": validation},
+            )
+            manifest_asset = crud.create_asset(
+                session,
+                project_id=project_id,
+                asset_type="MANIFEST",
+                provider_id=REAL_IMAGE_PROVIDER_ID,
+                source_type="REAL_IMAGE_KEYFRAME_FFMPEG_MOTION",
+                file_path=relative_manifest,
+                sha256=manifest_sha256,
+                metadata_json={"job_id": job_id},
+            )
+            export = crud.create_export(
+                session,
+                project_id=project_id,
+                job_id=job_id,
+                file_path=relative_video,
+                manifest_path=relative_manifest,
+                duration_seconds=encoded_duration,
+                sha256=video_sha256,
+            )
+            current.update(
+                {
+                    "stage": "SUCCEEDED",
+                    "export_id": export.id,
+                    "video_asset_id": video_asset.id,
+                    "manifest_asset_id": manifest_asset.id,
+                    "video_path": relative_video,
+                    "manifest_path": relative_manifest,
+                    "sha256": video_sha256,
+                    "validation": validation,
+                    "planned_duration_seconds": planned_duration,
+                    "encoded_duration_seconds": encoded_duration,
+                    "duration_seconds": encoded_duration,
+                    "duration_delta_seconds": float(
+                        validation.get(
+                            "duration_delta_seconds",
+                            encoded_duration - planned_duration,
+                        )
+                    ),
+                    "duration_tolerance_seconds": validation.get(
+                        "duration_tolerance_seconds"
+                    ),
+                    "duration_validation": validation.get("duration_validation"),
+                    "provider_id": REAL_IMAGE_PROVIDER_ID,
+                    "script_provider": "reused",
+                    "source_script_provider": source_script_provider,
+                    "source_script_job_id": source_script_job_id,
+                    "script_provider_calls": 0,
+                    "image_provider": REAL_IMAGE_PROVIDER_ID,
+                    "image_model_id": generated_assets[0].model_id,
+                    "image_model_license": self.settings.comfyui_model_license,
+                    "audio_provider": "mock",
+                    "video_source_type": "FFMPEG_KEYFRAME_MOTION",
+                    "source_type": "REAL_IMAGE_KEYFRAME_FFMPEG_MOTION",
+                    "image_generation_total_seconds": image_generation_total_seconds,
+                    "gpu_memory_observed": gpu_observation,
+                    "comfyui_start_count": comfyui_start_count,
+                    "mock_image_fallback": False,
+                    "video_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/video"
+                    ),
+                    "download_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/video?download=true"
+                    ),
+                    "manifest_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/manifest"
+                    ),
+                    "request_snapshot": request_snapshot,
+                }
+            )
+            crud.mark_job_succeeded(session, job=job, result_json=current)
+            session.commit()
+        print(
+            f"[worker] real-image job={job_id} SUCCEEDED export={export.id}",
+            flush=True,
+        )
+
+    def _stored_project_path(self, stored_path: str, project_id: str) -> Path:
+        raw = Path(stored_path)
+        candidate = raw.resolve() if raw.is_absolute() else (
+            Path(self.settings.data_dir) / raw
+        ).resolve()
+        project_root = self.settings.project_dir(project_id).resolve()
+        try:
+            candidate.relative_to(project_root)
+        except ValueError as exc:
+            raise ValueError("复用图片路径越过当前项目目录") from exc
+        return candidate
 
     def _generation_service_for(
         self,
@@ -669,6 +1571,12 @@ class Worker:
         from .media import resume_mock_project_short
 
         return resume_mock_project_short
+
+    @staticmethod
+    def _default_real_image_renderer() -> Renderer:
+        from .media import render_image_project_short
+
+        return render_image_project_short
 
     def _relative_project_path(self, path: Path, project_id: str) -> str:
         data_root = Path(self.settings.data_dir).resolve()

@@ -18,12 +18,15 @@ import {
   getJob,
   getProject,
   getProviders,
+  imageAssetUrl,
   listProjects,
+  renderRealImages,
   retryJob,
 } from "./api";
 import type {
   DesiredShotCount,
   DurationNormalization,
+  GeneratedImageShot,
   GenerationAttemptError,
   GenerationErrorDetail,
   GenerationJob,
@@ -40,6 +43,7 @@ const PAPER_CRANE_STORY =
   "深夜，少女在窗边折出一只纸鹤。纸鹤亮起微光，飞过屋顶、灯火与云层；黎明时，它飞向远方，少女在窗边静静注视。";
 const PAPER_CRANE_TITLE = "纸鹤的夜航";
 const LLM_START_COMMAND = ".\\scripts\\run_llm_server.ps1";
+const REAL_IMAGE_PROVIDER_ID = "comfyui-animagine-xl-4";
 const STORY_MIN_CHARS = 10;
 const STORY_MAX_CHARS = 3000;
 const STORY_RECOMMENDED_MIN_CHARS = 50;
@@ -95,6 +99,81 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function isRealImageJob(job: GenerationJob | null | undefined): boolean {
+  if (!job) return false;
+  return (
+    job.job_type === "GENERATE_REAL_IMAGE_VIDEO" ||
+    job.job_type === "RENDER_REAL_IMAGES" ||
+    textValue(job.request_json?.image_provider) === REAL_IMAGE_PROVIDER_ID ||
+    textValue(job.result_json?.image_provider) === REAL_IMAGE_PROVIDER_ID
+  );
+}
+
+function jobImageProvider(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return (
+    textValue(job.result_json?.image_provider) ??
+    textValue(job.request_json?.image_provider) ??
+    (isRealImageJob(job) ? textValue(job.provider_id) : null)
+  );
+}
+
+function jobImageShots(job: GenerationJob | null | undefined): GeneratedImageShot[] {
+  const images = job?.result_json?.image_shots;
+  if (!Array.isArray(images)) return [];
+  return images.filter(
+    (item): item is GeneratedImageShot =>
+      recordValue(item) !== null && typeof item.shot_id === "string" && item.shot_id.length > 0,
+  );
+}
+
+function jobImageCompletedCount(job: GenerationJob | null | undefined): number {
+  if (!job) return 0;
+  return (
+    numberValue(job.result_json?.image_completed_count) ??
+    numberValue(job.result_json?.completed_image_count) ??
+    numberValue(job.result_json?.completed_images) ??
+    jobImageShots(job).filter(
+      (image) => image.status === "SUCCEEDED" || Boolean(textValue(image.image_url)),
+    ).length
+  );
+}
+
+function jobImageTotalCount(job: GenerationJob | null | undefined, fallback = 0): number {
+  if (!job) return fallback;
+  return (
+    numberValue(job.result_json?.image_total_count) ??
+    numberValue(job.result_json?.total_image_count) ??
+    numberValue(job.result_json?.total_images) ??
+    jobActualShotCount(job, fallback) ??
+    fallback
+  );
+}
+
+function jobImageGenerationSeconds(job: GenerationJob | null | undefined): number | null {
+  if (!job) return null;
+  return (
+    numberValue(job.result_json?.image_generation_seconds) ??
+    numberValue(job.result_json?.image_generation_total_seconds) ??
+    numberValue(job.result_json?.generation_seconds_total)
+  );
+}
+
+function jobBaseSeed(job: GenerationJob | null | undefined): number | null {
+  if (!job) return null;
+  return numberValue(job.result_json?.base_seed) ?? numberValue(job.request_json?.base_seed);
+}
+
+function jobSourceScriptId(job: GenerationJob | null | undefined): string | null {
+  if (!job) return null;
+  return (
+    textValue(job.result_json?.script_source_job_id) ??
+    textValue(job.result_json?.source_script_job_id) ??
+    textValue(job.request_json?.source_script_job_id) ??
+    textValue(job.request_json?.reuse_script_from_job_id)
+  );
 }
 
 function stringList(value: unknown): string[] {
@@ -189,6 +268,14 @@ function shotCountLabel(value: DesiredShotCount | undefined): string {
 }
 
 function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): string {
+  if (isRealImageJob(job)) {
+    const completed = jobImageCompletedCount(job);
+    const total = jobImageTotalCount(job, fallbackActual ?? 0);
+    const elapsed = jobImageGenerationSeconds(job);
+    const countText = total > 0 ? `${completed}/${total} 张` : `${completed} 张`;
+    const elapsedText = elapsed === null ? "" : `，图像生成共 ${elapsed.toFixed(1)} 秒`;
+    return `真实动漫关键帧已完成 ${countText}${elapsedText}，并已合成为可播放短片。`;
+  }
   const desired = jobDesiredShotCount(job);
   const actual = jobActualShotCount(job, fallbackActual);
   const plannedDuration = numberValue(job.result_json?.planned_duration_seconds);
@@ -294,11 +381,44 @@ function FailureCard({
     storyCharCount !== null &&
     storyCharCount >= STORY_MIN_CHARS &&
     storyCharCount <= STORY_MAX_CHARS;
+  const imageFailure =
+    stage?.startsWith("IMAGE_") === true ||
+    stage?.startsWith("COMFYUI_") === true ||
+    code === "GPU_HANDOFF_REQUIRED" ||
+    code === "GPU_OOM" ||
+    code === "MODEL_NOT_FOUND" ||
+    code === "MODEL_HASH_MISMATCH";
+  const failedShotId = textValue(detail?.failed_shot_id) ?? textValue(detail?.shot_id);
+  const failedShotIndex =
+    numberValue(detail?.failed_shot_index) ?? numberValue(detail?.shot_index);
+  const completedImages =
+    numberValue(detail?.image_completed_count) ??
+    numberValue(detail?.completed_image_count) ??
+    numberValue(detail?.completed_images);
+  const totalImages =
+    numberValue(detail?.image_total_count) ??
+    numberValue(detail?.total_image_count) ??
+    numberValue(detail?.total_images);
+  const retryable = booleanValue(detail?.retryable);
+  const requiresQwenShutdown =
+    booleanValue(detail?.requires_qwen_shutdown) === true || code === "GPU_HANDOFF_REQUIRED";
+  const oom = booleanValue(detail?.oom) === true || code === "GPU_OOM";
+  const rawLogPaths = detail?.log_paths;
+  const logPathRecord = recordValue(rawLogPaths);
+  const logPaths = [
+    ...stringList(rawLogPaths),
+    ...(logPathRecord
+      ? Object.values(logPathRecord).filter(
+          (item): item is string => typeof item === "string" && item.trim().length > 0,
+        )
+      : []),
+    ...(textValue(detail?.log_path) ? [textValue(detail?.log_path)!] : []),
+  ];
 
   return (
     <div className="failure-box">
       <p className="failure-summary">{summary}</p>
-      {inputLengthValid && stage !== "INPUT_VALIDATION" && (
+      {inputLengthValid && stage !== "INPUT_VALIDATION" && !imageFailure && (
         <p className="failure-context">
           输入故事共 {storyCharCount} 个字符，长度合法；失败发生在
           {stage ? ` ${stage} 阶段` : "模型输出处理阶段"}，不是故事长度拦截。
@@ -313,7 +433,18 @@ function FailureCard({
           <div><dt>输入字符数</dt><dd>{storyCharCount ?? "未报告"}</dd></div>
           <div><dt>Provider</dt><dd>{textValue(detail?.provider_id) ?? "未报告"}</dd></div>
           <div><dt>模型</dt><dd>{textValue(detail?.model_id) ?? "未报告"}</dd></div>
+          {imageFailure && <div><dt>失败镜头</dt><dd>{failedShotIndex !== null ? `第 ${failedShotIndex} 镜` : failedShotId ?? "尚未进入单镜生成"}</dd></div>}
+          {imageFailure && <div><dt>已完成图片</dt><dd>{completedImages === null ? "未报告" : `${completedImages}/${totalImages ?? "?"}`}</dd></div>}
+          {imageFailure && <div><dt>可直接重试</dt><dd>{retryable === null ? "未报告" : retryable ? "可以" : "不建议"}</dd></div>}
+          {imageFailure && <div><dt>需要停止 Qwen</dt><dd>{requiresQwenShutdown ? "是" : "否"}</dd></div>}
+          {imageFailure && <div><dt>发生显存不足</dt><dd>{oom ? "是" : "否"}</dd></div>}
         </dl>
+        {logPaths.length > 0 && (
+          <div className="attempt-errors">
+            <strong>日志路径</strong>
+            <ul>{logPaths.map((item, index) => <li key={index}><code>{item}</code></li>)}</ul>
+          </div>
+        )}
         {firstErrors.length > 0 && (
           <div className="attempt-errors">
             <strong>首次输出</strong>
@@ -337,12 +468,20 @@ function FailureCard({
           {suggestions.length > 0 ? (
             <ul>{suggestions.map((item, index) => <li key={index}>{item}</li>)}</ul>
           ) : (
-            <p>可手动重试；若重复失败，请查看后端保存的校验报告。</p>
+            <p>
+              {imageFailure
+                ? "可在排除显存、模型或 ComfyUI 问题后重试；已完成且校验通过的图片会被复用。"
+                : "可手动重试；若重复失败，请查看后端保存的校验报告。"}
+            </p>
           )}
         </div>
       </details>
-      <button className="button button-danger" onClick={onRetry} disabled={retrying}>
-        {retrying ? "正在创建重试任务…" : "手动重试"}
+      <button
+        className="button button-danger"
+        onClick={onRetry}
+        disabled={retrying || retryable === false}
+      >
+        {retrying ? "正在创建重试任务…" : retryable === false ? "当前不可直接重试" : "手动重试"}
       </button>
     </div>
   );
@@ -397,6 +536,7 @@ function JobPanel({
   onRetry,
   onViewResult,
   configuredModelId,
+  configuredImageModelId,
   actualShotCount,
 }: {
   job: GenerationJob;
@@ -404,8 +544,10 @@ function JobPanel({
   onRetry: () => void;
   onViewResult: () => void;
   configuredModelId?: string | null;
+  configuredImageModelId?: string | null;
   actualShotCount?: number;
 }) {
+  const imageJob = isRealImageJob(job);
   const progress = Math.max(0, Math.min(100, Math.round(job.progress ?? 0)));
   const tracedModelId = jobModelId(job);
   const modelLabel =
@@ -438,11 +580,22 @@ function JobPanel({
   const durationDelta = numberValue(job.result_json?.duration_delta_seconds);
   const durationTolerance = numberValue(job.result_json?.duration_tolerance_seconds);
   const mediaDurationValidation = textValue(job.result_json?.duration_validation);
+  const imageCompleted = jobImageCompletedCount(job);
+  const imageTotal = jobImageTotalCount(job, actualShotCount ?? 0);
+  const imageElapsed = jobImageGenerationSeconds(job);
+  const baseSeed = jobBaseSeed(job);
+  const currentShotIndex = numberValue(job.result_json?.current_shot_index);
+  const currentShotId = textValue(job.result_json?.current_shot_id);
+  const imageModelLabel =
+    textValue(job.result_json?.image_model_id) ??
+    configuredImageModelId ??
+    "任务尚未报告";
+  const jobStage = textValue(job.result_json?.stage);
   return (
     <section className={`job-panel job-${job.status.toLowerCase()}`} aria-live="polite">
       <div className="job-heading">
         <div>
-          <span className="eyebrow">生成任务</span>
+          <span className="eyebrow">{imageJob ? "真实图像与成片任务" : "生成任务"}</span>
           <h3>{statusLabels[job.status] ?? job.status}</h3>
         </div>
         <span className="job-percent">{progress}%</span>
@@ -457,30 +610,51 @@ function JobPanel({
         <span style={{ width: `${progress}%` }} />
       </div>
       <p className="job-meta">
-        任务 {job.id.slice(0, 8)} · 剧本 Provider：{jobScriptProvider(job) ?? "未报告"}
-        {` · 模型：${modelLabel}`}
+        任务 {job.id.slice(0, 8)} ·
+        {imageJob
+          ? ` 图像 Provider：${jobImageProvider(job) ?? "未报告"} · 模型：${imageModelLabel}`
+          : ` 剧本 Provider：${jobScriptProvider(job) ?? "未报告"} · 模型：${modelLabel}`}
       </p>
       <dl className="job-facts">
-        <div><dt>本次镜头要求</dt><dd>{shotCountLabel(desired)}</dd></div>
-        <div><dt>最终实际镜头</dt><dd>{finalShotCount === null ? "生成后报告" : `${finalShotCount} 个`}</dd></div>
-        <div><dt>故事字符数</dt><dd>{storyCharCount ?? "未报告"}</dd></div>
-        <div>
-          <dt>LLM 修复</dt>
-          <dd>{repairUsed === null ? "未报告" : repairUsed ? "已使用唯一一次修复" : "未使用"}</dd>
-        </div>
-        <div>
-          <dt>时长归一化</dt>
-          <dd>
-            {normalization
-              ? normalizationApplied
-                ? "已执行"
-                : "未执行"
-              : "未报告"}
-          </dd>
-        </div>
+        {imageJob ? (
+          <>
+            <div><dt>图像进度</dt><dd>{imageCompleted}/{imageTotal || "?"} 张</dd></div>
+            <div><dt>当前阶段</dt><dd>{jobStage ?? (job.status === "QUEUED" ? "等待 Worker" : "图像生成")}</dd></div>
+            <div><dt>当前镜头</dt><dd>{currentShotIndex !== null ? `第 ${currentShotIndex} 镜` : currentShotId ?? "未报告"}</dd></div>
+            <div><dt>图像总耗时</dt><dd>{imageElapsed === null ? "生成后报告" : `${imageElapsed.toFixed(1)} 秒`}</dd></div>
+            <div><dt>Base seed</dt><dd>{baseSeed ?? "未报告"}</dd></div>
+            <div><dt>剧本来源 Job</dt><dd title={jobSourceScriptId(job) ?? undefined}>{jobSourceScriptId(job)?.slice(0, 8) ?? "未报告"}</dd></div>
+            <div><dt>并发</dt><dd>1（顺序生成）</dd></div>
+          </>
+        ) : (
+          <>
+            <div><dt>本次镜头要求</dt><dd>{shotCountLabel(desired)}</dd></div>
+            <div><dt>最终实际镜头</dt><dd>{finalShotCount === null ? "生成后报告" : `${finalShotCount} 个`}</dd></div>
+            <div><dt>故事字符数</dt><dd>{storyCharCount ?? "未报告"}</dd></div>
+            <div>
+              <dt>LLM 修复</dt>
+              <dd>{repairUsed === null ? "未报告" : repairUsed ? "已使用唯一一次修复" : "未使用"}</dd>
+            </div>
+            <div>
+              <dt>时长归一化</dt>
+              <dd>
+                {normalization
+                  ? normalizationApplied
+                    ? "已执行"
+                    : "未执行"
+                  : "未报告"}
+              </dd>
+            </div>
+          </>
+        )}
         <div><dt>计划时长</dt><dd>{plannedDuration === null ? "未报告" : `${plannedDuration.toFixed(3)} 秒`}</dd></div>
         <div><dt>编码时长</dt><dd>{encodedDuration === null ? "未报告" : `${encodedDuration.toFixed(3)} 秒`}</dd></div>
       </dl>
+      {imageJob && (job.status === "RUNNING" || imageCompleted > 0) && (
+        <p className="job-hint image-progress-copy">
+          已完成 {imageCompleted}/{imageTotal || "?"} 张真实关键帧；同一任务内 ComfyUI 仅启动一次并顺序生成。
+        </p>
+      )}
       {mediaDurationValidation === "passed_with_media_tolerance" &&
         plannedDuration !== null && encodedDuration !== null &&
         durationDelta !== null && durationTolerance !== null && (
@@ -490,7 +664,7 @@ function JobPanel({
             在 ±{durationTolerance.toFixed(3)} 秒容差内，验收通过。
           </p>
         )}
-      {normalizationApplied && (
+      {!imageJob && normalizationApplied && (
         <div className="normalization-note" role="status">
           <strong>已进行确定性时长归一化。</strong>
           {textValue(normalization?.reason) && <span>原因：{textValue(normalization?.reason)}</span>}
@@ -508,7 +682,7 @@ function JobPanel({
           )}
         </div>
       )}
-      {(warnings.unusedSceneIds.length > 0 || warnings.unusedCharacterIds.length > 0) && (
+      {!imageJob && (warnings.unusedSceneIds.length > 0 || warnings.unusedCharacterIds.length > 0) && (
         <p className="job-warning">
           非阻断警告：
           {warnings.unusedSceneIds.length > 0 && `${warnings.unusedSceneIds.length} 个未使用场景`}
@@ -518,7 +692,11 @@ function JobPanel({
         </p>
       )}
       {job.status === "QUEUED" && (
-        <p className="job-hint">任务已入队。请确认独立 Worker 正在运行。</p>
+        <p className="job-hint">
+          {imageJob
+            ? "真实图像任务已入队。开始前请确保本地 Qwen 已停止并释放显存。"
+            : "任务已入队。请确认独立 Worker 正在运行。"}
+        </p>
       )}
       {job.status === "FAILED" && (
         <FailureCard
@@ -718,6 +896,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [generationRequestError, setGenerationRequestError] =
     useState<GenerationErrorDetail | null>(null);
+  const [imageRequestError, setImageRequestError] =
+    useState<GenerationErrorDetail | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [deleteCandidate, setDeleteCandidate] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -824,6 +1004,7 @@ export default function App() {
     setActiveJob(null);
     setError("");
     setGenerationRequestError(null);
+    setImageRequestError(null);
     refreshDetail(selectedId).catch((cause: unknown) => setError(readableError(cause)));
   }, [refreshDetail, selectedId]);
 
@@ -997,6 +1178,7 @@ export default function App() {
     setBusy("generate");
     setError("");
     setGenerationRequestError(null);
+    setImageRequestError(null);
     setNotice(null);
     try {
       if (scriptProvider === "llamacpp") {
@@ -1045,6 +1227,34 @@ export default function App() {
     }
   };
 
+  const startRealImageGeneration = async () => {
+    if (!selectedId || !scriptJob) return;
+    setBusy("real-image");
+    setError("");
+    setGenerationRequestError(null);
+    setImageRequestError(null);
+    setNotice(null);
+    try {
+      const job = await renderRealImages(selectedId, scriptJob.id);
+      setActiveJob({ ...job, project_id: job.project_id || selectedId });
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      if (cause instanceof ApiError) {
+        const structured = generationErrorValue(cause.detail);
+        if (structured) {
+          setImageRequestError(structured);
+          setError("");
+        } else {
+          setError(cause.message);
+        }
+      } else {
+        setError(readableError(cause));
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const selectedProject = detail?.project ?? projects.find((item) => item.id === selectedId) ?? null;
   const formStoryCharCount = characterCount(story);
   const formStoryLengthValid =
@@ -1061,12 +1271,19 @@ export default function App() {
   const generationInProgress =
     activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING";
   const providerDescriptors = providersStatus?.providers ?? [];
+  const imageProviderDescriptors = providersStatus?.image_providers ?? [];
   const selectedProviderDescriptor = providerDescriptors.find(
     (provider) => provider.provider_id === scriptProvider,
   );
   const llamaAvailable = providerDescriptors.some(
     (provider) => provider.provider_id === "llamacpp" && provider.available,
   ) && !providerError;
+  const realImageProviderDescriptor = imageProviderDescriptors.find(
+    (provider) => provider.provider_id === REAL_IMAGE_PROVIDER_ID,
+  );
+  const realImageProviderConfigured = realImageProviderDescriptor?.configured !== false;
+  const gpuHandoffRequired =
+    llamaAvailable || realImageProviderDescriptor?.requires_gpu_handoff === true;
   const structuredScript = detail?.project.script_json ?? null;
   const scriptCharacters = Array.isArray(structuredScript?.characters)
     ? structuredScript.characters
@@ -1097,12 +1314,22 @@ export default function App() {
   const exportJob = detail?.latest_export
     ? detail.recent_jobs.find((job) => job.id === detail.latest_export?.job_id) ?? null
     : null;
+  const referencedScriptJobId =
+    jobSourceScriptId(latestVisibleJob) ?? jobSourceScriptId(exportJob);
+  const referencedScriptJob = referencedScriptJobId
+    ? detail?.recent_jobs.find((job) => job.id === referencedScriptJobId) ?? null
+    : null;
   const scriptJob =
+    (referencedScriptJob?.status === "SUCCEEDED" ? referencedScriptJob : null) ??
     detail?.recent_jobs.find(
-      (job) => recordValue(job.result_json?.script_trace) !== null,
-    ) ?? null;
+      (job) =>
+        job.status === "SUCCEEDED" &&
+        !isRealImageJob(job) &&
+        recordValue(job.result_json?.script_trace) !== null,
+    ) ??
+    null;
   const scriptProviderUsed = jobScriptProvider(exportJob) ?? "未报告";
-  const scriptModelUsed = jobModelId(exportJob) ?? "未报告";
+  const scriptModelUsed = jobModelId(exportJob) ?? jobModelId(scriptJob) ?? "未报告";
   const scriptSourceUsed = textValue(exportJob?.result_json?.script_source_type) ?? "未报告";
   const imageProviderUsed = textValue(exportJob?.result_json?.image_provider) ?? "未报告";
   const audioProviderUsed = textValue(exportJob?.result_json?.audio_provider) ?? "未报告";
@@ -1114,6 +1341,17 @@ export default function App() {
   const exportActualShotCount = jobActualShotCount(exportJob, scriptShots.length);
   const exportRepairUsed = jobRepairUsed(exportJob);
   const exportDurationNormalization = jobDurationNormalization(exportJob);
+  const exportIsRealImage =
+    exportJob?.status === "SUCCEEDED" && imageProviderUsed === REAL_IMAGE_PROVIDER_ID;
+  const imageDisplayJob =
+    (isRealImageJob(latestVisibleJob) ? latestVisibleJob : null) ??
+    (isRealImageJob(exportJob) ? exportJob : null) ??
+    detail?.recent_jobs.find((job) => isRealImageJob(job)) ??
+    null;
+  const generatedImageShots = jobImageShots(imageDisplayJob);
+  const imageGenerationInProgress =
+    isRealImageJob(activeJob) &&
+    (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
   const scriptWarnings = jobValidationWarnings(exportJob ?? scriptJob ?? latestVisibleJob);
   const currentJobProviderId = jobScriptProvider(latestVisibleJob);
   const currentJobProviderDescriptor = providerDescriptors.find(
@@ -1157,16 +1395,16 @@ export default function App() {
           </a>
           <div className={`health-pill ${healthError ? "is-offline" : ""}`}>
             <span className="health-dot" />
-            {healthError ? "后端未连接" : `M3 · ${displayHealth(health)}`}
+            {healthError ? "后端未连接" : `${textValue(health?.stage) ?? "M4-B"} · ${displayHealth(health)}`}
           </div>
         </nav>
 
         <div className="hero-copy" id="top">
-          <p className="kicker">SCRIPT PROVIDER × FFMPEG</p>
+          <p className="kicker">SCRIPT PROVIDER × IMAGE PROVIDER × FFMPEG</p>
           <h1>把一个故事，折成一段<br />真正可播放的短片。</h1>
           <p>
-            剧本可选择 Mock 离线保底或本地 Qwen；图像与音频仍使用 Mock，视频由
-            FFmpeg 确定性兜底生成，Worker 在 HTTP 请求之外完成渲染。
+            剧本可选择 Mock 离线保底或本地 Qwen；图像可显式选择 Mock，或在释放
+            Qwen 显存后使用本地 Animagine。音频仍为 Mock，FFmpeg 负责运镜、字幕与成片。
           </p>
           <a className="text-link" href="#workspace">开始创建 <span>↓</span></a>
         </div>
@@ -1285,9 +1523,10 @@ export default function App() {
               <p className="eyebrow">本次生成路径</p>
               <ol>
                 <li><span>1</span>所选剧本 Provider 生成 3—5 个镜头</li>
-                <li><span>2</span>Worker 领取 SQLite 任务</li>
-                <li><span>3</span>FFmpeg 合成画面、字幕与音频</li>
-                <li><span>4</span>浏览器播放并下载 MP4</li>
+                <li><span>2</span>保存并复用严格 ScriptV1</li>
+                <li><span>3</span>选择 Mock 或真实动漫关键帧</li>
+                <li><span>4</span>FFmpeg 合成运动、字幕与音频</li>
+                <li><span>5</span>浏览器播放并下载 MP4</li>
               </ol>
               <p className="offline-note">Mock 保底无需网络、API Key 或模型权重</p>
             </aside>
@@ -1330,6 +1569,7 @@ export default function App() {
                           setDeleteCandidate(null);
                           setSelectedId(project.id);
                           setActiveJob(null);
+                          setImageRequestError(null);
                         }}
                       >
                         <span className="project-index">{project.title.slice(0, 1)}</span>
@@ -1431,6 +1671,7 @@ export default function App() {
                       setScriptProvider(providerId);
                       setError("");
                       setGenerationRequestError(null);
+                      setImageRequestError(null);
                       setNotice(null);
                     }}
                     onRefresh={() => void refreshProviderStatus()}
@@ -1445,6 +1686,7 @@ export default function App() {
                           const value = event.target.value;
                           setDesiredShotCount(value === "auto" ? null : Number(value) as 3 | 4 | 5);
                           setGenerationRequestError(null);
+                          setImageRequestError(null);
                           setError("");
                         }}
                       >
@@ -1496,6 +1738,7 @@ export default function App() {
                       onRetry={() => retryGeneration(latestVisibleJob)}
                       onViewResult={() => scrollToSection("result")}
                       configuredModelId={currentJobProviderDescriptor?.model_id}
+                      configuredImageModelId={realImageProviderDescriptor?.model_id}
                       actualShotCount={
                         latestVisibleJob.status === "SUCCEEDED" ? scriptShots.length : undefined
                       }
@@ -1599,38 +1842,171 @@ export default function App() {
               </div>
             </div>
 
+            <section className="real-image-control" aria-labelledby="real-image-title">
+              <div className="real-image-heading">
+                <div>
+                  <p className="eyebrow">M4-B · IMAGE PROVIDER</p>
+                  <h3 id="real-image-title">使用当前剧本生成真实动漫画面</h3>
+                </div>
+                <span className={`visual-source-badge ${exportIsRealImage ? "is-real" : "is-mock"}`}>
+                  当前成片：{exportIsRealImage ? "真实动漫视觉" : "Mock 视觉"}
+                </span>
+              </div>
+              <div className="real-image-provider-line">
+                <strong>
+                  当前 Image Provider：
+                  {realImageProviderDescriptor?.display_name ?? "Animagine XL 4.0（ComfyUI）"}
+                </strong>
+                <span>Provider ID：{REAL_IMAGE_PROVIDER_ID}</span>
+                <span>模型：{realImageProviderDescriptor?.model_id ?? "animagine-xl-4.0-opt.safetensors"}</span>
+                <span>
+                  状态：
+                  {realImageProviderDescriptor
+                    ? realImageProviderDescriptor.available
+                      ? "可启动"
+                      : realImageProviderDescriptor.configured
+                        ? "等待 GPU 交接"
+                        : "配置不完整"
+                    : "等待后端报告"}
+                </span>
+                {realImageProviderDescriptor?.detail && (
+                  <span className="image-provider-detail">{realImageProviderDescriptor.detail}</span>
+                )}
+              </div>
+              <div className={`gpu-handoff-notice ${gpuHandoffRequired ? "needs-action" : "is-ready"}`} role="status">
+                <strong>8GB 显存互斥</strong>
+                <span>
+                  {gpuHandoffRequired
+                    ? "检测到本地 Qwen 在线。请先自行停止 Qwen、释放 8081 和显存，再重新检查；平台不会结束外部进程。"
+                    : "开始真实图像生成前仍会由后端复查 8081 与 llama-server；ComfyUI 与 Qwen 不会同时驻留 GPU。"}
+                </span>
+              </div>
+              <dl className="real-image-facts">
+                <div><dt>剧本来源</dt><dd>{scriptJob ? `Job ${scriptJob.id.slice(0, 8)}` : "没有可复用的成功 Job"}</dd></div>
+                <div><dt>运行方式</dt><dd>lowvram · 单并发 · 顺序生成</dd></div>
+                <div><dt>可复现</dt><dd>{jobBaseSeed(imageDisplayJob) ?? "提交后记录 base seed"}</dd></div>
+                <div><dt>图片进度</dt><dd>{imageDisplayJob ? `${jobImageCompletedCount(imageDisplayJob)}/${jobImageTotalCount(imageDisplayJob, scriptShots.length)}` : `0/${scriptShots.length}`}</dd></div>
+              </dl>
+              {!realImageProviderConfigured && (
+                <p className="provider-warning">真实图像 Provider 尚未配置完整，请检查模型文件和独立 ComfyUI 环境。</p>
+              )}
+              <div className="real-image-actions">
+                <button
+                  className="button button-primary"
+                  type="button"
+                  onClick={() => void startRealImageGeneration()}
+                  disabled={
+                    busy !== null ||
+                    generationInProgress ||
+                    !scriptJob ||
+                    gpuHandoffRequired ||
+                    !realImageProviderConfigured
+                  }
+                >
+                  {busy === "real-image"
+                    ? "正在提交真实图像任务…"
+                    : imageGenerationInProgress
+                      ? `正在生成 ${jobImageCompletedCount(activeJob)}/${jobImageTotalCount(activeJob, scriptShots.length)}`
+                      : gpuHandoffRequired
+                        ? "请先停止本地 Qwen"
+                        : "使用当前剧本生成真实动漫画面"}
+                </button>
+                <button
+                  className="button button-ghost"
+                  type="button"
+                  disabled={providerChecking || busy !== null}
+                  onClick={() => void refreshProviderStatus()}
+                >
+                  {providerChecking ? "正在检查…" : "重新检查 Provider"}
+                </button>
+              </div>
+              {imageRequestError && (
+                <FailureCard
+                  detail={imageRequestError}
+                  retrying={busy === "real-image"}
+                  onRetry={() => void startRealImageGeneration()}
+                />
+              )}
+            </section>
+
             <div className="shot-grid">
               {[...scriptShots]
                 .sort((left, right) => shotNumber(left, 0) - shotNumber(right, 0))
-                .map((shot, index) => (
-                  <article
-                    className="shot-card"
-                    key={shot.id ?? shot.shot_id ?? `${shot.title}-${index}`}
-                  >
-                    <div className="shot-art" data-shot={(index % 4) + 1}>
-                      <span>{String(shotNumber(shot, index + 1)).padStart(2, "0")}</span>
-                      <i />
-                    </div>
-                    <div className="shot-copy">
-                      <p className="eyebrow">
-                        {shot.duration_seconds}s · {shot.provider_id ?? jobScriptProvider(scriptJob) ?? "未报告"}
-                      </p>
-                      <h3>{shot.title}</h3>
-                      <p>{shot.visual_description}</p>
-                      <blockquote>“{shot.narration}”</blockquote>
-                      <dl className="shot-details">
-                        <div>
-                          <dt>Camera</dt>
-                          <dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd>
+                .map((shot, index) => {
+                  const sequence = shotNumber(shot, index + 1);
+                  const sourceShotId = shot.shot_id ?? shot.id;
+                  const generatedImage = generatedImageShots.find(
+                    (image) =>
+                      (sourceShotId && image.shot_id === sourceShotId) ||
+                      numberValue(image.shot_index) === sequence,
+                  );
+                  const thumbnailUrl = imageAssetUrl(textValue(generatedImage?.image_url) ?? undefined);
+                  const imageStatus =
+                    textValue(generatedImage?.status) ?? (thumbnailUrl ? "SUCCEEDED" : "PENDING");
+                  const hasRealImage =
+                    Boolean(thumbnailUrl) &&
+                    (generatedImage?.provider_id === REAL_IMAGE_PROVIDER_ID || isRealImageJob(imageDisplayJob));
+                  const imageStatusLabel =
+                    imageStatus === "RUNNING"
+                      ? "正在生成"
+                      : imageStatus === "FAILED"
+                        ? "生成失败"
+                        : imageStatus === "REUSED"
+                          ? "已校验复用"
+                        : imageStatus === "SUCCEEDED"
+                          ? "已生成"
+                          : "等待生成";
+                  const displayedImageStatus = isRealImageJob(imageDisplayJob)
+                    ? imageStatusLabel
+                    : "Mock 已准备";
+                  return (
+                    <article
+                      className={`shot-card ${hasRealImage ? "has-real-image" : ""}`}
+                      key={shot.id ?? shot.shot_id ?? `${shot.title}-${index}`}
+                    >
+                      <div className="shot-art" data-shot={(index % 4) + 1}>
+                        {hasRealImage && thumbnailUrl ? (
+                          <img src={thumbnailUrl} alt={`第 ${sequence} 镜真实动漫关键帧：${shot.title}`} loading="lazy" />
+                        ) : (
+                          <i />
+                        )}
+                        <span className="shot-number">{String(sequence).padStart(2, "0")}</span>
+                        <small className={`shot-image-status status-${imageStatus.toLowerCase()}`}>
+                          {hasRealImage ? "真实模型" : isRealImageJob(imageDisplayJob) ? imageStatusLabel : "Mock 视觉"}
+                        </small>
+                      </div>
+                      <div className="shot-copy">
+                        <div className="shot-provider-row">
+                          <p className="eyebrow">{shot.duration_seconds}s · 图像 {displayedImageStatus}</p>
+                          <span className={`visual-source-badge ${hasRealImage ? "is-real" : "is-mock"}`}>
+                            {hasRealImage ? "Animagine XL 4.0" : isRealImageJob(imageDisplayJob) ? "等待真实图片" : "Mock 视觉"}
+                          </span>
                         </div>
-                        <div>
-                          <dt>Image prompt</dt>
-                          <dd>{shot.image_prompt ?? "未提供"}</dd>
-                        </div>
-                      </dl>
-                    </div>
-                  </article>
-                ))}
+                        <h3>{shot.title}</h3>
+                        <p>{shot.visual_description}</p>
+                        <blockquote>“{shot.narration}”</blockquote>
+                        <dl className="shot-details">
+                          <div>
+                            <dt>Camera</dt>
+                            <dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd>
+                          </div>
+                          <div>
+                            <dt>Image prompt</dt>
+                            <dd>{shot.image_prompt ?? "未提供"}</dd>
+                          </div>
+                          {generatedImage && (
+                            <div>
+                              <dt>真实图片追溯</dt>
+                              <dd>
+                                seed {numberValue(generatedImage.seed) ?? "未报告"} · {numberValue(generatedImage.generation_seconds)?.toFixed(1) ?? "—"} 秒
+                              </dd>
+                            </div>
+                          )}
+                        </dl>
+                      </div>
+                    </article>
+                  );
+                })}
             </div>
             <div
               className={`shot-next-step next-${latestVisibleJob?.status?.toLowerCase() ?? "ready"}`}
@@ -1670,11 +2046,21 @@ export default function App() {
               <span className="section-number">04</span>
               <div>
                 <p className="eyebrow">播放与下载</p>
-                <h2 ref={resultTitleRef} tabIndex={-1}>最终成片</h2>
+                <h2 ref={resultTitleRef} tabIndex={-1}>
+                  {exportIsRealImage ? "真实动漫成片" : "Mock 视觉成片"}
+                </h2>
               </div>
             </div>
+            {imageGenerationInProgress && !exportIsRealImage && (
+              <p className="previous-export-notice">
+                下方仍是上一版 Mock 视觉成片；新的真实动漫画面尚未完成，不会提前标记为真实模型输出。
+              </p>
+            )}
             <div className="result-status-summary" aria-label="成片状态">
               <span className="result-ready">● 已生成</span>
+              <span className={`result-provider-badge ${exportIsRealImage ? "is-real" : "is-mock"}`}>
+                {exportIsRealImage ? "真实模型 · Animagine XL 4.0" : "Mock 视觉"}
+              </span>
               <span>{detail.latest_export.duration_seconds?.toFixed(2) ?? "—"} 秒</span>
               <span>{scriptShots.length} 个镜头</span>
               <span>要求：{shotCountLabel(exportDesiredShotCount)}</span>
@@ -1691,6 +2077,11 @@ export default function App() {
                   : "未报告"}
               </span>
               <span>剧本：{scriptProviderUsed}</span>
+              {exportIsRealImage && (
+                <span>
+                  图像耗时：{jobImageGenerationSeconds(exportJob)?.toFixed(1) ?? "未报告"} 秒
+                </span>
+              )}
             </div>
             <div className="result-grid">
               <div className="video-frame">
@@ -1708,6 +2099,9 @@ export default function App() {
                   <div><dt>Script Model</dt><dd title={scriptModelUsed}>{scriptModelUsed}</dd></div>
                   <div><dt>Script Source</dt><dd title={scriptSourceUsed}>{scriptSourceUsed}</dd></div>
                   <div><dt>Image Provider</dt><dd title={imageProviderUsed}>{imageProviderUsed}</dd></div>
+                  <div><dt>视觉来源</dt><dd>{exportIsRealImage ? "真实本地模型" : "Mock 确定性保底"}</dd></div>
+                  {exportIsRealImage && <div><dt>Base seed</dt><dd>{jobBaseSeed(exportJob) ?? "未报告"}</dd></div>}
+                  {exportIsRealImage && <div><dt>真实关键帧</dt><dd>{jobImageCompletedCount(exportJob)}/{jobImageTotalCount(exportJob, scriptShots.length)} 张</dd></div>}
                   <div><dt>Audio Provider</dt><dd title={audioProviderUsed}>{audioProviderUsed}</dd></div>
                   <div><dt>Video</dt><dd title={videoSourceUsed}>{videoSourceUsed}</dd></div>
                   <div>
@@ -1732,7 +2126,12 @@ export default function App() {
       {latestVisibleJob && (
         <aside className={`task-shortcut shortcut-${latestVisibleJob.status.toLowerCase()}`} aria-live="polite">
           {latestVisibleJob.status === "QUEUED" || latestVisibleJob.status === "RUNNING" ? (
-            <span>正在生成短片 · {Math.max(0, Math.min(100, Math.round(latestVisibleJob.progress)))}%</span>
+            <span>
+              {isRealImageJob(latestVisibleJob)
+                ? `正在生成真实图片 ${jobImageCompletedCount(latestVisibleJob)}/${jobImageTotalCount(latestVisibleJob, scriptShots.length)}`
+                : "正在生成短片"}
+              {` · ${Math.max(0, Math.min(100, Math.round(latestVisibleJob.progress)))}%`}
+            </span>
           ) : latestVisibleJob.status === "SUCCEEDED" && media ? (
             <>
               <span>短片已生成</span>
@@ -1748,8 +2147,8 @@ export default function App() {
       )}
 
       <footer>
-        <span>纸鹤工坊 · M3 本地文本模型纵向链路</span>
-        <span>Mock 可离线运行，本地 Qwen 显式选择</span>
+        <span>纸鹤工坊 · M4-B 真实动漫关键帧纵向链路</span>
+        <span>Mock 始终可辨识；Qwen 与 ComfyUI 在 8GB 显存下分阶段运行</span>
       </footer>
     </div>
   );
