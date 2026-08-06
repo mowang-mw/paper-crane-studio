@@ -699,6 +699,33 @@ function shotNumber(shot: PresentedShot, fallback: number): number {
   return shot.index ?? shot.shot_index ?? shot.sequence_no ?? fallback;
 }
 
+function audioAssetUrl(value: unknown): string | null {
+  return typeof value === "string" ? imageAssetUrl(value) : null;
+}
+
+function ShotImage({ src, sequence, title }: { src: string; sequence: number; title: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <div className="media-load-error" role="status">
+        <strong>图片加载失败</strong>
+        <span>请检查后端媒体服务后重试。</span>
+        <a href={src} target="_blank" rel="noreferrer">打开原始地址</a>
+      </div>
+    );
+  }
+  return (
+    <a className="shot-image-link" href={src} target="_blank" rel="noreferrer" aria-label={`在新窗口查看第 ${sequence} 镜大图`}>
+      <img
+        src={src}
+        alt={`第 ${sequence} 镜真实动漫关键帧：${title}`}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    </a>
+  );
+}
+
 function JobPanel({
   job,
   retrying,
@@ -1063,15 +1090,16 @@ function StageNavigation({
   onNavigate: (section: SectionName) => void;
 }) {
   const stages: Array<{ key: SectionName; number: string; label: string }> = [
-    { key: "create", number: "01", label: "创建项目" },
-    { key: "project", number: "02", label: "生成任务" },
-    { key: "shots", number: "03", label: "查看镜头" },
-    { key: "result", number: "04", label: "播放与下载成片" },
+    { key: "create", number: "01", label: "项目与故事" },
+    { key: "project", number: "02", label: "AI 剧本" },
+    { key: "shots", number: "03", label: "动漫画面" },
+    { key: "result", number: "04", label: "配音与成片" },
   ];
   return (
     <nav className="stage-navigation" aria-label="制作流程">
       {stages.map((stage) => {
         const state = current === stage.key ? "current" : completed[stage.key] ? "done" : "pending";
+        const stateLabel = state === "current" ? "当前" : state === "done" ? "已完成" : available[stage.key] ? "可以开始" : "未开始";
         return (
           <button
             key={stage.key}
@@ -1082,7 +1110,7 @@ function StageNavigation({
             onClick={() => onNavigate(stage.key)}
           >
             <span className="stage-marker">{completed[stage.key] ? "✓" : stage.number}</span>
-            <span>{stage.label}</span>
+            <span className="stage-copy"><strong>{stage.label}</strong><small>{stateLabel}</small></span>
           </button>
         );
       })}
@@ -1690,20 +1718,38 @@ export default function App() {
               <small>Paper Crane Studio</small>
             </span>
           </a>
-          <div className={`health-pill ${healthError ? "is-offline" : ""}`}>
-            <span className="health-dot" />
-            {healthError ? "后端未连接" : `${textValue(health?.stage) ?? "M4-B"} · ${displayHealth(health)}`}
+          <div className="topbar-status">
+            <a className="model-status-link" href="#project-section">
+              模型状态
+              <span>{providerChecking ? "检查中" : providerError ? "需检查" : "查看"}</span>
+            </a>
+            <div className={`health-pill ${healthError ? "is-offline" : ""}`}>
+              <span className="health-dot" />
+              {healthError ? "后端未连接" : `${textValue(health?.stage) ?? "M6"} · ${displayHealth(health)}`}
+            </div>
           </div>
         </nav>
 
         <div className="hero-copy" id="top">
-          <p className="kicker">SCRIPT PROVIDER × IMAGE PROVIDER × FFMPEG</p>
-          <h1>把一个故事，折成一段<br />真正可播放的短片。</h1>
+          <div className="hero-heading-row">
+            <div>
+              <p className="kicker">AI ANIMATION WORKBENCH · M6 DEMO</p>
+              <h1>纸鹤工坊</h1>
+              <p className="hero-subtitle">把故事变成可审阅、可追溯、可播放的动漫短片。</p>
+            </div>
+            <div className="hero-project-context" aria-label="当前项目">
+              <span className="context-label">当前项目</span>
+              <strong>{selectedProject?.title ?? "尚未选择项目"}</strong>
+              <span>{selectedProject ? `${scriptShots.length || "—"} 个镜头 · ${currentStage === "result" ? "成片已就绪" : "制作进行中"}` : "从一个故事开始"}</span>
+            </div>
+          </div>
           <p>
-            剧本可选择 Mock 离线保底或本地 Qwen；图像可显式选择 Mock，或在释放
-            Qwen 显存后使用本地 Animagine。音频仍为 Mock，FFmpeg 负责运镜、字幕与成片。
+            一条清晰的制作链路：Qwen 生成结构化剧本，Animagine 生成关键帧，Qwen3-TTS 生成旁白，FFmpeg 完成运镜、字幕与 MP4 合成。
           </p>
-          <a className="text-link" href="#workspace">开始创建 <span>↓</span></a>
+          <div className="hero-actions">
+            <a className="button button-primary" href="#workspace">开始创建 <span aria-hidden="true">↓</span></a>
+            <span className="chain-summary" aria-label="模型链路"><b>Qwen</b><i>→</i><b>Animagine</b><i>→</i><b>Qwen3-TTS</b><i>→</i><b>FFmpeg</b></span>
+          </div>
         </div>
         <div className="hero-orbit" aria-hidden="true">
           <span className="crane">⌁</span>
@@ -2417,7 +2463,7 @@ export default function App() {
                     >
                       <div className="shot-art" data-shot={(index % 4) + 1}>
                         {hasRealImage && thumbnailUrl ? (
-                          <img src={thumbnailUrl} alt={`第 ${sequence} 镜真实动漫关键帧：${shot.title}`} loading="lazy" />
+                          <ShotImage src={thumbnailUrl} sequence={sequence} title={shot.title} />
                         ) : (
                           <i />
                         )}
@@ -2446,6 +2492,15 @@ export default function App() {
                             </span>
                           )}
                         </div>
+                        {(() => {
+                          const playableAudioUrl = audioAssetUrl(generatedAudio?.audio_url);
+                          return playableAudioUrl ? (
+                            <div className="shot-audio-player">
+                              <span>逐镜头试听</span>
+                              <audio controls preload="none" src={playableAudioUrl} aria-label={`第 ${sequence} 镜旁白试听`} />
+                            </div>
+                          ) : null;
+                        })()}
                         <dl className="shot-details">
                           <div>
                             <dt>Camera</dt>
