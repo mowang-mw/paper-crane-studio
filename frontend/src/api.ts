@@ -2,12 +2,14 @@ import type {
   AudioProviderId,
   AudioProviderStatus,
   AudioSpeaker,
+  BackgroundAudioAsset,
   DesiredShotCount,
   ExportRecord,
   GenerationJob,
   HealthStatus,
   ImageProviderId,
   ImageProviderStatus,
+  MediaPolishOptions,
   Project,
   ProjectDetail,
   ProvidersStatus,
@@ -57,7 +59,7 @@ function errorMessage(value: unknown, fallback: string): string {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Accept", "application/json");
-  if (init?.body) headers.set("Content-Type", "application/json");
+  if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers,
@@ -266,6 +268,7 @@ export async function generateProject(
   projectId: string,
   scriptProvider: ScriptProviderId,
   desiredShotCount: DesiredShotCount,
+  mediaOptions: MediaPolishOptions,
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/generate`, {
@@ -273,6 +276,9 @@ export async function generateProject(
       body: JSON.stringify({
         script_provider: scriptProvider,
         desired_shot_count: desiredShotCount,
+        motion_preset: mediaOptions.motionPreset,
+        background_audio_enabled: mediaOptions.backgroundAudioEnabled,
+        background_volume: mediaOptions.backgroundVolume,
       }),
     }),
   );
@@ -282,6 +288,7 @@ export async function renderRealImages(
   projectId: string,
   sourceScriptJobId: string,
   baseSeed?: number,
+  mediaOptions?: MediaPolishOptions,
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-images`, {
@@ -290,6 +297,13 @@ export async function renderRealImages(
         source_script_job_id: sourceScriptJobId,
         image_provider: "comfyui-animagine-xl-4",
         ...(baseSeed === undefined ? {} : { base_seed: baseSeed }),
+        ...(mediaOptions
+          ? {
+              motion_preset: mediaOptions.motionPreset,
+              background_audio_enabled: mediaOptions.backgroundAudioEnabled,
+              background_volume: mediaOptions.backgroundVolume,
+            }
+          : {}),
       }),
     }),
   );
@@ -299,6 +313,7 @@ export async function renderRealAudio(
   projectId: string,
   sourceImageJobId: string,
   speaker: AudioSpeaker,
+  mediaOptions: MediaPolishOptions,
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-audio`, {
@@ -308,6 +323,27 @@ export async function renderRealAudio(
         audio_provider: "qwen3-tts-0.6b-customvoice",
         speaker,
         language: "Chinese",
+        motion_preset: mediaOptions.motionPreset,
+        background_audio_enabled: mediaOptions.backgroundAudioEnabled,
+        background_volume: mediaOptions.backgroundVolume,
+      }),
+    }),
+  );
+}
+
+export async function rerenderMediaOnly(
+  projectId: string,
+  sourceAudioJobId: string,
+  mediaOptions: MediaPolishOptions,
+): Promise<GenerationJob> {
+  return unwrapJob(
+    await request<unknown>(`/projects/${encodeURIComponent(projectId)}/media-rerender`, {
+      method: "POST",
+      body: JSON.stringify({
+        source_audio_job_id: sourceAudioJobId,
+        motion_preset: mediaOptions.motionPreset,
+        background_audio_enabled: mediaOptions.backgroundAudioEnabled,
+        background_volume: mediaOptions.backgroundVolume,
       }),
     }),
   );
@@ -323,6 +359,32 @@ export async function retryJob(jobId: string): Promise<GenerationJob> {
       method: "POST",
     }),
   );
+}
+
+export async function getBackgroundAudio(projectId: string): Promise<BackgroundAudioAsset | null> {
+  return request<BackgroundAudioAsset | null>(
+    `/projects/${encodeURIComponent(projectId)}/background-audio`,
+  );
+}
+
+export async function uploadBackgroundAudio(
+  projectId: string,
+  file: File,
+): Promise<BackgroundAudioAsset> {
+  return request<BackgroundAudioAsset>(
+    `/projects/${encodeURIComponent(projectId)}/background-audio?filename=${encodeURIComponent(file.name)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    },
+  );
+}
+
+export async function deleteBackgroundAudio(projectId: string): Promise<void> {
+  await request<void>(`/projects/${encodeURIComponent(projectId)}/background-audio`, {
+    method: "DELETE",
+  });
 }
 
 function absoluteMediaUrl(value: string | undefined): string | null {
@@ -341,6 +403,7 @@ export function exportUrls(projectId: string, record: ExportRecord): {
   video: string;
   download: string;
   manifest: string;
+  poster: string;
 } {
   const project = encodeURIComponent(projectId);
   const exportId = encodeURIComponent(record.id);
@@ -353,5 +416,8 @@ export function exportUrls(projectId: string, record: ExportRecord): {
     manifest:
       absoluteMediaUrl(record.manifest_url) ??
       `${API_BASE}/projects/${project}/exports/${exportId}/manifest`,
+    poster:
+      absoluteMediaUrl(record.poster_url) ??
+      `${API_BASE}/projects/${project}/exports/${exportId}/poster`,
   };
 }

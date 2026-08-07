@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from .. import crud
 from ..database import get_session
 from ..schemas import JobQueued, JobRead
+from .job_serialization import job_read_with_media_urls
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -16,7 +17,7 @@ def get_job(job_id: str, session: Session = Depends(get_session)) -> JobRead:
     job = crud.get_job(session, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return JobRead.model_validate(job)
+    return job_read_with_media_urls(session, job)
 
 
 @router.post(
@@ -34,4 +35,3 @@ def retry_job(job_id: str, session: Session = Depends(get_session)) -> JobQueued
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     session.commit()
     return JobQueued(job_id=retried.id)
-

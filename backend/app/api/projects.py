@@ -15,12 +15,15 @@ from .. import crud
 from ..config import Settings
 from ..database import get_session
 from ..models import Export, JobStatus
+from ..media.background_audio import background_job_snapshot
+from ..media.ffmpeg import MediaToolError
 from ..providers.registry import check_llamacpp
 from ..schemas import (
     ExportRead,
     JobQueued,
     JobRead,
     GenerationRequest,
+    MediaRerenderRequest,
     RealAudioRenderRequest,
     RealImageRenderRequest,
     ProjectCreate,
@@ -42,6 +45,12 @@ from ..services.audio_jobs import (
     audio_gpu_handoff_status,
     create_audio_source_snapshot,
 )
+from ..services.media_rerender import (
+    MEDIA_RERENDER_JOB_TYPE,
+    MEDIA_RERENDER_PROVIDER_ID,
+    media_rerender_error_payload,
+)
+from .job_serialization import job_read_with_media_urls
 from ..services.image_jobs import REAL_IMAGE_JOB_TYPE, REAL_IMAGE_PROVIDER_ID
 
 
@@ -70,6 +79,39 @@ def _export_read(item: Export) -> ExportRead:
             f"/api/projects/{item.project_id}/exports/{item.id}/video?download=true"
         ),
         manifest_url=f"/api/projects/{item.project_id}/exports/{item.id}/manifest",
+        poster_url=f"/api/projects/{item.project_id}/exports/{item.id}/poster",
+    )
+
+
+def _media_polish_snapshot(
+    settings: Settings,
+    project_id: str,
+    payload: (
+        GenerationRequest
+        | RealImageRenderRequest
+        | RealAudioRenderRequest
+        | MediaRerenderRequest
+    ),
+) -> dict[str, object]:
+    try:
+        background_audio = background_job_snapshot(
+            data_dir=Path(settings.data_dir),
+            project_id=project_id,
+            enabled=payload.background_audio_enabled,
+            volume=payload.background_volume,
+        )
+    except MediaToolError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "motion_preset": payload.motion_preset,
+        "background_audio": background_audio,
+    }
+
+
+def _rerender_source_error(code: str, summary: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=media_rerender_error_payload(code, summary),
     )
 
 
@@ -189,7 +231,8 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> Pro
         project=ProjectRead.model_validate(project),
         shots=[ShotRead.model_validate(item) for item in crud.list_shots(session, project.id)],
         recent_jobs=[
-            JobRead.model_validate(item) for item in crud.recent_jobs(session, project.id)
+            job_read_with_media_urls(session, item)
+            for item in crud.recent_jobs(session, project.id)
         ],
         latest_export=_export_read(latest) if latest is not None else None,
     )
@@ -210,8 +253,9 @@ def generate_project(
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     settings: Settings = request.app.state.settings
-    provider_id = payload.script_provider if payload and payload.script_provider else settings.script_provider
-    desired_shot_count = payload.desired_shot_count if payload is not None else 4
+    payload = payload or GenerationRequest()
+    provider_id = payload.script_provider or settings.script_provider
+    desired_shot_count = payload.desired_shot_count
     if provider_id == "llamacpp":
         availability = check_llamacpp(settings)
         if not availability["available"]:
@@ -244,6 +288,7 @@ def generate_project(
             "script_provider": provider_id,
             "desired_shot_count": desired_shot_count,
             "story_char_count": len(project.story.strip()),
+            **_media_polish_snapshot(settings, project.id, payload),
         },
         provider_id=provider_id,
     )
@@ -381,6 +426,7 @@ def render_project_with_real_images(
         "output": {"width": 1280, "height": 720, "fps": 24},
         "story_char_count": len(project.story.strip()),
         "actual_shot_count": len(script.shots),
+        **_media_polish_snapshot(settings, project.id, payload),
     }
     session.commit()
     return JobQueued(job_id=job.id)
@@ -565,6 +611,132 @@ def render_project_with_real_audio(
         "story_char_count": len(project.story.strip()),
         "actual_shot_count": len(script.shots),
         "source_planned_duration_seconds": source_duration,
+        **_media_polish_snapshot(settings, project.id, payload),
     }
+    session.commit()
+    return JobQueued(job_id=job.id)
+
+
+@router.post(
+    "/{project_id}/media-rerender",
+    response_model=JobQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rerender_project_media_only(
+    project_id: str,
+    payload: MediaRerenderRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> JobQueued:
+    """Queue an FFmpeg-only export using validated real PNG and WAV assets."""
+
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if crud.project_has_active_jobs(session, project.id):
+        raise HTTPException(status_code=409, detail="当前项目仍有任务正在运行。")
+
+    source_audio_job = crud.get_job(session, payload.source_audio_job_id)
+    if source_audio_job is None:
+        raise _rerender_source_error(
+            "SOURCE_AUDIO_JOB_NOT_FOUND", "来源真实旁白 Job 不存在。"
+        )
+    if source_audio_job.project_id != project.id:
+        raise _rerender_source_error(
+            "SOURCE_JOB_PROJECT_MISMATCH", "来源旁白 Job 不属于当前项目。"
+        )
+    if (
+        source_audio_job.job_type != REAL_AUDIO_JOB_TYPE
+        or source_audio_job.provider_id != REAL_AUDIO_PROVIDER_ID
+        or source_audio_job.status != JobStatus.SUCCEEDED
+    ):
+        raise _rerender_source_error(
+            "SOURCE_AUDIO_JOB_NOT_FOUND", "来源 Job 不是成功的真实 Qwen3-TTS 旁白 Job。"
+        )
+    audio_result = dict(source_audio_job.result_json or {})
+    if audio_result.get("mock_audio_fallback") is not False:
+        raise _rerender_source_error(
+            "SOURCE_AUDIO_MISSING", "来源旁白 Job 无法证明使用了完整真实 WAV。"
+        )
+
+    source_script_job_id = str(
+        audio_result.get("source_script_job_id")
+        or (source_audio_job.request_json or {}).get("source_script_job_id")
+        or ""
+    )
+    source_image_job_id = str(
+        audio_result.get("source_image_job_id")
+        or (source_audio_job.request_json or {}).get("source_image_job_id")
+        or ""
+    )
+    source_script_job = crud.get_job(session, source_script_job_id)
+    source_image_job = crud.get_job(session, source_image_job_id)
+    if source_script_job is None:
+        raise _rerender_source_error(
+            "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 不存在。"
+        )
+    if source_image_job is None:
+        raise _rerender_source_error(
+            "SOURCE_IMAGE_JOB_NOT_FOUND", "来源真实图片 Job 不存在。"
+        )
+    if (
+        source_script_job.project_id != project.id
+        or source_image_job.project_id != project.id
+    ):
+        raise _rerender_source_error(
+            "SOURCE_JOB_PROJECT_MISMATCH", "剧本、图片和旁白来源必须属于同一个项目。"
+        )
+    if source_script_job.status != JobStatus.SUCCEEDED:
+        raise _rerender_source_error(
+            "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 尚未成功。"
+        )
+    if (
+        source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+        or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
+        or source_image_job.status != JobStatus.SUCCEEDED
+        or (source_image_job.result_json or {}).get("mock_image_fallback") is not False
+    ):
+        raise _rerender_source_error(
+            "SOURCE_IMAGE_JOB_NOT_FOUND", "来源 Job 不是成功的真实 Animagine 图片 Job。"
+        )
+
+    settings: Settings = request.app.state.settings
+    media_snapshot = _media_polish_snapshot(settings, project.id, payload)
+    background = media_snapshot.get("background_audio")
+    job = crud.create_job(
+        session,
+        project=project,
+        provider_id=MEDIA_RERENDER_PROVIDER_ID,
+        job_type=MEDIA_RERENDER_JOB_TYPE,
+        request_json={
+            "project_id": project.id,
+            "parent_job_id": source_audio_job.id,
+            "source_script_job_id": source_script_job.id,
+            "source_image_job_id": source_image_job.id,
+            "source_audio_job_id": source_audio_job.id,
+            "script_provider": "reused",
+            "image_provider": "reused",
+            "audio_provider": "reused",
+            "source_script_provider": (
+                audio_result.get("source_script_provider") or source_script_job.provider_id
+            ),
+            "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+            "source_audio_provider": REAL_AUDIO_PROVIDER_ID,
+            "script_provider_calls_expected": 0,
+            "image_provider_calls_expected": 0,
+            "audio_provider_calls_expected": 0,
+            "media_only": True,
+            "background_audio_id": (
+                background.get("asset_id")
+                if isinstance(background, dict) and background.get("enabled") is True
+                else None
+            ),
+            "output": {"width": 1280, "height": 720, "fps": 24},
+            "actual_shot_count": len(project.script_json.get("shots", []))
+            if isinstance(project.script_json, dict)
+            else 0,
+            **media_snapshot,
+        },
+    )
     session.commit()
     return JobQueued(job_id=job.id)

@@ -5,6 +5,29 @@ export type AudioProviderId = "mock" | "qwen3-tts-0.6b-customvoice";
 export type AudioSpeaker = "Serena" | "Vivian";
 export type AudioLanguage = "Chinese";
 export type DesiredShotCount = 3 | 4 | 5 | null;
+export type MotionPreset = "static" | "gentle_zoom" | "cinematic_pan";
+
+export interface BackgroundAudioAsset {
+  asset_id: string;
+  original_filename: string;
+  mime_type: string;
+  format: "wav" | "mp3" | "m4a" | "ogg";
+  duration_seconds: number;
+  size_bytes: number;
+  sha256: string;
+  storage_path: string;
+  source_type: "USER_UPLOAD";
+  codec_name: string;
+  sample_rate?: number | null;
+  channels?: number | null;
+  rights_notice: string;
+}
+
+export interface MediaPolishOptions {
+  motionPreset: MotionPreset;
+  backgroundAudioEnabled: boolean;
+  backgroundVolume: number;
+}
 
 export interface ScriptProviderStatus {
   provider_id: ScriptProviderId;
@@ -102,6 +125,7 @@ export interface GenerationRequestSnapshot {
   reuse_script_from_job_id?: string;
   image_provider?: ImageProviderId;
   source_image_job_id?: string;
+  source_audio_job_id?: string;
   parent_job_id?: string;
   audio_provider?: AudioProviderId;
   speaker?: AudioSpeaker;
@@ -112,6 +136,9 @@ export interface GenerationRequestSnapshot {
   story_char_count?: number;
   retry_of_job_id?: string;
   resumed_from_stage?: "MEDIA_RENDER";
+  motion_preset?: MotionPreset;
+  background_audio?: Record<string, unknown>;
+  media_only?: boolean;
   [key: string]: unknown;
 }
 
@@ -232,6 +259,12 @@ export interface GeneratedAudioShot {
   language?: AudioLanguage | string;
   text?: string;
   audio_path?: string;
+  audio_url?: string;
+  audio_asset_id?: string;
+  audio_url_error?: {
+    code: "AUDIO_ASSET_URL_MISSING" | string;
+    summary: string;
+  };
   sample_rate?: number;
   channels?: number;
   duration_seconds?: number;
@@ -316,6 +349,7 @@ export interface GenerationResult {
   script_source_job_id?: string;
   source_script_job_id?: string;
   source_image_job_id?: string;
+  source_audio_job_id?: string;
   parent_job_id?: string;
   audio_provider?: string;
   audio_model_id?: string;
@@ -338,6 +372,7 @@ export interface GenerationResult {
   audio_extension_seconds?: number;
   extended_by_seconds?: number;
   video_source_type?: string;
+  media_only?: boolean;
   source_type?: string;
   [key: string]: unknown;
 }
@@ -403,6 +438,7 @@ export interface ExportRecord {
   media_url?: string;
   download_url?: string;
   manifest_url?: string;
+  poster_url?: string;
   created_at?: string;
 }
 

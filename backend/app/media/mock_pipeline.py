@@ -36,6 +36,10 @@ CANVAS_WIDTH = 1344
 CANVAS_HEIGHT = 756
 FPS = 24
 SAMPLE_RATE = 48_000
+MOTION_PRESETS = {"static", "gentle_zoom", "cinematic_pan"}
+DEFAULT_MOTION_PRESET = "gentle_zoom"
+MOTION_SUPERSAMPLE = 2
+M6_MEDIA_MANIFEST_VERSION = "m6.media-export.v1"
 
 
 def _repo_relative(root: Path, path: Path) -> str:
@@ -229,7 +233,37 @@ def _motion_filter(
     width: int = WIDTH,
     height: int = HEIGHT,
     fps: int = FPS,
+    motion_preset: str | None = None,
 ) -> str:
+    if motion_preset is not None:
+        if motion_preset not in MOTION_PRESETS:
+            raise MediaToolError(f"未知 motion preset：{motion_preset}")
+        denominator = max(1, frame_count - 1)
+        if motion_preset == "static":
+            return (
+                f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,"
+                f"fps={fps}"
+            )
+        if motion_preset == "gentle_zoom":
+            work_width = width * MOTION_SUPERSAMPLE
+            work_height = height * MOTION_SUPERSAMPLE
+            return (
+                f"scale={work_width}:{work_height}:flags=lanczos,"
+                f"zoompan=z='min(1.018,1+0.018*on/{denominator})':"
+                "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':"
+                f"d=1:s={work_width}x{work_height}:fps={fps},"
+                f"scale={width}:{height}:flags=lanczos"
+            )
+        work_width = width * MOTION_SUPERSAMPLE
+        work_height = height * MOTION_SUPERSAMPLE
+        return (
+            f"scale={work_width}:{work_height}:flags=lanczos,"
+            "zoompan=z=1.04:"
+            f"x='(iw-iw/zoom)*(0.10+0.80*on/{denominator})':"
+            "y='(ih-ih/zoom)/2':"
+            f"d=1:s={work_width}x{work_height}:fps={fps},"
+            f"scale={width}:{height}:flags=lanczos"
+        )
     common = f"d=1:s={width}x{height}:fps={fps}"
     if motion == "PUSH_IN":
         return (
@@ -267,6 +301,7 @@ def _create_shot(
     width: int = WIDTH,
     height: int = HEIGHT,
     fps: int = FPS,
+    motion_preset: str | None = None,
 ) -> dict[str, Any]:
     duration = float(shot["duration_seconds"])
     parameters = shot["generation_parameters"]
@@ -282,6 +317,7 @@ def _create_shot(
             width=width,
             height=height,
             fps=fps,
+            motion_preset=motion_preset,
         )
     )
     filters.append(
@@ -389,6 +425,7 @@ def _create_image_shot(
     width: int = WIDTH,
     height: int = HEIGHT,
     fps: int = FPS,
+    motion_preset: str | None = None,
 ) -> dict[str, Any]:
     """把已校验真实 PNG 转为带轻微运镜、Mock 音频和烧录字幕的镜头。"""
 
@@ -413,6 +450,7 @@ def _create_image_shot(
             width=width,
             height=height,
             fps=fps,
+            motion_preset=motion_preset,
         ),
         _label_filter(
             font,
@@ -1162,6 +1200,180 @@ def _normalize_media_timing_plan(
     return normalized, round(source_total, 6), round(rendered_total, 6)
 
 
+def _resolve_background_audio(
+    background_audio: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not background_audio or background_audio.get("enabled") is not True:
+        return None
+    payload = dict(background_audio)
+    raw_path = payload.get("resolved_path") or payload.get("audio_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise MediaToolError("启用背景音时缺少已解析的受控文件路径")
+    path = Path(raw_path).resolve()
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise MediaToolError("背景音文件不存在或为空")
+    recorded_sha = payload.get("sha256")
+    if not isinstance(recorded_sha, str) or sha256_file(path) != recorded_sha.lower():
+        raise MediaToolError("背景音 SHA256 与 Job 快照不一致")
+    try:
+        volume = float(payload["volume"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MediaToolError("背景音快照缺少有效音量") from exc
+    if not 0.02 <= volume <= 0.35:
+        raise MediaToolError("背景音量必须在 0.02—0.35 之间")
+    payload["resolved_path"] = str(path)
+    payload["volume"] = round(volume, 3)
+    return payload
+
+
+def _mix_background_audio(
+    *,
+    tools: MediaTools,
+    base_video: Path,
+    output_path: Path,
+    background_audio: dict[str, Any],
+    duration: float,
+    command_log: list[str],
+) -> None:
+    fade_in = min(0.6, max(0.1, duration / 5))
+    fade_out = min(0.8, max(0.1, duration / 5))
+    fade_out_start = max(0.0, duration - fade_out)
+    volume = float(background_audio["volume"])
+    filter_complex = (
+        f"[1:a]aresample={SAMPLE_RATE},volume={volume:.3f},"
+        f"afade=t=in:st=0:d={fade_in:.3f},"
+        f"afade=t=out:st={fade_out_start:.6f}:d={fade_out:.3f},"
+        f"atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[bg];"
+        "[bg][0:a]sidechaincompress=threshold=0.020:ratio=8:"
+        "attack=20:release=500[ducked];"
+        "[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=0,"
+        "alimiter=limit=0.95[aout]"
+    )
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            base_video,
+            "-stream_loop",
+            "-1",
+            "-i",
+            Path(str(background_audio["resolved_path"])),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v:0",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2",
+            "-t",
+            f"{duration:.6f}",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ],
+        timeout_seconds=300,
+        command_log=command_log,
+    )
+
+
+def _background_manifest(
+    background_audio: dict[str, Any] | None,
+    *,
+    duration: float,
+) -> dict[str, Any]:
+    if background_audio is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "source_type": "USER_UPLOAD",
+        "original_filename": background_audio.get("original_filename"),
+        "mime_type": background_audio.get("mime_type"),
+        "format": background_audio.get("format"),
+        "duration_seconds": background_audio.get("duration_seconds"),
+        "size_bytes": background_audio.get("size_bytes"),
+        "sha256": background_audio.get("sha256"),
+        "storage_path": background_audio.get("storage_path"),
+        "volume": background_audio["volume"],
+        "loop_and_trim_to_seconds": round(duration, 6),
+        "fade_in_seconds": min(0.6, max(0.1, duration / 5)),
+        "fade_out_seconds": min(0.8, max(0.1, duration / 5)),
+        "ducking": {
+            "method": "FFmpeg sidechaincompress",
+            "threshold": 0.020,
+            "ratio": 8,
+            "attack_ms": 20,
+            "release_ms": 500,
+            "narration_is_uncompressed_sidechain": True,
+        },
+        "rights_notice": background_audio.get(
+            "rights_notice",
+            "来源为用户上传；平台不声明该音频的版权归属。",
+        ),
+    }
+
+
+def _create_poster(
+    *,
+    tools: MediaTools,
+    video_path: Path,
+    output_dir: Path,
+    first_shot_duration: float,
+    command_log: list[str],
+) -> dict[str, Any]:
+    capture_at = min(0.75, max(0.4, first_shot_duration * 0.12))
+    poster_path = output_dir / "poster.jpg"
+    temporary = poster_path.with_name("poster.part.jpg")
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{capture_at:.6f}",
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            "-vf",
+            (
+                "scale=1280:720:force_original_aspect_ratio=increase,"
+                "crop=1280:720,setsar=1"
+            ),
+            "-q:v",
+            "2",
+            temporary,
+        ],
+        timeout_seconds=120,
+        command_log=command_log,
+    )
+    if not temporary.is_file() or temporary.stat().st_size <= 0:
+        raise MediaToolError("FFmpeg 未生成有效 poster")
+    os.replace(temporary, poster_path)
+    return {
+        "path": poster_path,
+        "sha256": sha256_file(poster_path),
+        "width": 1280,
+        "height": 720,
+        "captured_at_seconds": round(capture_at, 6),
+        "format": "jpeg",
+    }
+
+
 def _render_project_short(
     *,
     root: Path,
@@ -1178,6 +1390,8 @@ def _render_project_short(
     generation_context: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
     keyframes: list[dict[str, Any]] | None = None,
+    motion_preset: str | None = None,
+    background_audio: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """用同一 FFmpeg 链路渲染 Mock 画面或已校验的真实关键帧。
 
@@ -1221,6 +1435,9 @@ def _render_project_short(
         else {}
     )
     real_image_mode = keyframes is not None
+    if motion_preset is not None and motion_preset not in MOTION_PRESETS:
+        raise MediaToolError(f"未知 motion preset：{motion_preset}")
+    resolved_background = _resolve_background_audio(background_audio)
 
     if real_image_mode:
         keyframe_provider = next(iter(keyframes_by_shot.values()))["provider_id"]
@@ -1280,6 +1497,7 @@ def _render_project_short(
             "width": width,
             "height": height,
             "fps": fps,
+            "motion_preset": motion_preset,
         }
         if real_image_mode:
             generated = _create_image_shot(
@@ -1301,6 +1519,12 @@ def _render_project_short(
 
     output_path = output_dir / requested_name
     temporary = _atomic_media_target(output_path)
+    base_temporary = (
+        output_dir / f"{output_path.stem}.base.part.mp4"
+        if resolved_background is not None
+        else temporary
+    )
+    base_temporary.unlink(missing_ok=True)
     run_command(
         [
             tools.ffmpeg,
@@ -1322,7 +1546,7 @@ def _render_project_short(
             "copy",
             "-movflags",
             "+faststart",
-            temporary,
+            base_temporary,
         ],
         timeout_seconds=180,
         command_log=command_log,
@@ -1330,6 +1554,18 @@ def _render_project_short(
     planned_duration = sum(
         float(shot["duration_seconds"]) for shot in normalized_shots
     )
+    if resolved_background is not None:
+        try:
+            _mix_background_audio(
+                tools=tools,
+                base_video=base_temporary,
+                output_path=temporary,
+                background_audio=resolved_background,
+                duration=planned_duration,
+                command_log=command_log,
+            )
+        finally:
+            base_temporary.unlink(missing_ok=True)
     validation = verify_media(
         tools,
         temporary,
@@ -1340,6 +1576,13 @@ def _render_project_short(
         command_log=command_log,
     )
     os.replace(temporary, output_path)
+    poster = _create_poster(
+        tools=tools,
+        video_path=output_path,
+        output_dir=output_dir,
+        first_shot_duration=float(normalized_shots[0]["duration_seconds"]),
+        command_log=command_log,
+    )
     if progress_callback:
         progress_callback(90)
 
@@ -1360,6 +1603,7 @@ def _render_project_short(
             "script_provider_id": shot.get("script_provider_id", provider_id),
             "source_type": shot["source_type"],
             "generation_parameters": shot["generation_parameters"],
+            "motion_preset": motion_preset or "legacy_shot_motion",
             "subtitle_file": _repo_relative(root, generated["subtitle_path"]),
             "subtitle_text_path": _repo_relative(root, generated["subtitle_path"]),
             "rendered_subtitle_text": generated["rendered_subtitle_text"],
@@ -1441,6 +1685,10 @@ def _render_project_short(
         "image_provider": image_provider,
         "audio_provider": audio_provider,
         "video_source_type": video_source_type,
+        "motion_preset": motion_preset or "legacy_shot_motion",
+        "background_audio": _background_manifest(
+            resolved_background, duration=planned_duration
+        ),
         "script_validation_warnings": script_validation_warnings,
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
@@ -1468,11 +1716,16 @@ def _render_project_short(
             "audio_provider": audio_provider,
             "video_source_type": video_source_type,
             "visual_method": (
-                "validated real PNG keyframes -> FFmpeg deterministic Ken Burns/fade"
+                "validated real PNG keyframes -> FFmpeg structured motion/fade"
                 if real_image_mode
-                else "FFmpeg color/drawbox/drawtext/zoompan/fade filters"
+                else "FFmpeg mock composition/structured motion/fade filters"
             ),
-            "audio_method": "Python standard-library deterministic PCM WAV -> FFmpeg AAC",
+            "motion_preset": motion_preset or "legacy_shot_motion",
+            "audio_method": (
+                "mock PCM WAV + user-upload background ducking -> FFmpeg AAC"
+                if resolved_background is not None
+                else "Python standard-library deterministic PCM WAV -> FFmpeg AAC"
+            ),
             "subtitle_method": "FFmpeg drawtext + independent UTF-8 textfile",
             "subtitle_rendering": "burned_in",
             "chinese_font_path": str(font),
@@ -1487,6 +1740,11 @@ def _render_project_short(
             "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
             "file_size_bytes": output_path.stat().st_size,
             "sha256": digest,
+            "poster_path": _repo_relative(root, poster["path"]),
+            "poster_sha256": poster["sha256"],
+            "poster_width": poster["width"],
+            "poster_height": poster["height"],
+            "poster_captured_at_seconds": poster["captured_at_seconds"],
         },
         "ffprobe_validation": validation,
         "safe_command_log": command_log,
@@ -1505,6 +1763,7 @@ def _render_project_short(
         "validation": validation,
         "shots": shot_outputs,
         "manifest": manifest,
+        "poster_path": str(poster["path"]),
     }
 
 
@@ -1523,6 +1782,8 @@ def render_mock_project_short(
     provider_id: str = "mock",
     generation_context: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    motion_preset: str | None = None,
+    background_audio: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """保持 M0—M3 行为不变的确定性 Mock 媒体入口。"""
 
@@ -1541,6 +1802,8 @@ def render_mock_project_short(
         generation_context=generation_context,
         progress_callback=progress_callback,
         keyframes=None,
+        motion_preset=motion_preset,
+        background_audio=background_audio,
     )
 
 
@@ -1560,6 +1823,8 @@ def render_image_project_short(
     provider_id: str = "comfyui-animagine-xl-4",
     generation_context: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    motion_preset: str | None = None,
+    background_audio: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """用完整的一组真实 PNG 关键帧生成 MP4；禁止缺图或混用 Mock。"""
 
@@ -1578,6 +1843,8 @@ def render_image_project_short(
         generation_context=generation_context,
         progress_callback=progress_callback,
         keyframes=keyframes,
+        motion_preset=motion_preset,
+        background_audio=background_audio,
     )
 
 
@@ -1595,6 +1862,7 @@ def _create_real_audio_image_shot(
     width: int,
     height: int,
     fps: int,
+    motion_preset: str | None = None,
 ) -> dict[str, Any]:
     """把真实 PNG 与完整真实旁白合成为单镜头，不变速也不截断旁白。"""
 
@@ -1631,6 +1899,7 @@ def _create_real_audio_image_shot(
             width=width,
             height=height,
             fps=fps,
+            motion_preset=motion_preset,
         ),
         _label_filter(
             font,
@@ -1784,6 +2053,8 @@ def render_real_audio_project_short(
     progress_callback: Callable[[int], None] | None = None,
     max_total_duration_seconds: float = _DEFAULT_RENDERED_DURATION_LIMIT_SECONDS,
     timing_plan_path: Path | None = None,
+    motion_preset: str | None = None,
+    background_audio: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """用复用真实 PNG、逐镜真实中文 WAV 与 FFmpeg 生成 M5-B 成片。"""
 
@@ -1799,6 +2070,9 @@ def render_real_audio_project_short(
         if timing_plan_path is not None
         else None
     )
+    if motion_preset is not None and motion_preset not in MOTION_PRESETS:
+        raise MediaToolError(f"未知 motion preset：{motion_preset}")
+    resolved_background = _resolve_background_audio(background_audio)
     if (
         resolved_timing_plan_path is not None
         and not resolved_timing_plan_path.is_file()
@@ -1931,6 +2205,7 @@ def render_real_audio_project_short(
             width=width,
             height=height,
             fps=fps,
+            motion_preset=motion_preset,
         )
         shot_outputs.append(generated)
         if progress_callback:
@@ -1945,6 +2220,12 @@ def render_real_audio_project_short(
 
     output_path = output_dir / requested_name
     temporary = _atomic_media_target(output_path)
+    base_temporary = (
+        output_dir / f"{output_path.stem}.base.part.mp4"
+        if resolved_background is not None
+        else temporary
+    )
+    base_temporary.unlink(missing_ok=True)
     run_command(
         [
             tools.ffmpeg,
@@ -1966,11 +2247,23 @@ def render_real_audio_project_short(
             "copy",
             "-movflags",
             "+faststart",
-            temporary,
+            base_temporary,
         ],
         timeout_seconds=240,
         command_log=command_log,
     )
+    if resolved_background is not None:
+        try:
+            _mix_background_audio(
+                tools=tools,
+                base_video=base_temporary,
+                output_path=temporary,
+                background_audio=resolved_background,
+                duration=rendered_total,
+                command_log=command_log,
+            )
+        finally:
+            base_temporary.unlink(missing_ok=True)
     validation = verify_media(
         tools,
         temporary,
@@ -1981,6 +2274,25 @@ def render_real_audio_project_short(
         command_log=command_log,
     )
     os.replace(temporary, output_path)
+    render_warnings: list[dict[str, str]] = []
+    try:
+        poster = _create_poster(
+            tools=tools,
+            video_path=output_path,
+            output_dir=output_dir,
+            first_shot_duration=float(
+                normalized_timings[0]["rendered_shot_duration"]
+            ),
+            command_log=command_log,
+        )
+    except (MediaToolError, OSError) as exc:
+        poster = None
+        render_warnings.append(
+            {
+                "code": "POSTER_GENERATION_FAILED",
+                "summary": f"成片已成功，但封面生成失败：{str(exc)[:300]}",
+            }
+        )
     if progress_callback:
         progress_callback(94)
 
@@ -1988,6 +2300,13 @@ def render_real_audio_project_short(
     _write_real_audio_srt(normalized_timings, normalized_shots, subtitle_sidecar)
     digest = sha256_file(output_path)
 
+    context = dict(generation_context or {})
+    media_only = bool(context.get("media_only"))
+    media_video_source_type = (
+        "MEDIA_ONLY_RERENDER_FFMPEG"
+        if media_only
+        else "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION"
+    )
     shot_manifest: list[dict[str, Any]] = []
     for shot, generated in zip(normalized_shots, shot_outputs, strict=True):
         keyframe = dict(generated["keyframe"])
@@ -2015,6 +2334,7 @@ def render_real_audio_project_short(
                 "extended_by_seconds": timing["extended_by_seconds"],
                 "extension_seconds": timing["extension_seconds"],
                 "extension_reason": timing["extension_reason"],
+                "motion_preset": motion_preset or "legacy_shot_motion",
                 "lead_in_seconds": timing["lead_in_seconds"],
                 "lead_out_seconds": timing["lead_out_seconds"],
                 "subtitle": shot["subtitle_text"],
@@ -2064,10 +2384,16 @@ def render_real_audio_project_short(
                 ),
                 "audio_warnings": list(audio["warnings"]),
                 "audio_reused": bool(audio["reused"]),
+                "media_reuse": {
+                    "media_only": media_only,
+                    "script": media_only,
+                    "keyframe": media_only,
+                    "audio": media_only,
+                    "source_jobs": context.get("source_jobs", {}),
+                },
             }
         )
 
-    context = dict(generation_context or {})
     provider_trace = context.get("providers", {})
     if not isinstance(provider_trace, dict):
         provider_trace = {}
@@ -2095,7 +2421,7 @@ def render_real_audio_project_short(
             "image_source_type": "REUSED_REAL_LOCAL_MODEL",
             "audio_provider": provider_id,
             "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
-            "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            "video_source_type": media_video_source_type,
         }
     )
     context["providers"] = provider_trace
@@ -2112,7 +2438,16 @@ def render_real_audio_project_short(
     script_provider = str(provider_trace.get("script_provider", "reused"))
     extension_total = round(rendered_total - source_total, 6)
     manifest = {
-        "manifest_version": "m5.real-audio-export.v1",
+        "manifest_version": M6_MEDIA_MANIFEST_VERSION,
+        "media_only": media_only,
+        "reused_providers": context.get("reused_providers"),
+        "provider_calls": context.get("provider_calls", {}),
+        "media_reuse": {
+            "script": media_only,
+            "keyframe": media_only,
+            "audio": media_only,
+            "source_jobs": context.get("source_jobs", {}),
+        },
         "project": {"id": project_id, "title": project_title},
         "generation_context": context,
         "script_provider": script_provider,
@@ -2123,7 +2458,11 @@ def render_real_audio_project_short(
         "audio_model_sha256": next(iter(model_sha256_values)),
         "speaker": next(iter(speaker_values)),
         "language": next(iter(language_values)),
-        "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+        "video_source_type": media_video_source_type,
+        "motion_preset": motion_preset or "legacy_shot_motion",
+        "background_audio": _background_manifest(
+            resolved_background, duration=rendered_total
+        ),
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace(
             "+00:00", "Z"
         ),
@@ -2151,20 +2490,23 @@ def render_real_audio_project_short(
         },
         "pipeline": {
             "provider_id": provider_id,
-            "source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            "source_type": media_video_source_type,
             "script_provider": script_provider,
             "image_provider": actual_image_provider_id,
             "image_source_type": "REUSED_REAL_LOCAL_MODEL",
             "audio_provider": provider_id,
             "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
-            "video_source_type": "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION",
+            "video_source_type": media_video_source_type,
             "visual_method": (
                 "reused validated real PNG keyframes -> FFmpeg deterministic "
-                "Ken Burns/fade"
+                "structured motion/fade"
             ),
+            "motion_preset": motion_preset or "legacy_shot_motion",
             "audio_method": (
-                "Qwen3-TTS CustomVoice PCM16 WAV -> lead-in/silence padding -> "
+                "Qwen3-TTS WAV + user-upload background sidechain ducking -> "
                 "FFmpeg 48kHz AAC"
+                if resolved_background is not None
+                else "Qwen3-TTS CustomVoice PCM16 WAV -> lead-in/silence padding -> FFmpeg 48kHz AAC"
             ),
             "audio_speed_changed": False,
             "audio_truncated": False,
@@ -2175,8 +2517,9 @@ def render_real_audio_project_short(
             "network_required": False,
             "cloud_api_used": False,
             "api_key_required": False,
-            "model_weights_required": True,
+            "model_weights_required": not bool(context.get("media_only")),
         },
+        "warnings": render_warnings,
         "shot_count": len(shot_manifest),
         "shots": shot_manifest,
         "timing_plan": {
@@ -2191,6 +2534,15 @@ def render_real_audio_project_short(
             "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
             "file_size_bytes": output_path.stat().st_size,
             "sha256": digest,
+            "poster_path": (
+                _repo_relative(root, poster["path"]) if poster is not None else None
+            ),
+            "poster_sha256": poster["sha256"] if poster is not None else None,
+            "poster_width": poster["width"] if poster is not None else None,
+            "poster_height": poster["height"] if poster is not None else None,
+            "poster_captured_at_seconds": (
+                poster["captured_at_seconds"] if poster is not None else None
+            ),
         },
         "ffprobe_validation": {
             **validation,
@@ -2219,6 +2571,8 @@ def render_real_audio_project_short(
         "extended_by_seconds": extension_total,
         "shots": shot_outputs,
         "manifest": manifest,
+        "poster_path": str(poster["path"]) if poster is not None else None,
+        "warnings": render_warnings,
     }
 
 
@@ -2238,6 +2592,8 @@ def resume_mock_project_short(
     provider_id: str = "mock",
     generation_context: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    motion_preset: str | None = None,
+    background_audio: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """复用 MEDIA_RENDER 失败时已编码完成的 MP4，只解码、探测和登记。"""
 
@@ -2287,6 +2643,13 @@ def resume_mock_project_short(
         command_log=command_log,
     )
     os.replace(temporary, output_path)
+    poster = _create_poster(
+        tools=tools,
+        video_path=output_path,
+        output_dir=output_dir,
+        first_shot_duration=float(normalized_shots[0]["duration_seconds"]),
+        command_log=command_log,
+    )
     if progress_callback:
         progress_callback(90)
 
@@ -2333,6 +2696,7 @@ def resume_mock_project_short(
                 "script_provider_id": shot.get("script_provider_id", provider_id),
                 "source_type": shot["source_type"],
                 "generation_parameters": shot["generation_parameters"],
+                "motion_preset": motion_preset or "legacy_shot_motion",
                 "subtitle_file": _repo_relative(root, subtitle.text_path),
                 "subtitle_text_path": _repo_relative(root, subtitle.text_path),
                 "rendered_subtitle_text": subtitle.rendered_text,
@@ -2372,6 +2736,11 @@ def resume_mock_project_short(
         "image_provider": image_provider,
         "audio_provider": audio_provider,
         "video_source_type": video_source_type,
+        "motion_preset": motion_preset or "legacy_shot_motion",
+        "background_audio": _background_manifest(
+            dict(background_audio) if background_audio and background_audio.get("enabled") is True else None,
+            duration=planned_duration,
+        ),
         "script_validation_warnings": script_validation_warnings,
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "runtime": {**runtime_summary(tools), "operating_system": platform.platform()},
@@ -2395,6 +2764,7 @@ def resume_mock_project_short(
             "audio_provider": audio_provider,
             "video_source_type": video_source_type,
             "visual_method": "复用已编码的 FFmpeg Mock 媒体",
+            "motion_preset": motion_preset or "legacy_shot_motion",
             "audio_method": "复用已编码的 AAC 音频流",
             "subtitle_method": "复用已烧录画面并重建 UTF-8 LF 字幕追溯文件",
             "subtitle_rendering": "burned_in",
@@ -2418,6 +2788,11 @@ def resume_mock_project_short(
             "subtitle_sidecar_path": _repo_relative(root, subtitle_sidecar),
             "file_size_bytes": output_path.stat().st_size,
             "sha256": digest,
+            "poster_path": _repo_relative(root, poster["path"]),
+            "poster_sha256": poster["sha256"],
+            "poster_width": poster["width"],
+            "poster_height": poster["height"],
+            "poster_captured_at_seconds": poster["captured_at_seconds"],
         },
         "ffprobe_validation": validation,
         "safe_command_log": command_log,
@@ -2439,6 +2814,7 @@ def resume_mock_project_short(
         "media_reused": True,
         "reencoded": False,
         "source_media_path": str(source),
+        "poster_path": str(poster["path"]),
     }
 
 

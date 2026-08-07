@@ -218,6 +218,18 @@ def test_real_audio_renderer_pads_short_audio_and_extends_long_audio(
         fps=24,
         provider_id=AUDIO_PROVIDER_ID,
         generation_context={
+            "media_only": True,
+            "reused_providers": {
+                "script_provider": "reused",
+                "image_provider": "reused",
+                "audio_provider": "reused",
+            },
+            "source_jobs": {
+                "script": "source-script-job",
+                "image": "source-image-job",
+                "audio": "source-audio-job",
+            },
+            "provider_calls": {"script": 0, "image": 0, "audio": 0},
             "source_script_job_id": "source-script-job",
             "source_image_job_id": "source-image-job",
             "providers": {
@@ -226,6 +238,7 @@ def test_real_audio_renderer_pads_short_audio_and_extends_long_audio(
                 "audio_provider": AUDIO_PROVIDER_ID,
             },
         },
+        motion_preset="gentle_zoom",
     )
 
     output_path = Path(rendered["output_path"])
@@ -233,7 +246,19 @@ def test_real_audio_renderer_pads_short_audio_and_extends_long_audio(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert output_path.is_file() and output_path.stat().st_size > 0
     assert rendered["sha256"] == sha256_file(output_path)
-    assert manifest["manifest_version"] == "m5.real-audio-export.v1"
+    assert manifest["manifest_version"] == "m6.media-export.v1"
+    assert manifest["media_only"] is True
+    assert manifest["reused_providers"]["audio_provider"] == "reused"
+    assert manifest["reused_providers"] == {
+        "script_provider": "reused",
+        "image_provider": "reused",
+        "audio_provider": "reused",
+    }
+    assert manifest["provider_calls"] == {"script": 0, "image": 0, "audio": 0}
+    assert manifest["media_reuse"]["keyframe"] is True
+    assert manifest["media_reuse"]["audio"] is True
+    assert manifest["motion_preset"] == "gentle_zoom"
+    assert manifest["pipeline"]["model_weights_required"] is False
     assert manifest["script_provider"] == "reused"
     assert manifest["image_provider"] == IMAGE_PROVIDER_ID
     assert manifest["audio_provider"] == AUDIO_PROVIDER_ID
@@ -242,6 +267,22 @@ def test_real_audio_renderer_pads_short_audio_and_extends_long_audio(
     assert manifest["pipeline"]["mock_audio_used"] is False
     assert manifest["pipeline"]["audio_speed_changed"] is False
     assert manifest["pipeline"]["audio_truncated"] is False
+    assert manifest["pipeline"]["video_source_type"] == "MEDIA_ONLY_RERENDER_FFMPEG"
+    assert all(
+        shot["media_reuse"] == {
+            "media_only": True,
+            "script": True,
+            "keyframe": True,
+            "audio": True,
+            "source_jobs": {
+                "script": "source-script-job",
+                "image": "source-image-job",
+                "audio": "source-audio-job",
+            },
+        }
+        for shot in manifest["shots"]
+    )
+    assert all(shot["keyframe"].get("reused") is not True for shot in manifest["shots"])
 
     expected_rendered = sum(
         item["rendered_shot_duration"] for item in timing_plan["shots"]

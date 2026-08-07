@@ -93,6 +93,7 @@ class ExportRead(ApiModel):
     video_url: str
     download_url: str
     manifest_url: str
+    poster_url: str
 
 
 class ProjectDetail(BaseModel):
@@ -107,12 +108,20 @@ class JobQueued(BaseModel):
     status: Literal["QUEUED"] = "QUEUED"
 
 
-class GenerationRequest(BaseModel):
+class MediaPolishOptions(BaseModel):
+    motion_preset: Literal["static", "gentle_zoom", "cinematic_pan"] = (
+        "gentle_zoom"
+    )
+    background_audio_enabled: bool = False
+    background_volume: float = Field(default=0.12, ge=0.02, le=0.35)
+
+
+class GenerationRequest(MediaPolishOptions):
     script_provider: Literal["mock", "llamacpp"] | None = None
     desired_shot_count: Literal[3, 4, 5] | None = 4
 
 
-class RealImageRenderRequest(BaseModel):
+class RealImageRenderRequest(MediaPolishOptions):
     source_script_job_id: str = Field(min_length=1, max_length=36)
     image_provider: Literal["comfyui-animagine-xl-4"] = (
         "comfyui-animagine-xl-4"
@@ -120,13 +129,33 @@ class RealImageRenderRequest(BaseModel):
     base_seed: int | None = Field(default=None, ge=0, le=2**63 - 6)
 
 
-class RealAudioRenderRequest(BaseModel):
+class RealAudioRenderRequest(MediaPolishOptions):
     source_image_job_id: str = Field(min_length=1, max_length=36)
     audio_provider: Literal["qwen3-tts-0.6b-customvoice"] = (
         "qwen3-tts-0.6b-customvoice"
     )
     speaker: Literal["Serena", "Vivian"] = "Serena"
     language: Literal["Chinese"] = "Chinese"
+
+
+class MediaRerenderRequest(MediaPolishOptions):
+    source_audio_job_id: str = Field(min_length=1, max_length=36)
+
+
+class BackgroundAudioRead(BaseModel):
+    asset_id: str
+    original_filename: str
+    mime_type: str
+    format: Literal["wav", "mp3", "m4a", "ogg"]
+    duration_seconds: float
+    size_bytes: int
+    sha256: str
+    storage_path: str
+    source_type: Literal["USER_UPLOAD"] = "USER_UPLOAD"
+    codec_name: str
+    sample_rate: int | None = None
+    channels: int | None = None
+    rights_notice: str
 
 
 class ProviderStatusRead(BaseModel):

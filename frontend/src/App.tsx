@@ -5,16 +5,19 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type ChangeEvent,
   type MouseEvent,
 } from "react";
 import {
   API_BASE,
   ApiError,
   createProject,
+  deleteBackgroundAudio,
   deleteProject,
   exportUrls,
   generateProject,
   getHealth,
+  getBackgroundAudio,
   getJob,
   getProject,
   getProviders,
@@ -22,11 +25,14 @@ import {
   listProjects,
   renderRealAudio,
   renderRealImages,
+  rerenderMediaOnly,
   retryJob,
+  uploadBackgroundAudio,
 } from "./api";
 import type {
   AudioProviderStatus,
   AudioSpeaker,
+  BackgroundAudioAsset,
   DesiredShotCount,
   DurationNormalization,
   GeneratedAudioShot,
@@ -37,6 +43,7 @@ import type {
   HealthStatus,
   JobStatus,
   MediaTimingPlan,
+  MotionPreset,
   Project,
   ProjectDetail,
   ProvidersStatus,
@@ -121,6 +128,7 @@ function isRealAudioJob(job: GenerationJob | null | undefined): boolean {
   if (!job) return false;
   return (
     job.job_type === "GENERATE_REAL_AUDIO_VIDEO" ||
+    job.job_type === "MEDIA_RERENDER" ||
     textValue(job.request_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID ||
     textValue(job.result_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID
   );
@@ -128,11 +136,16 @@ function isRealAudioJob(job: GenerationJob | null | undefined): boolean {
 
 function jobAudioProvider(job: GenerationJob | null | undefined): string | null {
   if (!job) return null;
-  return (
+  const provider = (
     textValue(job.result_json?.audio_provider) ??
     textValue(job.request_json?.audio_provider) ??
     (isRealAudioJob(job) ? textValue(job.provider_id) : null)
   );
+  return provider === "reused"
+    ? textValue(job.result_json?.source_audio_provider) ??
+        textValue(job.request_json?.source_audio_provider) ??
+        REAL_AUDIO_PROVIDER_ID
+    : provider;
 }
 
 function jobAudioSpeaker(job: GenerationJob | null | undefined): string | null {
@@ -726,6 +739,48 @@ function ShotImage({ src, sequence, title }: { src: string; sequence: number; ti
   );
 }
 
+function ShotAudioPlayer({
+  src,
+  sequence,
+  missingReason,
+}: {
+  src: string | null;
+  sequence: number;
+  missingReason?: string;
+}) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => setFailed(false), [src]);
+
+  if (!src) {
+    return (
+      <div className="shot-audio-error" role="alert">
+        <strong>旁白暂时无法播放</strong>
+        <span>{missingReason ?? "AUDIO_ASSET_URL_MISSING：后端没有提供有效的公共音频地址。"}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="shot-audio-player">
+      <span>逐镜头试听</span>
+      <audio
+        controls
+        preload="metadata"
+        src={src}
+        aria-label={`第 ${sequence} 镜旁白试听`}
+        onLoadedMetadata={() => setFailed(false)}
+        onError={() => setFailed(true)}
+      />
+      {failed && (
+        <span className="shot-audio-error" role="alert">
+          AUDIO_DECODE_FAILED：旁白加载失败，请检查后端媒体服务后重试。
+        </span>
+      )}
+    </div>
+  );
+}
+
 function JobPanel({
   job,
   retrying,
@@ -1126,6 +1181,11 @@ export default function App() {
   const [providerChecking, setProviderChecking] = useState(false);
   const [scriptProvider, setScriptProvider] = useState<ScriptProviderId>("mock");
   const [audioSpeaker, setAudioSpeaker] = useState<AudioSpeaker>("Serena");
+  const [motionPreset, setMotionPreset] = useState<MotionPreset>("gentle_zoom");
+  const [backgroundAudioEnabled, setBackgroundAudioEnabled] = useState(false);
+  const [backgroundVolume, setBackgroundVolume] = useState(0.12);
+  const [backgroundAudio, setBackgroundAudio] = useState<BackgroundAudioAsset | null>(null);
+  const [backgroundLoading, setBackgroundLoading] = useState(false);
   const [desiredShotCount, setDesiredShotCount] = useState<DesiredShotCount>(4);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1156,6 +1216,11 @@ export default function App() {
   const providerSelectionTouchedRef = useRef(false);
   const pendingNavigationRef = useRef<"project" | "result" | null>(null);
   const handledSucceededJobsRef = useRef(new Set<string>());
+  const mediaPolishOptions = {
+    motionPreset,
+    backgroundAudioEnabled,
+    backgroundVolume,
+  };
 
   const scrollToSection = useCallback((section: SectionName) => {
     const sections: Record<SectionName, HTMLElement | null> = {
@@ -1251,6 +1316,33 @@ export default function App() {
     setAudioRequestError(null);
     refreshDetail(selectedId).catch((cause: unknown) => setError(readableError(cause)));
   }, [refreshDetail, selectedId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedId) {
+      setBackgroundAudio(null);
+      setBackgroundAudioEnabled(false);
+      return;
+    }
+    setBackgroundAudio(null);
+    setBackgroundAudioEnabled(false);
+    setBackgroundLoading(true);
+    getBackgroundAudio(selectedId)
+      .then((asset) => {
+        if (cancelled) return;
+        setBackgroundAudio(asset);
+        if (!asset) setBackgroundAudioEnabled(false);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(`背景音状态读取失败：${readableError(cause)}`);
+      })
+      .finally(() => {
+        if (!cancelled) setBackgroundLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   useEffect(() => {
     if (!activeJob || (activeJob.status !== "QUEUED" && activeJob.status !== "RUNNING")) return;
@@ -1436,7 +1528,12 @@ export default function App() {
           return;
         }
       }
-      const job = await generateProject(selectedId, scriptProvider, desiredShotCount);
+      const job = await generateProject(
+        selectedId,
+        scriptProvider,
+        desiredShotCount,
+        mediaPolishOptions,
+      );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
@@ -1483,7 +1580,12 @@ export default function App() {
     setAudioRequestError(null);
     setNotice(null);
     try {
-      const job = await renderRealImages(selectedId, scriptJob.id);
+      const job = await renderRealImages(
+        selectedId,
+        scriptJob.id,
+        undefined,
+        mediaPolishOptions,
+      );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
@@ -1512,7 +1614,12 @@ export default function App() {
     setAudioRequestError(null);
     setNotice(null);
     try {
-      const job = await renderRealAudio(selectedId, sourceImageJob.id, audioSpeaker);
+      const job = await renderRealAudio(
+        selectedId,
+        sourceImageJob.id,
+        audioSpeaker,
+        mediaPolishOptions,
+      );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
@@ -1527,6 +1634,74 @@ export default function App() {
       } else {
         setError(readableError(cause));
       }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startMediaOnlyRerender = async () => {
+    if (!selectedId || !successfulRealAudioJob) return;
+    setBusy("media-rerender");
+    setError("");
+    setGenerationRequestError(null);
+    setImageRequestError(null);
+    setAudioRequestError(null);
+    setNotice(null);
+    try {
+      const job = await rerenderMediaOnly(
+        selectedId,
+        successfulRealAudioJob.id,
+        mediaPolishOptions,
+      );
+      pendingNavigationRef.current = "result";
+      setActiveJob({ ...job, project_id: job.project_id || selectedId });
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      if (cause instanceof ApiError) {
+        const structured = generationErrorValue(cause.detail);
+        if (structured) {
+          setAudioRequestError(structured);
+          setError("");
+        } else {
+          setError(cause.message);
+        }
+      } else {
+        setError(readableError(cause));
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const uploadProjectBackgroundAudio = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!selectedId || !file) return;
+    setBusy("background-upload");
+    setError("");
+    try {
+      const asset = await uploadBackgroundAudio(selectedId, file);
+      setBackgroundAudio(asset);
+      setBackgroundAudioEnabled(true);
+      setNotice({ kind: "success", message: `背景音“${asset.original_filename}”已上传并通过媒体校验。` });
+    } catch (cause) {
+      setError(`背景音上传失败：${readableError(cause)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeProjectBackgroundAudio = async () => {
+    if (!selectedId || !backgroundAudio) return;
+    setBusy("background-delete");
+    setError("");
+    try {
+      await deleteBackgroundAudio(selectedId);
+      setBackgroundAudio(null);
+      setBackgroundAudioEnabled(false);
+      setNotice({ kind: "success", message: "项目背景音已删除，后续任务将保持原有音频行为。" });
+    } catch (cause) {
+      setError(`删除背景音失败：${readableError(cause)}`);
     } finally {
       setBusy(null);
     }
@@ -1663,6 +1838,14 @@ export default function App() {
     (isRealAudioJob(exportJob) ? exportJob : null) ??
     detail?.recent_jobs.find((job) => isRealAudioJob(job)) ??
     null;
+  const successfulRealAudioJob =
+    detail?.recent_jobs.find(
+      (job) =>
+        job.job_type === "GENERATE_REAL_AUDIO_VIDEO" &&
+        job.status === "SUCCEEDED" &&
+        job.result_json?.mock_audio_fallback === false &&
+        jobAudioShots(job).length === scriptShots.length,
+    ) ?? null;
   const generatedAudioShots = jobAudioShots(audioDisplayJob);
   const audioGenerationInProgress =
     isRealAudioJob(activeJob) &&
@@ -2246,6 +2429,7 @@ export default function App() {
                     generationInProgress ||
                     !scriptJob ||
                     gpuHandoffRequired ||
+                    (backgroundAudioEnabled && !backgroundAudio) ||
                     !realImageProviderConfigured
                   }
                 >
@@ -2306,6 +2490,91 @@ export default function App() {
                   <span className="image-provider-detail">{realAudioProviderDescriptor.detail}</span>
                 )}
               </div>
+              <section className="media-polish-controls" aria-labelledby="media-polish-title">
+                <div className="media-polish-heading">
+                  <div>
+                    <p className="eyebrow">成片设置</p>
+                    <h4 id="media-polish-title">镜头运动与背景音</h4>
+                  </div>
+                  <span>新任务将冻结这些设置，重试沿用原快照</span>
+                </div>
+                <fieldset className="motion-preset-selector" disabled={busy !== null || generationInProgress}>
+                  <legend>镜头运动模式</legend>
+                  {([
+                    ["static", "静态", "无平移缩放，仅淡入淡出"],
+                    ["gentle_zoom", "轻柔缩放", "中心缓慢缩放，默认"],
+                    ["cinematic_pan", "电影平移", "小幅横向移动"],
+                  ] as const).map(([value, label, description]) => (
+                    <label className={motionPreset === value ? "is-selected" : ""} key={value}>
+                      <input
+                        type="radio"
+                        name="motion-preset"
+                        value={value}
+                        checked={motionPreset === value}
+                        onChange={() => setMotionPreset(value)}
+                      />
+                      <span><strong>{label}</strong><small>{description}</small></span>
+                    </label>
+                  ))}
+                </fieldset>
+                <div className="background-audio-control">
+                  <div className="background-audio-row">
+                    <label className="toggle-control">
+                      <input
+                        type="checkbox"
+                        checked={backgroundAudioEnabled}
+                        disabled={!backgroundAudio || busy !== null || generationInProgress}
+                        onChange={(event) => setBackgroundAudioEnabled(event.target.checked)}
+                      />
+                      <span>使用背景音</span>
+                    </label>
+                    <label className="button button-ghost background-upload-button">
+                      {backgroundAudio ? "替换音频" : "上传音频"}
+                      <input
+                        className="visually-hidden"
+                        type="file"
+                        accept=".wav,.mp3,.m4a,.ogg,audio/wav,audio/mpeg,audio/mp4,audio/ogg"
+                        disabled={busy !== null || generationInProgress}
+                        onChange={(event) => void uploadProjectBackgroundAudio(event)}
+                        aria-label="上传背景音乐或环境音"
+                      />
+                    </label>
+                    {backgroundAudio && (
+                      <button
+                        className="button button-ghost"
+                        type="button"
+                        disabled={busy !== null || generationInProgress}
+                        onClick={() => void removeProjectBackgroundAudio()}
+                      >
+                        {busy === "background-delete" ? "正在删除…" : "删除"}
+                      </button>
+                    )}
+                  </div>
+                  {backgroundLoading ? (
+                    <p className="background-audio-meta">正在读取项目背景音…</p>
+                  ) : backgroundAudio ? (
+                    <p className="background-audio-meta">
+                      <strong>{backgroundAudio.original_filename}</strong>
+                      <span>{backgroundAudio.duration_seconds.toFixed(2)} 秒 · {backgroundAudio.format.toUpperCase()} · 用户上传</span>
+                    </p>
+                  ) : (
+                    <p className="background-audio-meta">未上传背景音，成片保持当前音频行为。</p>
+                  )}
+                  <label className="background-volume-control">
+                    <span>背景音量 <output>{Math.round(backgroundVolume * 100)}%</output></span>
+                    <input
+                      type="range"
+                      min="0.02"
+                      max="0.35"
+                      step="0.01"
+                      value={backgroundVolume}
+                      disabled={!backgroundAudioEnabled || busy !== null || generationInProgress}
+                      onChange={(event) => setBackgroundVolume(Number(event.target.value))}
+                    />
+                  </label>
+                  <p className="rights-notice">仅上传您拥有使用权的 WAV、MP3、M4A 或 OGG 文件，最大 20MB。平台不声明音频版权归属。</p>
+                </div>
+              </section>
               <fieldset className="speaker-selector" disabled={busy !== null || generationInProgress}>
                 <legend>整段成片使用同一个旁白音色</legend>
                 <label className={audioSpeaker === "Serena" ? "is-selected" : ""}>
@@ -2366,6 +2635,7 @@ export default function App() {
                     generationInProgress ||
                     !sourceImageJob ||
                     gpuHandoffRequired ||
+                    (backgroundAudioEnabled && !backgroundAudio) ||
                     !realAudioProviderConfigured
                   }
                 >
@@ -2380,12 +2650,35 @@ export default function App() {
                 <button
                   className="button button-ghost"
                   type="button"
+                  onClick={() => void startMediaOnlyRerender()}
+                  disabled={
+                    busy !== null ||
+                    generationInProgress ||
+                    !successfulRealAudioJob ||
+                    (backgroundAudioEnabled && !backgroundAudio)
+                  }
+                  aria-describedby="media-rerender-note"
+                >
+                  {busy === "media-rerender"
+                    ? "正在提交媒体合成任务…"
+                    : activeJob?.job_type === "MEDIA_RERENDER" && generationInProgress
+                      ? `正在合成成片 ${activeJob.progress}%`
+                      : "仅重新合成成片"}
+                </button>
+                <button
+                  className="button button-ghost"
+                  type="button"
                   disabled={providerChecking || busy !== null}
                   onClick={() => void refreshProviderStatus()}
                 >
                   {providerChecking ? "正在检查…" : "重新检查 Provider"}
                 </button>
               </div>
+              <p id="media-rerender-note" className="media-rerender-note">
+                {successfulRealAudioJob
+                  ? "复用已有图片和旁白，不重新运行任何模型。"
+                  : "需要一个成功且素材完整的真实旁白 Job，才可仅重新合成成片。"}
+              </p>
               {audioRequestError && (
                 <FailureCard
                   detail={audioRequestError}
@@ -2492,15 +2785,13 @@ export default function App() {
                             </span>
                           )}
                         </div>
-                        {(() => {
-                          const playableAudioUrl = audioAssetUrl(generatedAudio?.audio_url);
-                          return playableAudioUrl ? (
-                            <div className="shot-audio-player">
-                              <span>逐镜头试听</span>
-                              <audio controls preload="none" src={playableAudioUrl} aria-label={`第 ${sequence} 镜旁白试听`} />
-                            </div>
-                          ) : null;
-                        })()}
+                        {hasRealAudio && (
+                          <ShotAudioPlayer
+                            src={audioAssetUrl(generatedAudio?.audio_url)}
+                            sequence={sequence}
+                            missingReason={generatedAudio?.audio_url_error?.summary}
+                          />
+                        )}
                         <dl className="shot-details">
                           <div>
                             <dt>Camera</dt>
@@ -2633,7 +2924,7 @@ export default function App() {
             </div>
             <div className="result-grid">
               <div className="video-frame">
-                <video controls preload="metadata" src={media.video}>
+                <video controls preload="metadata" src={media.video} poster={media.poster}>
                   当前浏览器不支持 HTML5 视频，请下载 MP4 后播放。
                 </video>
               </div>

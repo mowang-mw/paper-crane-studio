@@ -252,7 +252,7 @@ def _fake_real_audio_renderer(**kwargs: Any) -> dict[str, Any]:
     }
     manifest_path = output_dir / "manifest.json"
     manifest = {
-        "manifest_version": "m5.real-audio-export.v1",
+        "manifest_version": "m6.media-export.v1",
         "script_provider": "reused",
         "source_script_provider": context["providers"]["source_script_provider"],
         "image_provider": context["providers"]["image_provider"],

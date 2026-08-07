@@ -16,7 +16,13 @@ from urllib.parse import urlparse
 from . import crud
 from .config import Settings
 from .database import Database
-from .media.ffmpeg import sha256_file
+from .media.ffmpeg import (
+    MediaToolError,
+    ffprobe_json,
+    resolve_media_tools,
+    run_command,
+    sha256_file,
+)
 from .models import JobStatus
 from .providers.base import (
     AudioGenerationOptions,
@@ -48,10 +54,17 @@ from .services.audio_jobs import (
     REAL_AUDIO_PROVIDER_ID,
     REAL_AUDIO_SOURCE_TYPE,
     RealAudioJobError,
+    AudioValidationError,
     atomic_json,
     audio_gpu_handoff_status,
     build_media_timing_plan,
     load_audio_source_snapshot,
+    inspect_pcm16_wav,
+)
+from .services.media_rerender import (
+    MEDIA_RERENDER_JOB_TYPE,
+    MEDIA_RERENDER_PROVIDER_ID,
+    MediaRerenderJobError,
 )
 
 
@@ -230,7 +243,12 @@ class Worker:
             request_snapshot = dict(job.request_json or {})
             image_provider_id: str | None = None
             audio_provider_id: str | None = None
-            if job.job_type == REAL_AUDIO_JOB_TYPE:
+            media_only = job.job_type == MEDIA_RERENDER_JOB_TYPE
+            if media_only:
+                project_id = project.id
+                project_title = project.title
+                project_script_json = copy.deepcopy(project.script_json)
+            elif job.job_type == REAL_AUDIO_JOB_TYPE:
                 project_id = project.id
                 project_title = project.title
                 project_story = project.story
@@ -276,6 +294,16 @@ class Worker:
                         retryable=False,
                     )
                 project_script_json = copy.deepcopy(project.script_json)
+
+        if media_only:
+            self._process_media_rerender_job(
+                job_id=job_id,
+                project_id=project_id,
+                project_title=project_title,
+                project_script_json=project_script_json,
+                request_snapshot=request_snapshot,
+            )
+            return
 
         if audio_provider_id is not None:
             self._process_real_audio_job(
@@ -587,6 +615,7 @@ class Worker:
             "output_filename": f"short_{job_id}.mp4",
             "provider_id": "mock",
             "generation_context": generation_context,
+            **self._renderer_media_options(request_snapshot, project_id),
         }
         if source_media_path is None:
             renderer = self.renderer or self._default_renderer()
@@ -603,6 +632,12 @@ class Worker:
             raise RuntimeError("媒体函数未生成有效 manifest")
         relative_video = self._relative_project_path(output_path, project_id)
         relative_manifest = self._relative_project_path(manifest_path, project_id)
+        poster_value = rendered.get("poster_path")
+        relative_poster = (
+            self._relative_project_path(Path(str(poster_value)).resolve(), project_id)
+            if poster_value and Path(str(poster_value)).is_file()
+            else None
+        )
         video_sha256 = sha256_file(output_path)
         reported_sha256 = rendered.get("sha256")
         if reported_sha256 and reported_sha256 != video_sha256:
@@ -706,16 +741,446 @@ class Worker:
                 "source_type": "DETERMINISTIC_FALLBACK",
                 "media_reused": bool(rendered.get("media_reused")),
                 "reencoded": bool(rendered.get("reencoded", source_media_path is None)),
+                "motion_preset": request_snapshot.get("motion_preset"),
+                "background_audio": request_snapshot.get("background_audio"),
+                "poster_path": relative_poster,
                 **recovery_trace,
                 "video_url": f"/api/projects/{project_id}/exports/{export.id}/video",
                 "download_url": (
                     f"/api/projects/{project_id}/exports/{export.id}/video?download=true"
                 ),
                 "manifest_url": f"/api/projects/{project_id}/exports/{export.id}/manifest",
+                "poster_url": f"/api/projects/{project_id}/exports/{export.id}/poster",
             }
             crud.mark_job_succeeded(session, job=job, result_json=result_json)
             session.commit()
         print(f"[worker] job={job_id} SUCCEEDED export={export.id}", flush=True)
+
+    def _process_media_rerender_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        project_title: str,
+        project_script_json: dict[str, Any] | None,
+        request_snapshot: dict[str, Any],
+    ) -> None:
+        """Reuse validated ScriptV1, PNG and WAV assets; invoke FFmpeg only."""
+
+        if request_snapshot.get("media_only") is not True:
+            raise MediaRerenderJobError(
+                "MEDIA_RENDER_FAILED", "媒体重合成 Job 缺少 media_only 快照标记。"
+            )
+        for provider_name in ("script", "image", "audio"):
+            if (
+                request_snapshot.get(f"{provider_name}_provider") != "reused"
+                or request_snapshot.get(f"{provider_name}_provider_calls_expected") != 0
+            ):
+                raise MediaRerenderJobError(
+                    "MEDIA_RENDER_FAILED",
+                    f"媒体重合成禁止调用 {provider_name} Provider。",
+                )
+        try:
+            script = ScriptV1.model_validate(project_script_json)
+        except Exception as exc:
+            raise MediaRerenderJobError(
+                "SOURCE_SCRIPT_NOT_FOUND", "项目当前 ScriptV1 缺失或无法校验。"
+            ) from exc
+
+        source_script_job_id = str(request_snapshot.get("source_script_job_id") or "")
+        source_image_job_id = str(request_snapshot.get("source_image_job_id") or "")
+        source_audio_job_id = str(request_snapshot.get("source_audio_job_id") or "")
+        with self.database.session() as session:
+            source_script_job = crud.get_job(session, source_script_job_id)
+            source_image_job = crud.get_job(session, source_image_job_id)
+            source_audio_job = crud.get_job(session, source_audio_job_id)
+            if source_script_job is None:
+                raise MediaRerenderJobError(
+                    "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 不存在。"
+                )
+            if source_image_job is None:
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_JOB_NOT_FOUND", "来源真实图片 Job 不存在。"
+                )
+            if source_audio_job is None:
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_JOB_NOT_FOUND", "来源真实旁白 Job 不存在。"
+                )
+            if any(
+                item.project_id != project_id
+                for item in (source_script_job, source_image_job, source_audio_job)
+            ):
+                raise MediaRerenderJobError(
+                    "SOURCE_JOB_PROJECT_MISMATCH",
+                    "剧本、图片和旁白来源必须属于当前项目。",
+                )
+            if source_script_job.status != JobStatus.SUCCEEDED:
+                raise MediaRerenderJobError(
+                    "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 尚未成功。"
+                )
+            if (
+                source_image_job.status != JobStatus.SUCCEEDED
+                or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+                or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
+            ):
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_JOB_NOT_FOUND", "来源真实图片 Job 无效或尚未成功。"
+                )
+            if (
+                source_audio_job.status != JobStatus.SUCCEEDED
+                or source_audio_job.job_type != REAL_AUDIO_JOB_TYPE
+                or source_audio_job.provider_id != REAL_AUDIO_PROVIDER_ID
+            ):
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_JOB_NOT_FOUND", "来源真实旁白 Job 无效或尚未成功。"
+                )
+            image_result = copy.deepcopy(source_image_job.result_json or {})
+            audio_result = copy.deepcopy(source_audio_job.result_json or {})
+
+        if (
+            audio_result.get("source_script_job_id") != source_script_job_id
+            or audio_result.get("source_image_job_id") != source_image_job_id
+        ):
+            raise MediaRerenderJobError(
+                "SOURCE_JOB_PROJECT_MISMATCH", "来源旁白 Job 的上游追溯与快照不一致。"
+            )
+        if (
+            image_result.get("mock_image_fallback") is not False
+            or audio_result.get("mock_audio_fallback") is not False
+        ):
+            raise MediaRerenderJobError(
+                "MEDIA_RENDER_FAILED", "来源 Job 含 Mock 回退，已拒绝媒体重合成。"
+            )
+
+        raw_images = image_result.get("image_shots")
+        raw_audio = audio_result.get("audio_shots")
+        timing_plan = audio_result.get("timing_plan")
+        if not isinstance(raw_images, list) or len(raw_images) != len(script.shots):
+            raise MediaRerenderJobError(
+                "SOURCE_IMAGE_MISSING", "来源 Job 缺少完整的逐镜头真实 PNG。"
+            )
+        if not isinstance(raw_audio, list) or len(raw_audio) != len(script.shots):
+            raise MediaRerenderJobError(
+                "SOURCE_AUDIO_MISSING", "来源 Job 缺少完整的逐镜头真实 WAV。"
+            )
+        if not isinstance(timing_plan, dict):
+            raise MediaRerenderJobError(
+                "MEDIA_RENDER_FAILED", "来源真实旁白 Job 缺少 TimingPlan。"
+            )
+
+        keyframes = self._media_rerender_keyframes(
+            project_id=project_id,
+            script=script,
+            source_images=raw_images,
+        )
+        generated_assets = self._media_rerender_audio_assets(
+            project_id=project_id,
+            script=script,
+            source_audio=raw_audio,
+        )
+        job_dir = self.settings.project_dir(project_id) / "jobs" / job_id
+        timing_plan_path = job_dir / "timing_plan.json"
+        atomic_json(timing_plan_path, timing_plan)
+
+        initial_result = {
+            "stage": "MEDIA_RENDER",
+            "media_only": True,
+            "parent_job_id": source_audio_job_id,
+            "source_script_job_id": source_script_job_id,
+            "source_image_job_id": source_image_job_id,
+            "source_audio_job_id": source_audio_job_id,
+            "script_provider": "reused",
+            "image_provider": "reused",
+            "audio_provider": "reused",
+            "source_script_provider": request_snapshot.get("source_script_provider"),
+            "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+            "source_audio_provider": REAL_AUDIO_PROVIDER_ID,
+            "script_provider_calls": 0,
+            "image_provider_calls": 0,
+            "audio_provider_calls": 0,
+            "mock_image_fallback": False,
+            "mock_audio_fallback": False,
+            "audio_shots": raw_audio,
+            "audio_completed_count": len(generated_assets),
+            "audio_total_count": len(generated_assets),
+            "timing_plan": timing_plan,
+            "motion_preset": request_snapshot.get("motion_preset"),
+            "background_audio": request_snapshot.get("background_audio"),
+            "retry_of_job_id": request_snapshot.get("retry_of_job_id"),
+        }
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"媒体重合成准备完成时 Job 不再是 RUNNING：{job_id}")
+            job.result_json = initial_result
+            crud.set_job_progress(session, job, 20)
+            session.commit()
+
+        generation_context = {
+            "generation_job_id": job_id,
+            "job_type": MEDIA_RERENDER_JOB_TYPE,
+            "media_only": True,
+            "parent_job_id": source_audio_job_id,
+            "source_jobs": {
+                "script": source_script_job_id,
+                "image": source_image_job_id,
+                "audio": source_audio_job_id,
+            },
+            "reused_providers": {
+                "script_provider": "reused",
+                "image_provider": "reused",
+                "audio_provider": "reused",
+            },
+            "provider_calls": {"script": 0, "image": 0, "audio": 0},
+            "providers": {
+                "script_provider": "reused",
+                "source_script_provider": request_snapshot.get(
+                    "source_script_provider"
+                ),
+                "image_provider": REAL_IMAGE_PROVIDER_ID,
+                "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+                "audio_provider": REAL_AUDIO_PROVIDER_ID,
+                "audio_source_type": REAL_AUDIO_SOURCE_TYPE,
+                "video_source_type": "MEDIA_ONLY_RERENDER_FFMPEG",
+            },
+            "timing_plan": timing_plan,
+            "request": request_snapshot,
+            "mock_image_fallback": False,
+            "mock_audio_fallback": False,
+        }
+        output_dir = self.settings.project_dir(project_id) / "exports" / job_id
+        renderer = self.real_audio_renderer or self._default_real_audio_renderer()
+        timing_options = request_snapshot.get("timing_options")
+        max_duration = (
+            float(timing_options.get("max_total_duration_seconds", 60.0))
+            if isinstance(timing_options, dict)
+            else float(timing_plan.get("max_total_duration_seconds", 60.0))
+        )
+        try:
+            rendered = renderer(
+                root=self.settings.root_dir,
+                project_id=project_id,
+                project_title=project_title,
+                shots=self._real_audio_media_shots(script),
+                keyframes=keyframes,
+                audio_assets=[asset.as_dict() for asset in generated_assets],
+                timing_plan=timing_plan,
+                timing_plan_path=timing_plan_path,
+                output_dir=output_dir,
+                output_filename=f"short_{job_id}.mp4",
+                provider_id=REAL_AUDIO_PROVIDER_ID,
+                generation_context=generation_context,
+                max_total_duration_seconds=max_duration,
+                **self._renderer_media_options(request_snapshot, project_id),
+                progress_callback=lambda progress: self._set_running_job_progress(
+                    job_id, max(21, min(95, int(progress)))
+                ),
+            )
+        except MediaRerenderJobError:
+            raise
+        except Exception as exc:
+            raise MediaRerenderJobError(
+                "MEDIA_RENDER_FAILED",
+                f"FFmpeg 媒体重合成失败：{str(exc)[:500]}",
+                stage="MEDIA_RENDER",
+                retryable=True,
+            ) from exc
+
+        self._finish_real_audio_job(
+            job_id=job_id,
+            project_id=project_id,
+            request_snapshot=request_snapshot,
+            generated_assets=generated_assets,
+            rendered=rendered,
+            timing_plan=timing_plan,
+            timing_plan_path=timing_plan_path,
+            source_script_job_id=source_script_job_id,
+            source_script_provider=str(
+                request_snapshot.get("source_script_provider") or "reused"
+            ),
+            source_image_job_id=source_image_job_id,
+            source_image_provider=REAL_IMAGE_PROVIDER_ID,
+            audio_generation_total_seconds=0.0,
+            provider_report={
+                "model_load_count": 0,
+                "sequential_generation": True,
+                "max_audio_concurrency": 0,
+            },
+            gpu_observation={},
+        )
+
+    def _media_rerender_keyframes(
+        self,
+        *,
+        project_id: str,
+        script: ScriptV1,
+        source_images: list[Any],
+    ) -> list[dict[str, Any]]:
+        tools = resolve_media_tools()
+        expected_ids = {shot.id for shot in script.shots}
+        by_id: dict[str, dict[str, Any]] = {}
+        for raw in source_images:
+            if not isinstance(raw, dict) or not isinstance(raw.get("shot_id"), str):
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_MISSING", "来源 PNG 追溯字段无效。"
+                )
+            item = dict(raw)
+            shot_id = item["shot_id"]
+            try:
+                path = self._stored_project_path(str(item["image_path"]), project_id)
+                expected_sha = str(item["image_sha256"]).lower()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_MISSING", f"来源 PNG {shot_id} 路径无效。"
+                ) from exc
+            if (
+                shot_id not in expected_ids
+                or path.suffix.lower() != ".png"
+                or not path.is_file()
+                or sha256_file(path) != expected_sha
+            ):
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_MISSING", f"来源 PNG {shot_id} 缺失或哈希不匹配。"
+                )
+            try:
+                probe = ffprobe_json(tools, path)
+                streams = probe.get("streams")
+                video = [
+                    value
+                    for value in streams
+                    if isinstance(value, dict) and value.get("codec_type") == "video"
+                ] if isinstance(streams, list) else []
+                if len(video) != 1 or video[0].get("codec_name") != "png":
+                    raise MediaToolError("不是单流 PNG")
+                run_command(
+                    [
+                        tools.ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        path,
+                        "-map",
+                        "0:v:0",
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout_seconds=60,
+                )
+            except MediaToolError as exc:
+                raise MediaRerenderJobError(
+                    "SOURCE_IMAGE_MISSING", f"来源 PNG {shot_id} 无法解码。"
+                ) from exc
+            item["image_path"] = str(path)
+            for trace_field in ("workflow_path", "trace_path"):
+                trace_value = item.get(trace_field)
+                if isinstance(trace_value, str) and trace_value:
+                    item[trace_field] = str(
+                        self._stored_project_path(trace_value, project_id)
+                    )
+            by_id[shot_id] = item
+        if set(by_id) != expected_ids:
+            raise MediaRerenderJobError(
+                "SOURCE_IMAGE_MISSING", "来源 PNG 镜头集合与 ScriptV1 不一致。"
+            )
+        return [by_id[shot.id] for shot in script.shots]
+
+    def _media_rerender_audio_assets(
+        self,
+        *,
+        project_id: str,
+        script: ScriptV1,
+        source_audio: list[Any],
+    ) -> tuple[GeneratedAudioAsset, ...]:
+        tools = resolve_media_tools()
+        expected_ids = {shot.id for shot in script.shots}
+        by_id: dict[str, GeneratedAudioAsset] = {}
+        for raw in source_audio:
+            if not isinstance(raw, dict) or not isinstance(raw.get("shot_id"), str):
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_MISSING", "来源 WAV 追溯字段无效。"
+                )
+            shot_id = raw["shot_id"]
+            try:
+                path = self._stored_project_path(str(raw["audio_path"]), project_id)
+                trace_path = self._stored_project_path(
+                    str(raw["trace_path"]), project_id
+                )
+                expected_sha = str(raw["audio_sha256"]).lower()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_MISSING", f"来源 WAV {shot_id} 路径无效。"
+                ) from exc
+            if (
+                shot_id not in expected_ids
+                or path.suffix.lower() != ".wav"
+                or not path.is_file()
+                or not trace_path.is_file()
+                or sha256_file(path) != expected_sha
+            ):
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_MISSING", f"来源 WAV {shot_id} 缺失或哈希不匹配。"
+                )
+            try:
+                inspected = inspect_pcm16_wav(path)
+                run_command(
+                    [
+                        tools.ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        path,
+                        "-map",
+                        "0:a:0",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    timeout_seconds=120,
+                )
+            except (AudioValidationError, MediaToolError) as exc:
+                raise MediaRerenderJobError(
+                    "AUDIO_DECODE_FAILED", f"来源 WAV {shot_id} 无法完整解码。"
+                ) from exc
+            try:
+                asset = GeneratedAudioAsset(
+                    provider_id=REAL_AUDIO_PROVIDER_ID,
+                    model_id=str(raw["model_id"]),
+                    model_revision=str(raw["model_revision"]),
+                    model_sha256=str(raw["model_sha256"]),
+                    shot_id=shot_id,
+                    audio_path=path,
+                    trace_path=trace_path,
+                    text=str(raw["text"]),
+                    speaker=str(raw["speaker"]),
+                    language=str(raw["language"]),
+                    seed=int(raw["seed"]),
+                    sample_rate=int(inspected["sample_rate"]),
+                    channels=int(inspected["channels"]),
+                    sample_width_bytes=int(inspected["sample_width_bytes"]),
+                    duration_seconds=float(inspected["duration_seconds"]),
+                    generation_seconds=float(raw["generation_seconds"]),
+                    real_time_factor=float(raw["real_time_factor"]),
+                    peak_amplitude=float(inspected["peak_amplitude"]),
+                    rms=float(inspected["rms"]),
+                    audio_sha256=str(inspected["sha256"]),
+                    warnings=tuple(str(value) for value in raw.get("warnings", [])),
+                    reused=True,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MediaRerenderJobError(
+                    "SOURCE_AUDIO_MISSING", f"来源 WAV {shot_id} 追溯元数据无效。"
+                ) from exc
+            by_id[shot_id] = asset
+        if set(by_id) != expected_ids:
+            raise MediaRerenderJobError(
+                "SOURCE_AUDIO_MISSING", "来源 WAV 镜头集合与 ScriptV1 不一致。"
+            )
+        return tuple(by_id[shot.id] for shot in script.shots)
 
     def _process_real_audio_job(
         self,
@@ -1192,6 +1657,7 @@ class Worker:
                 max_total_duration_seconds=timing_options[
                     "max_total_duration_seconds"
                 ],
+                **self._renderer_media_options(request_snapshot, project_id),
                 progress_callback=lambda progress: self._set_running_job_progress(
                     job_id, max(66, min(95, int(progress)))
                 ),
@@ -1683,6 +2149,12 @@ class Worker:
         relative_video = self._relative_project_path(output_path, project_id)
         relative_manifest = self._relative_project_path(manifest_path, project_id)
         relative_timing = self._relative_project_path(timing_plan_path, project_id)
+        poster_value = rendered.get("poster_path")
+        relative_poster = (
+            self._relative_project_path(Path(str(poster_value)).resolve(), project_id)
+            if poster_value and Path(str(poster_value)).is_file()
+            else None
+        )
         video_sha256 = sha256_file(output_path)
         if rendered.get("sha256") not in (None, video_sha256):
             raise RealAudioJobError(
@@ -1804,6 +2276,9 @@ class Worker:
                     "mock_audio_used": False,
                     "cloud_api_used": False,
                     "voice_cloning_used": False,
+                    "motion_preset": request_snapshot.get("motion_preset"),
+                    "background_audio": request_snapshot.get("background_audio"),
+                    "poster_path": relative_poster,
                     "video_url": (
                         f"/api/projects/{project_id}/exports/{export.id}/video"
                     ),
@@ -1814,9 +2289,39 @@ class Worker:
                     "manifest_url": (
                         f"/api/projects/{project_id}/exports/{export.id}/manifest"
                     ),
+                    "poster_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/poster"
+                    ),
                     "request_snapshot": request_snapshot,
+                    "media_only": request_snapshot.get("media_only") is True,
+                    "parent_job_id": request_snapshot.get("parent_job_id"),
+                    "source_audio_job_id": request_snapshot.get(
+                        "source_audio_job_id"
+                    ),
+                    "source_audio_provider": request_snapshot.get(
+                        "source_audio_provider"
+                    ),
+                    "audio_provider_calls": (
+                        0 if request_snapshot.get("media_only") is True else None
+                    ),
+                    "warnings": rendered.get("warnings", []),
                 }
             )
+            if request_snapshot.get("media_only") is True:
+                current.update(
+                    {
+                        "script_provider": "reused",
+                        "image_provider": "reused",
+                        "audio_provider": "reused",
+                        "script_provider_calls": 0,
+                        "image_provider_calls": 0,
+                        "audio_provider_calls": 0,
+                        "source_type": "MEDIA_ONLY_RERENDER_FFMPEG",
+                        "video_source_type": "MEDIA_ONLY_RERENDER_FFMPEG",
+                        "mock_image_fallback": False,
+                        "mock_audio_fallback": False,
+                    }
+                )
             crud.mark_job_succeeded(session, job=job, result_json=current)
             session.commit()
         print(
@@ -2174,6 +2679,7 @@ class Worker:
                 output_filename=f"short_{job_id}.mp4",
                 provider_id=REAL_IMAGE_PROVIDER_ID,
                 generation_context=generation_context,
+                **self._renderer_media_options(request_snapshot, project_id),
                 progress_callback=lambda progress: self._set_running_job_progress(
                     job_id, max(66, min(95, int(progress)))
                 ),
@@ -2534,6 +3040,12 @@ class Worker:
             )
         relative_video = self._relative_project_path(output_path, project_id)
         relative_manifest = self._relative_project_path(manifest_path, project_id)
+        poster_value = rendered.get("poster_path")
+        relative_poster = (
+            self._relative_project_path(Path(str(poster_value)).resolve(), project_id)
+            if poster_value and Path(str(poster_value)).is_file()
+            else None
+        )
         video_sha256 = sha256_file(output_path)
         if rendered.get("sha256") not in (None, video_sha256):
             raise RealImageJobError(
@@ -2626,6 +3138,9 @@ class Worker:
                     "gpu_memory_observed": gpu_observation,
                     "comfyui_start_count": comfyui_start_count,
                     "mock_image_fallback": False,
+                    "motion_preset": request_snapshot.get("motion_preset"),
+                    "background_audio": request_snapshot.get("background_audio"),
+                    "poster_path": relative_poster,
                     "video_url": (
                         f"/api/projects/{project_id}/exports/{export.id}/video"
                     ),
@@ -2634,6 +3149,9 @@ class Worker:
                     ),
                     "manifest_url": (
                         f"/api/projects/{project_id}/exports/{export.id}/manifest"
+                    ),
+                    "poster_url": (
+                        f"/api/projects/{project_id}/exports/{export.id}/poster"
                     ),
                     "request_snapshot": request_snapshot,
                 }
@@ -2752,6 +3270,31 @@ class Worker:
         except ValueError as exc:
             raise RuntimeError(f"媒体输出越过当前项目目录：{path}") from exc
         return path.resolve().relative_to(data_root).as_posix()
+
+    def _renderer_media_options(
+        self, request_snapshot: dict[str, Any], project_id: str
+    ) -> dict[str, Any]:
+        """解析新任务的媒体快照；缺字段的旧 Job 保持历史渲染行为。"""
+
+        preset = request_snapshot.get("motion_preset")
+        if preset is not None and preset not in {
+            "static",
+            "gentle_zoom",
+            "cinematic_pan",
+        }:
+            raise RuntimeError(f"Job motion_preset 快照无效：{preset}")
+        raw_background = request_snapshot.get("background_audio")
+        background: dict[str, Any] | None = None
+        if isinstance(raw_background, dict):
+            background = dict(raw_background)
+            if background.get("enabled") is True:
+                stored_path = background.get("storage_path")
+                if not isinstance(stored_path, str) or not stored_path:
+                    raise RuntimeError("启用背景音的 Job 快照缺少 storage_path")
+                background["resolved_path"] = str(
+                    self._stored_project_path(stored_path, project_id)
+                )
+        return {"motion_preset": preset, "background_audio": background}
 
     def run_forever(self, *, poll_seconds: float | None = None) -> None:
         interval = self.settings.worker_poll_seconds if poll_seconds is None else poll_seconds
