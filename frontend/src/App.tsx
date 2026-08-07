@@ -7,6 +7,7 @@ import {
   type FormEvent,
   type ChangeEvent,
   type MouseEvent,
+  type ReactNode,
 } from "react";
 import {
   API_BASE,
@@ -61,6 +62,8 @@ const STORY_MIN_CHARS = 10;
 const STORY_MAX_CHARS = 3000;
 const STORY_RECOMMENDED_MIN_CHARS = 50;
 const STORY_RECOMMENDED_MAX_CHARS = 1000;
+const PROJECTS_PER_PAGE = 8;
+const SELECTED_PROJECT_STORAGE_KEY = "paper-crane:selected-project";
 
 type SectionName = "create" | "project" | "shots" | "result";
 type Notice = { kind: "info" | "success"; message: string; action?: SectionName };
@@ -80,6 +83,42 @@ type PresentedShot = {
   provider_id?: string;
   generation_parameters?: Record<string, unknown>;
 };
+
+type ProjectSignal = {
+  hasExport: boolean;
+  realScript: boolean;
+  realImage: boolean;
+  realAudio: boolean;
+  realChain: boolean;
+};
+
+type ProjectFilter = "all" | "real" | "mock";
+
+type ProjectPreference = { urlId: string | null; storageId: string | null };
+
+function readInitialProjectPreference(): ProjectPreference {
+  if (typeof window === "undefined") return { urlId: null, storageId: null };
+  const urlId = new URLSearchParams(window.location.search).get("project")?.trim() || null;
+  let storageId: string | null = null;
+  try {
+    storageId = window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY)?.trim() || null;
+  } catch {
+    storageId = null;
+  }
+  return { urlId, storageId };
+}
+
+function persistSelectedProjectId(projectId: string): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("project", projectId);
+  window.history.replaceState(window.history.state, "", url);
+  try {
+    window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, projectId);
+  } catch {
+    // Private browsing or a disabled storage area must not block selection.
+  }
+}
 
 const statusLabels: Record<JobStatus, string> = {
   QUEUED: "等待 Worker",
@@ -689,6 +728,61 @@ function jobScriptProvider(job: GenerationJob | null): string | null {
   );
 }
 
+function isRealScriptJob(job: GenerationJob | null): boolean {
+  if (!job || job.status !== "SUCCEEDED") return false;
+  const sourceProvider =
+    textValue(job.result_json?.source_script_provider) ??
+    textValue(job.request_json?.source_script_provider);
+  return jobScriptProvider(job) === "llamacpp" || sourceProvider === "llamacpp";
+}
+
+function summarizeProjectDetail(value: ProjectDetail): ProjectSignal {
+  const succeededJobs = value.recent_jobs.filter((job) => job.status === "SUCCEEDED");
+  const realScript = succeededJobs.some(isRealScriptJob);
+  const realImage = succeededJobs.some((job) => {
+    if (!isRealImageJob(job)) return false;
+    return (
+      job.result_json?.mock_image_fallback === false ||
+      textValue(job.result_json?.image_source_type)?.includes("REAL") === true
+    );
+  });
+  const realAudio = succeededJobs.some((job) => {
+    if (!isRealAudioJob(job)) return false;
+    return (
+      job.result_json?.mock_audio_fallback === false ||
+      textValue(job.result_json?.audio_source_type)?.includes("REAL") === true ||
+      jobAudioProvider(job) === REAL_AUDIO_PROVIDER_ID
+    );
+  });
+  const hasExport = value.latest_export !== null;
+  return {
+    hasExport,
+    realScript,
+    realImage,
+    realAudio,
+    realChain: hasExport && realScript && realImage && realAudio,
+  };
+}
+
+function projectSignalLabel(signal: ProjectSignal | undefined): string {
+  if (!signal) return "正在读取制作状态";
+  if (signal.realChain) return "真实成片";
+  if (signal.realScript || signal.realImage || signal.realAudio) return "真实链路未完成";
+  return signal.hasExport ? "Mock 成片" : "Mock / 测试";
+}
+
+function projectSortScore(
+  project: Project,
+  signal: ProjectSignal | undefined,
+  selectedId: string | null,
+): number {
+  if (signal?.realChain) return 0;
+  if (signal?.hasExport) return 1;
+  if (selectedId === project.id) return 2;
+  if (signal?.realScript || signal?.realImage || signal?.realAudio) return 3;
+  return 4;
+}
+
 function jobModelId(job: GenerationJob | null): string | null {
   if (!job) return null;
   const scriptTrace = recordValue(job.result_json?.script_trace);
@@ -1173,6 +1267,33 @@ function StageNavigation({
   );
 }
 
+function StageAccordion({
+  title,
+  summary,
+  status,
+  open,
+  children,
+}: {
+  title: string;
+  summary: string;
+  status: string;
+  open: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <details className="stage-accordion" open={open}>
+      <summary>
+        <span className="stage-accordion-copy">
+          <strong>{title}</strong>
+          <small>{summary}</small>
+        </span>
+        <span className="stage-accordion-status">{status}</span>
+      </summary>
+      <div className="stage-accordion-body">{children}</div>
+    </details>
+  );
+}
+
 export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthError, setHealthError] = useState("");
@@ -1188,6 +1309,11 @@ export default function App() {
   const [backgroundLoading, setBackgroundLoading] = useState(false);
   const [desiredShotCount, setDesiredShotCount] = useState<DesiredShotCount>(4);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectSignals, setProjectSignals] = useState<Record<string, ProjectSignal>>({});
+  const [projectSearch, setProjectSearch] = useState("");
+  const [projectFilter, setProjectFilter] = useState<ProjectFilter>("all");
+  const [projectPage, setProjectPage] = useState(1);
+  const [initialProjectPreference] = useState<ProjectPreference>(() => readInitialProjectPreference());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
@@ -1216,6 +1342,7 @@ export default function App() {
   const providerSelectionTouchedRef = useRef(false);
   const pendingNavigationRef = useRef<"project" | "result" | null>(null);
   const handledSucceededJobsRef = useRef(new Set<string>());
+  const projectSignalsRef = useRef<Record<string, ProjectSignal>>({});
   const mediaPolishOptions = {
     motionPreset,
     backgroundAudioEnabled,
@@ -1242,11 +1369,46 @@ export default function App() {
     focusTarget.focus({ preventScroll: true });
   }, []);
 
+  const loadProjectSignals = useCallback(async (items: Project[]) => {
+    const missing = items.filter((project) => !projectSignalsRef.current[project.id]);
+    if (missing.length === 0) return;
+    const resolved = await Promise.all(
+      missing.map(async (project) => {
+        try {
+          const value = await getProject(project.id);
+          return [project.id, summarizeProjectDetail(value)] as const;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const next = { ...projectSignalsRef.current };
+    for (const item of resolved) {
+      if (item) next[item[0]] = item[1];
+    }
+    projectSignalsRef.current = next;
+    setProjectSignals(next);
+    setSelectedId((current) => {
+      if (current || items.length === 0) return current;
+      const persisted =
+        items.find((project) => project.id === initialProjectPreference.urlId) ??
+        items.find((project) => project.id === initialProjectPreference.storageId);
+      if (persisted) return persisted.id;
+      return [...items]
+        .sort(
+          (left, right) =>
+            projectSortScore(left, next[left.id], null) -
+            projectSortScore(right, next[right.id], null),
+        )[0]?.id ?? null;
+    });
+  }, [initialProjectPreference]);
+
   const refreshProjects = useCallback(async () => {
     const items = await listProjects();
     setProjects(items);
+    void loadProjectSignals(items);
     return items;
-  }, []);
+  }, [loadProjectSignals]);
 
   const refreshProviderStatus = useCallback(async (): Promise<ProvidersStatus | null> => {
     setProviderChecking(true);
@@ -1275,6 +1437,9 @@ export default function App() {
   const refreshDetail = useCallback(async (projectId: string) => {
     const value = await getProject(projectId);
     setDetail(value);
+    const signal = summarizeProjectDetail(value);
+    projectSignalsRef.current = { ...projectSignalsRef.current, [projectId]: signal };
+    setProjectSignals(projectSignalsRef.current);
     const pending = value.recent_jobs.find(
       (job) => job.status === "QUEUED" || job.status === "RUNNING",
     );
@@ -1288,7 +1453,7 @@ export default function App() {
       .then(([healthValue, items]) => {
         if (cancelled) return;
         setHealth(healthValue);
-        if (items.length > 0) setSelectedId((current) => current ?? items[0].id);
+        if (items.length === 0) setSelectedId(null);
       })
       .catch((cause: unknown) => {
         if (cancelled) return;
@@ -1316,6 +1481,12 @@ export default function App() {
     setAudioRequestError(null);
     refreshDetail(selectedId).catch((cause: unknown) => setError(readableError(cause)));
   }, [refreshDetail, selectedId]);
+
+  useEffect(() => {
+    if (selectedId && projects.some((project) => project.id === selectedId)) {
+      persistSelectedProjectId(selectedId);
+    }
+  }, [projects, selectedId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1889,6 +2060,74 @@ export default function App() {
     shots: Boolean(scriptShots.length),
     result: Boolean(media),
   };
+  const filteredProjects = useMemo(() => {
+    const query = projectSearch.trim().toLocaleLowerCase();
+    return projects
+      .filter((project) => {
+        const signal = projectSignals[project.id];
+        const matchesQuery = !query || project.title.toLocaleLowerCase().includes(query);
+        const matchesFilter =
+          projectFilter === "all" ||
+          (projectFilter === "real" && signal?.realChain === true) ||
+          (projectFilter === "mock" && signal !== undefined && !signal.realChain);
+        return matchesQuery && matchesFilter;
+      })
+      .sort(
+        (left, right) =>
+          projectSortScore(left, projectSignals[left.id], selectedId) -
+          projectSortScore(right, projectSignals[right.id], selectedId),
+      );
+  }, [projectFilter, projectSearch, projectSignals, projects, selectedId]);
+  const projectTotalPages = Math.max(1, Math.ceil(filteredProjects.length / PROJECTS_PER_PAGE));
+  const currentProjectPage = Math.min(projectPage, projectTotalPages);
+  const visibleProjects = filteredProjects.slice(
+    (currentProjectPage - 1) * PROJECTS_PER_PAGE,
+    currentProjectPage * PROJECTS_PER_PAGE,
+  );
+  const selectedProjectVisible = selectedId
+    ? filteredProjects.some((project) => project.id === selectedId)
+    : false;
+  const projectFilterChangedRef = useRef(false);
+  useEffect(() => {
+    projectFilterChangedRef.current = true;
+    setProjectPage(1);
+  }, [projectFilter, projectSearch]);
+  useEffect(() => {
+    setProjectPage((current) => Math.min(Math.max(1, current), projectTotalPages));
+  }, [projectTotalPages]);
+  useEffect(() => {
+    if (projectFilterChangedRef.current) {
+      projectFilterChangedRef.current = false;
+      return;
+    }
+    if (!selectedId) return;
+    const selectedIndex = filteredProjects.findIndex((project) => project.id === selectedId);
+    if (selectedIndex >= 0) {
+      setProjectPage(Math.floor(selectedIndex / PROJECTS_PER_PAGE) + 1);
+    }
+  }, [filteredProjects, selectedId]);
+  const demoScriptState =
+    scriptJob?.status === "SUCCEEDED"
+      ? isRealScriptJob(scriptJob)
+        ? "REAL SCRIPT"
+        : "MOCK SCRIPT"
+      : "未生成";
+  const demoImageState =
+    sourceImageJob?.status === "SUCCEEDED"
+      ? "REAL IMAGE"
+      : "未生成";
+  const demoAudioIsReal =
+    exportIsRealAudio ||
+    (audioDisplayJob?.status === "SUCCEEDED" &&
+      (audioDisplayJob.result_json?.mock_audio_fallback === false ||
+        jobAudioProvider(audioDisplayJob) === REAL_AUDIO_PROVIDER_ID));
+  const demoAudioState =
+    demoAudioIsReal
+      ? "REAL TTS"
+      : audioDisplayJob?.status === "SUCCEEDED"
+        ? "MOCK AUDIO"
+        : "未生成";
+  const demoVideoState = media ? "FINAL VIDEO READY" : "未生成";
 
   return (
     <div className="app-shell">
@@ -1961,6 +2200,47 @@ export default function App() {
             )}
           </div>
         )}
+
+        <section className="demo-status-summary" aria-labelledby="demo-status-title">
+          <div className="demo-status-heading">
+            <div>
+              <p className="eyebrow">演示状态</p>
+              <h2 id="demo-status-title">真实演示链路</h2>
+            </div>
+            <span className="demo-project-label">
+              {selectedProject?.title ?? "尚未选择项目"}
+            </span>
+          </div>
+          <div className="demo-chain" aria-label="真实模型链路">
+            <span>Qwen3-4B</span><i aria-hidden="true">↓</i>
+            <span>Animagine XL 4.0</span><i aria-hidden="true">↓</i>
+            <span>Qwen3-TTS Serena</span><i aria-hidden="true">↓</i>
+            <span>FFmpeg</span>
+          </div>
+          <div className="demo-status-grid">
+            {[
+              ["Script", demoScriptState],
+              ["Image", demoImageState],
+              ["Audio", demoAudioState],
+              ["Final video", demoVideoState],
+            ].map(([label, state]) => (
+              <div className="demo-status-item" key={label}>
+                <small>{label}</small>
+                <strong className={state.startsWith("REAL") || state === "FINAL VIDEO READY" ? "is-ready" : ""}>
+                  {state}
+                </strong>
+              </div>
+            ))}
+          </div>
+          {media && (
+            <button className="demo-result-link" type="button" onClick={() => scrollToSection("result")}>
+              查看最终成片 →
+            </button>
+          )}
+          <p className="demo-limit-note">
+            当前版本：静态动漫关键帧 + FFmpeg 镜头运动；真实本地模型按阶段交接 GPU 运行。
+          </p>
+        </section>
 
         <section
           className="section create-section"
@@ -2081,10 +2361,42 @@ export default function App() {
           </div>
           <div className="projects-layout">
             <aside className="project-list" aria-label="项目列表">
+              <div className="project-list-toolbar">
+                <label className="project-search-label">
+                  <span>搜索项目</span>
+                  <input
+                    type="search"
+                    value={projectSearch}
+                    onChange={(event) => setProjectSearch(event.target.value)}
+                    placeholder="输入项目名称"
+                    aria-label="搜索项目名称"
+                  />
+                </label>
+                <div className="project-filters" role="group" aria-label="项目筛选">
+                  {([
+                    ["all", "全部"],
+                    ["real", "真实成片"],
+                    ["mock", "Mock / 测试"],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value}
+                      className={projectFilter === value ? "is-active" : ""}
+                      type="button"
+                      aria-pressed={projectFilter === value}
+                      onClick={() => setProjectFilter(value)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="project-list-hint">真实链路和最终成片优先显示</p>
+              </div>
               {projects.length === 0 ? (
                 <div className="empty-state">还没有项目，请先创建一个故事。</div>
+              ) : filteredProjects.length === 0 ? (
+                <div className="empty-state">没有匹配的项目，请调整搜索或筛选条件。</div>
               ) : (
-                projects.map((project) => (
+                visibleProjects.map((project) => (
                   <div className="project-list-entry" key={project.id}>
                     <div className={`project-item ${selectedId === project.id ? "is-active" : ""}`}>
                       <button
@@ -2101,7 +2413,17 @@ export default function App() {
                         <span className="project-index">{project.title.slice(0, 1)}</span>
                         <span className="project-summary">
                           <strong>{project.title}</strong>
-                          <small>{projectStatus(project)}</small>
+                          <small>
+                            {projectStatus(project)} · {projectSignalLabel(projectSignals[project.id])}
+                          </small>
+                        </span>
+                        <span className="project-badges" aria-label="项目类型">
+                          {projectSignals[project.id]?.realChain && (
+                            <em className="project-badge is-real">真实链路</em>
+                          )}
+                          {projectSignals[project.id]?.realChain && (
+                            <em className="project-badge is-export">真实成片</em>
+                          )}
                         </span>
                         <span aria-hidden="true">›</span>
                       </button>
@@ -2149,6 +2471,32 @@ export default function App() {
                     )}
                   </div>
                 ))
+              )}
+              {selectedId && !selectedProjectVisible && projects.some((project) => project.id === selectedId) && (
+                <p className="project-filtered-note" role="status">
+                  当前项目已保留，但不符合当前搜索或筛选条件。
+                </p>
+              )}
+              {projectTotalPages > 1 && (
+                <nav className="project-pagination" aria-label="项目列表分页">
+                  <button
+                    type="button"
+                    disabled={currentProjectPage === 1}
+                    onClick={() => setProjectPage((current) => Math.max(1, current - 1))}
+                  >
+                    上一页
+                  </button>
+                  <span aria-live="polite">第 {currentProjectPage} / {projectTotalPages} 页</span>
+                  <button
+                    type="button"
+                    disabled={currentProjectPage === projectTotalPages}
+                    onClick={() =>
+                      setProjectPage((current) => Math.min(projectTotalPages, current + 1))
+                    }
+                  >
+                    下一页
+                  </button>
+                </nav>
               )}
             </aside>
 
@@ -2260,18 +2608,27 @@ export default function App() {
                     </p>
                   )}
                   {latestVisibleJob && (
-                    <JobPanel
-                      job={latestVisibleJob}
-                      retrying={busy === "retry"}
-                      onRetry={() => retryGeneration(latestVisibleJob)}
-                      onViewResult={() => scrollToSection("result")}
-                      configuredModelId={currentJobProviderDescriptor?.model_id}
-                      configuredImageModelId={realImageProviderDescriptor?.model_id}
-                      configuredAudioModelId={realAudioProviderDescriptor?.model_id}
-                      actualShotCount={
-                        latestVisibleJob.status === "SUCCEEDED" ? scriptShots.length : undefined
-                      }
-                    />
+                    <details
+                      className="technical-details job-technical-details"
+                      open={generationInProgress || latestVisibleJob.status === "FAILED"}
+                    >
+                      <summary>
+                        <strong>运行与追溯</strong>
+                        <span>{latestVisibleJob.status} · {latestVisibleJob.progress}%</span>
+                      </summary>
+                      <JobPanel
+                        job={latestVisibleJob}
+                        retrying={busy === "retry"}
+                        onRetry={() => retryGeneration(latestVisibleJob)}
+                        onViewResult={() => scrollToSection("result")}
+                        configuredModelId={currentJobProviderDescriptor?.model_id}
+                        configuredImageModelId={realImageProviderDescriptor?.model_id}
+                        configuredAudioModelId={realAudioProviderDescriptor?.model_id}
+                        actualShotCount={
+                          latestVisibleJob.status === "SUCCEEDED" ? scriptShots.length : undefined
+                        }
+                      />
+                    </details>
                   )}
                 </>
               )}
@@ -2294,6 +2651,12 @@ export default function App() {
               </div>
             </div>
 
+            <StageAccordion
+              title="AI 剧本"
+              summary={`${jobScriptProvider(scriptJob) ?? "Script Provider 未报告"} · ${scriptShots.length} 个镜头`}
+              status={scriptJob?.status === "SUCCEEDED" ? "已生成" : "未生成"}
+              open={currentStage === "project" || !media}
+            >
             <div className="script-overview">
               <div className="script-overview-heading">
                 <div>
@@ -2370,7 +2733,14 @@ export default function App() {
                 </section>
               </div>
             </div>
+            </StageAccordion>
 
+            <StageAccordion
+              title="动漫画面"
+              summary={`${realImageProviderDescriptor?.display_name ?? "Animagine XL 4.0"} · ${jobImageCompletedCount(sourceImageJob ?? imageDisplayJob)}/${jobImageTotalCount(sourceImageJob ?? imageDisplayJob, scriptShots.length)} 张关键帧`}
+              status={exportIsRealImage ? "真实成片" : sourceImageJob?.status === "SUCCEEDED" ? "已生成" : "未开始"}
+              open={currentStage === "project" && !exportIsRealImage}
+            >
             <section className="real-image-control" aria-labelledby="real-image-title">
               <div className="real-image-heading">
                 <div>
@@ -2458,7 +2828,14 @@ export default function App() {
                 />
               )}
             </section>
+            </StageAccordion>
 
+            <StageAccordion
+              title="配音与成片"
+              summary={`${audioSpeaker} · ${exportAudioGenerationSeconds?.toFixed(1) ?? "—"} 秒 TTS`}
+              status={exportIsRealAudio ? "真实旁白已完成" : audioDisplayJob?.status === "SUCCEEDED" ? "已生成" : "未开始"}
+              open={currentStage === "project" && !exportIsRealAudio}
+            >
             <section className="real-audio-control" aria-labelledby="real-audio-title">
               <div className="real-image-heading">
                 <div>
@@ -2687,6 +3064,7 @@ export default function App() {
                 />
               )}
             </section>
+            </StageAccordion>
 
             <div className="shot-grid">
               {[...scriptShots]
@@ -2792,7 +3170,9 @@ export default function App() {
                             missingReason={generatedAudio?.audio_url_error?.summary}
                           />
                         )}
-                        <dl className="shot-details">
+                        <details className="technical-details shot-technical-details">
+                          <summary>技术详情</summary>
+                          <dl className="shot-details">
                           <div>
                             <dt>Camera</dt>
                             <dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd>
@@ -2817,7 +3197,8 @@ export default function App() {
                               </dd>
                             </div>
                           )}
-                        </dl>
+                          </dl>
+                        </details>
                       </div>
                     </article>
                   );
@@ -2931,7 +3312,9 @@ export default function App() {
               <aside className="export-info">
                 <p className="eyebrow">EXPORT READY</p>
                 <h3>{detail.project.title}</h3>
-                <dl>
+                <details className="technical-details export-technical-details">
+                  <summary>技术详情与追溯</summary>
+                  <dl>
                   <div><dt>时长</dt><dd>{detail.latest_export.duration_seconds?.toFixed(2) ?? "—"} 秒</dd></div>
                   <div><dt>镜头</dt><dd>{scriptShots.length} 个</dd></div>
                   <div><dt>Script Provider</dt><dd title={scriptProviderUsed}>{scriptProviderUsed}</dd></div>
@@ -2953,7 +3336,8 @@ export default function App() {
                     <dt>SHA-256</dt>
                     <dd title={detail.latest_export.sha256}>{detail.latest_export.sha256?.slice(0, 12) ?? "—"}…</dd>
                   </div>
-                </dl>
+                  </dl>
+                </details>
                 <div className="download-actions">
                   <a className="button button-light" href={media.download} download>
                     下载 MP4
