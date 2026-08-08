@@ -23,6 +23,7 @@ from backend.app.providers.comfyui import (
     build_positive_prompt,
     character_anchor,
     deterministic_shot_seed,
+    make_workflow,
 )
 from backend.app.providers.mock import MockImageProvider
 from backend.app.script_schema import Character, Scene, ScriptV1, Shot
@@ -134,6 +135,86 @@ def _requests(
             options=options,
         )
         for shot in script.shots
+    )
+
+
+def _station_requests(tmp_path: Path) -> tuple[ImageGenerationRequest, ...]:
+    character = Character(
+        id="girl",
+        name="短发少女",
+        role="主角",
+        appearance="短发，穿着深色雨衣，面容清秀",
+        personality="安静、好奇",
+        costume="深色雨衣",
+        consistency_prompt="保持短发、深色雨衣和清秀面容",
+    )
+    scene_descriptions = (
+        "雨夜，末班车站，少女独自等待列车",
+        "少女发现长椅下有一只发着微光的纸飞机",
+        "雨渐渐停下，远处列车驶来，她拿着纸飞机走向亮起的车门",
+    )
+    visuals = (
+        "雨夜，少女站在长椅旁等待列车，聚焦在少女身上。",
+        "少女蹲下身，发现长椅下有一只发着微光的纸飞机。",
+        "雨渐渐停下，远处列车驶来，少女拿着纸飞机走向亮起的车门。",
+    )
+    cameras = (
+        "缓慢推进，聚焦在少女身上",
+        "镜头从纸飞机缓缓升起",
+        "镜头从车门缓缓推进",
+    )
+    scenes = [
+        Scene(
+            id=f"scene{index}",
+            name=f"场景{index}",
+            description=scene_descriptions[index - 1],
+            time="雨停后" if index == 3 else "雨夜",
+            lighting=(
+                "明亮的车门灯光，雨停后的晴朗天空"
+                if index == 3
+                else "阴暗的天色，车站灯光微弱"
+            ),
+            consistency_prompt="保持车站环境和少女外观",
+        )
+        for index in range(1, 4)
+    ]
+    shots = [
+        Shot(
+            id=f"shot{index}",
+            index=index,
+            title=f"镜头{index}",
+            scene_id=f"scene{index}",
+            character_ids=["girl"],
+            visual_description=visuals[index - 1],
+            camera=cameras[index - 1],
+            image_prompt=visuals[index - 1],
+            negative_prompt=None,
+            narration=f"镜头{index}旁白。",
+            duration_seconds=8.0 if index == 1 else 6.0,
+        )
+        for index in range(1, 4)
+    ]
+    script = ScriptV1(
+        schema_version="script.v1",
+        title="车站故事",
+        synopsis="少女在车站发现纸飞机，并走向驶来的列车。",
+        characters=[character],
+        scenes=scenes,
+        shots=shots,
+    )
+    options = ImageGenerationOptions()
+    return tuple(
+        ImageGenerationRequest(
+            project_id="project-station",
+            job_id="job-station",
+            script=script,
+            shot=shot,
+            characters=(character,),
+            scene=scenes[shot.index - 1],
+            output_dir=tmp_path / "station-images",
+            options=options,
+        )
+        for shot in shots
     )
 
 
@@ -267,6 +348,99 @@ def test_character_anchor_preserves_common_script_v1_appearance_details() -> Non
         assert expected in anchor
 
 
+def test_station_story_prompt_preserves_entities_actions_and_bound_relations(
+    tmp_path: Path,
+) -> None:
+    requests = _station_requests(tmp_path)
+    prompts = [build_positive_prompt(request) for request in requests]
+
+    for prompt, layers in prompts:
+        assert "1girl" in prompt
+        assert "short hair" in layers["character_anchor"]
+        assert "dark raincoat" in layers["character_anchor"]
+
+    shot1 = prompts[0][0]
+    assert "train station" in shot1
+    assert "waiting" in shot1
+    assert "standing beside the bench" in shot1
+    assert "character-focused composition" in shot1
+
+    shot2 = prompts[1][0]
+    assert "glowing paper airplane" in shot2
+    assert "glowing paper airplane under the bench" in shot2
+    assert "crouching" in shot2
+    assert "discovering" in shot2
+    assert "low-angle composition" in shot2
+    assert "paper airplane in foreground" in shot2
+
+    shot3 = prompts[2][0]
+    assert "holding a paper airplane" in shot3
+    assert "walking toward an illuminated train door" in shot3
+    assert "approaching train in the distance" in shot3
+    assert "after the rain" in shot3
+    assert "illuminated train door prominent in frame" in shot3
+    assert "blue and violet night lighting" not in shot3
+
+
+def test_prompt_and_seed_are_deterministic_and_workflow_parameters_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    request = _station_requests(tmp_path)[1]
+    first_prompt, first_layers = build_positive_prompt(request)
+    second_prompt, second_layers = build_positive_prompt(request)
+    seed = deterministic_shot_seed(request.options.base_seed, request.shot.index)
+
+    assert (first_prompt, first_layers) == (second_prompt, second_layers)
+    assert seed == 20_260_804
+    workflow = make_workflow(
+        model_filename="animagine-xl-4.0-opt.safetensors",
+        positive_prompt=first_prompt,
+        negative_prompt=NEGATIVE_PROMPT,
+        seed=seed,
+        request=request,
+        filename_prefix="station-shot2",
+    )
+    assert workflow["1"]["inputs"]["ckpt_name"] == "animagine-xl-4.0-opt.safetensors"
+    assert workflow["3"]["inputs"]["text"] == NEGATIVE_PROMPT
+    assert workflow["4"]["inputs"] == {
+        "width": 1024,
+        "height": 576,
+        "batch_size": 1,
+    }
+    assert workflow["5"]["inputs"] == {
+        "seed": 20_260_804,
+        "steps": 24,
+        "cfg": 5.0,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "denoise": 1.0,
+        "model": ["1", 0],
+        "positive": ["2", 0],
+        "negative": ["3", 0],
+        "latent_image": ["4", 0],
+    }
+
+
+def test_station_trace_records_compound_and_unrecognized_semantics(
+    tmp_path: Path,
+) -> None:
+    factory = _FakeSessionFactory()
+    provider = _provider(tmp_path, factory)
+    request = _station_requests(tmp_path)[1]
+
+    asset = provider.generate(request=request)
+
+    trace = json.loads(asset.trace_path.read_text(encoding="utf-8"))
+    audit = trace["semantic_audit"]
+    compounds = audit["compound_semantic_cues"]["visual_description"]
+    assert any(
+        item["tags"] == "glowing paper airplane under the bench"
+        for item in compounds
+    )
+    assert "recognized_semantic_cues" in audit
+    assert "unrecognized_text_segments" in audit
+
+
 def test_batch_starts_one_session_generates_sequentially_and_writes_trace(
     tmp_path: Path,
 ) -> None:
@@ -317,6 +491,8 @@ def test_batch_starts_one_session_generates_sequentially_and_writes_trace(
     ]["shared_character_anchors"]
     assert request_trace["base_seed"] == 7000
     assert request_trace["seed"] == 7001
+    assert request_trace["semantic_audit"]["recognized_semantic_cues"]
+    assert "unrecognized_text_segments" in request_trace["semantic_audit"]
 
 
 @pytest.mark.parametrize("shot_count", [3, 4, 5])

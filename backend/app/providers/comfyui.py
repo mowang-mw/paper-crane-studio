@@ -37,7 +37,7 @@ SOURCE_TYPE = "REAL_LOCAL_MODEL"
 QUALITY_TAGS = "masterpiece, high score, great score, absurdres"
 PROJECT_STYLE_TAGS = (
     "original character, cinematic anime keyframe, polished anime film still, "
-    "detailed background, blue and violet night lighting, safe"
+    "detailed background"
 )
 NEGATIVE_PROMPT = (
     "lowres, bad anatomy, bad hands, extra fingers, missing fingers, malformed hands, "
@@ -245,6 +245,85 @@ def _png_info(path: Path) -> dict[str, Any]:
     }
 
 
+_COMPOUND_SEMANTIC_CUES: tuple[tuple[str, str, str], ...] = (
+    (
+        "长椅下有一只发着微光的纸飞机",
+        "glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "长椅下有一只发光的纸飞机",
+        "glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "走向亮起的车门",
+        "walking toward an illuminated train door",
+        "action",
+    ),
+    (
+        "远处列车驶来",
+        "approaching train in the distance",
+        "action",
+    ),
+    ("手中拿着纸飞机", "holding a paper airplane", "action"),
+    ("拿着纸飞机", "holding a paper airplane", "action"),
+    ("发着微光的纸飞机", "glowing paper airplane", "prop"),
+    ("发光的纸飞机", "glowing paper airplane", "prop"),
+    ("发光纸飞机", "glowing paper airplane", "prop"),
+    ("站在长椅旁", "standing beside the bench", "spatial_relation"),
+    (
+        "从纸飞机缓缓升起",
+        "low-angle composition, paper airplane in foreground, character behind",
+        "composition",
+    ),
+    (
+        "从车门缓缓推进",
+        "illuminated train door prominent in frame",
+        "composition",
+    ),
+    ("聚焦在少女身上", "character-focused composition", "composition"),
+    ("远处的车站建筑", "station architecture in the distance", "composition"),
+    ("雨渐渐停下", "after the rain, rain has stopped", "lighting_weather"),
+    ("雨停后的晴朗天空", "clear sky after the rain", "lighting_weather"),
+    ("明亮的车门灯光", "bright illuminated train door", "lighting_weather"),
+    ("阴暗的天色", "dark overcast sky", "lighting_weather"),
+    ("车站灯光微弱", "dim station lights", "lighting_weather"),
+)
+
+_STRUCTURED_SEMANTIC_CUES: tuple[tuple[str, str, str], ...] = (
+    ("末班车站", "last train station", "scene"),
+    ("车站", "train station", "scene"),
+    ("站台", "train platform", "scene"),
+    ("长椅", "bench", "prop"),
+    ("列车", "train", "prop"),
+    ("火车", "train", "prop"),
+    ("车门", "train door", "prop"),
+    ("纸飞机", "paper airplane", "prop"),
+    ("深色雨衣", "dark raincoat", "character"),
+    ("雨衣", "raincoat", "character"),
+    ("短发", "short hair", "character"),
+    ("面容清秀", "refined facial features", "character"),
+    ("独自等待", "waiting alone", "action"),
+    ("等待", "waiting", "action"),
+    ("站立", "standing", "action"),
+    ("蹲下身", "crouching", "action"),
+    ("蹲下", "crouching", "action"),
+    ("发现", "discovering", "action"),
+    ("拿着", "holding", "action"),
+    ("走向", "walking toward", "action"),
+    ("驶来", "approaching", "action"),
+    ("长椅下", "under the bench", "spatial_relation"),
+    ("手中", "in her hand", "spatial_relation"),
+    ("远处", "in the distance", "spatial_relation"),
+    ("雨停", "after the rain", "lighting_weather"),
+    ("雨滴", "rain droplets", "lighting_weather"),
+    ("亮起", "illuminated", "lighting_weather"),
+    ("晴朗天空", "clear sky", "lighting_weather"),
+    ("缓慢推进", "character-focused composition", "composition"),
+    ("缓缓推进", "character-focused composition", "composition"),
+)
+
 _TAG_TRANSLATIONS: tuple[tuple[str, str], ...] = (
     ("深夜旧书店", "inside an old bookstore at midnight, wooden bookshelves"),
     ("旧书店", "old bookstore, wooden bookshelves"),
@@ -316,16 +395,71 @@ def _deduplicate_tags(values: list[str]) -> str:
     return ", ".join(result)
 
 
-def _semantic_tags(value: str, *, fallback: str) -> str:
+def _semantic_tag_details(
+    value: str,
+    *,
+    fallback: str,
+    category: str | None = None,
+) -> dict[str, Any]:
     remaining = value
     translated: list[str] = []
-    for chinese, english in _TAG_TRANSLATIONS:
+    recognized: list[dict[str, str]] = []
+    compound: list[dict[str, str]] = []
+
+    for chinese, english, cue_category in _COMPOUND_SEMANTIC_CUES:
+        if category is not None and cue_category != category:
+            continue
         if chinese in remaining:
             translated.append(english)
+            cue = {"source": chinese, "tags": english, "category": cue_category}
+            recognized.append(cue)
+            compound.append(cue)
             remaining = remaining.replace(chinese, " ")
-    ascii_fragments = re.findall(r"[A-Za-z][A-Za-z0-9 _-]{1,80}", remaining)
-    translated.extend(fragment.strip().lower() for fragment in ascii_fragments)
-    return _deduplicate_tags(translated) or fallback
+
+    if category is None:
+        for chinese, english in _TAG_TRANSLATIONS:
+            if chinese in remaining:
+                translated.append(english)
+                recognized.append(
+                    {"source": chinese, "tags": english, "category": "legacy"}
+                )
+                remaining = remaining.replace(chinese, " ")
+
+    for chinese, english, cue_category in _STRUCTURED_SEMANTIC_CUES:
+        if category is not None and cue_category != category:
+            continue
+        if chinese in remaining:
+            translated.append(english)
+            recognized.append(
+                {"source": chinese, "tags": english, "category": cue_category}
+            )
+            remaining = remaining.replace(chinese, " ")
+
+    if category is None:
+        ascii_fragments = re.findall(r"[A-Za-z][A-Za-z0-9 _-]{1,80}", remaining)
+        translated.extend(fragment.strip().lower() for fragment in ascii_fragments)
+
+    unrecognized = [
+        fragment
+        for fragment in re.findall(r"[\u3400-\u9fff]{2,}", remaining)
+        if fragment.strip()
+    ]
+    return {
+        "tags": _deduplicate_tags(translated) or fallback,
+        "recognized": recognized,
+        "compound": compound,
+        "unrecognized": unrecognized,
+    }
+
+
+def _semantic_tags(value: str, *, fallback: str) -> str:
+    return str(_semantic_tag_details(value, fallback=fallback)["tags"])
+
+
+def _category_tags(value: str, category: str, *, fallback: str = "") -> str:
+    return str(
+        _semantic_tag_details(value, fallback=fallback, category=category)["tags"]
+    )
 
 
 def character_anchor(character: Any) -> str:
@@ -333,16 +467,68 @@ def character_anchor(character: Any) -> str:
 
     combined = ", ".join(
         [
+            str(character.name),
+            str(character.role),
             str(character.appearance),
             str(character.costume),
             str(character.consistency_prompt),
         ]
     )
-    return _semantic_tags(combined, fallback="original character, consistent appearance")
+    details = _semantic_tags(combined, fallback="")
+    return _deduplicate_tags(
+        ["original character, consistent appearance", details]
+    )
+
+
+def _prompt_semantic_audit(request: ImageGenerationRequest) -> dict[str, Any]:
+    sources = {
+        "characters": ", ".join(
+            ", ".join(
+                [
+                    str(item.name),
+                    str(item.role),
+                    str(item.appearance),
+                    str(item.costume),
+                    str(item.consistency_prompt),
+                ]
+            )
+            for item in request.characters
+        ),
+        "scene": ", ".join(
+            [
+                request.scene.description,
+                request.scene.time,
+                request.scene.lighting,
+                request.scene.consistency_prompt,
+            ]
+        ),
+        "visual_description": request.shot.visual_description,
+        "image_prompt": request.shot.image_prompt,
+        "camera": request.shot.camera,
+    }
+    recognized: dict[str, list[dict[str, str]]] = {}
+    compound: dict[str, list[dict[str, str]]] = {}
+    unrecognized: dict[str, list[str]] = {}
+    for name, value in sources.items():
+        details = _semantic_tag_details(value, fallback="")
+        if details["recognized"]:
+            recognized[name] = list(details["recognized"])
+        if details["compound"]:
+            compound[name] = list(details["compound"])
+        if details["unrecognized"]:
+            unrecognized[name] = list(details["unrecognized"])
+    return {
+        "recognized_semantic_cues": recognized,
+        "compound_semantic_cues": compound,
+        "unrecognized_text_segments": unrecognized,
+    }
 
 
 def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
     character_tags = [character_anchor(item) for item in request.characters]
+    subject_source = ", ".join(
+        f"{item.name}, {item.role}" for item in request.characters
+    )
     scene_source = ", ".join(
         [
             request.scene.description,
@@ -351,28 +537,57 @@ def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
             request.scene.consistency_prompt,
         ]
     )
-    camera_tags = _semantic_tags(request.shot.camera, fallback="medium wide shot")
+    visual_source = ", ".join(
+        [request.shot.visual_description, request.shot.image_prompt]
+    )
+    camera_source = ", ".join([request.shot.camera, request.shot.visual_description])
+    composition = _category_tags(
+        camera_source,
+        "composition",
+        fallback="medium wide shot",
+    )
     return {
         "quality": QUALITY_TAGS,
         "project_style": PROJECT_STYLE_TAGS,
+        "subject": _semantic_tags(subject_source, fallback="story character"),
+        "character_anchor": _deduplicate_tags(character_tags),
         "shared_character_anchors": _deduplicate_tags(character_tags),
         "scene": _semantic_tags(scene_source, fallback="detailed story environment"),
-        "visual_description": _semantic_tags(
-            request.shot.visual_description,
-            fallback="clear narrative action",
+        "action": _category_tags(visual_source, "action"),
+        "prop": _category_tags(visual_source, "prop"),
+        "spatial_relation": _category_tags(visual_source, "spatial_relation"),
+        "lighting_weather": _category_tags(
+            f"{scene_source}, {visual_source}",
+            "lighting_weather",
         ),
-        "shot_image_prompt": _semantic_tags(
-            request.shot.image_prompt,
-            fallback="anime story illustration",
+        "composition": composition,
+        "visual_description": _semantic_tags(visual_source, fallback=""),
+        "shot_image_prompt": _semantic_tags(request.shot.image_prompt, fallback=""),
+        "format": (
+            "safe, horizontal composition, 16:9, anime movie keyframe, "
+            "no text, no watermark"
         ),
-        "composition": camera_tags,
-        "format": "horizontal composition, 16:9, anime movie keyframe, no text, no watermark",
     }
 
 
 def build_positive_prompt(request: ImageGenerationRequest) -> tuple[str, dict[str, str]]:
     layers = build_prompt_layers(request)
-    return _deduplicate_tags(list(layers.values())), layers
+    ordered_layers = (
+        "quality",
+        "project_style",
+        "subject",
+        "character_anchor",
+        "scene",
+        "action",
+        "prop",
+        "spatial_relation",
+        "lighting_weather",
+        "composition",
+        "visual_description",
+        "shot_image_prompt",
+        "format",
+    )
+    return _deduplicate_tags([layers[name] for name in ordered_layers]), layers
 
 
 def deterministic_shot_seed(base_seed: int, shot_index: int) -> int:
@@ -1109,6 +1324,7 @@ class ComfyUIImageProvider(ImageProvider):
                 "camera": request.shot.camera,
             },
             "prompt_layers": prompt_layers,
+            "semantic_audit": _prompt_semantic_audit(request),
             "positive_prompt": positive_prompt,
             "negative_prompt": NEGATIVE_PROMPT,
             "workflow_path": str(workflow_path),
