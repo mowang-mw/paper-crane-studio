@@ -148,6 +148,10 @@ def test_generation_and_repair_prompts_require_explicit_story_ending() -> None:
         assert "最后一镜" in text
         assert "合并相邻" in text
         assert "不得删除" in text
+        assert "单张静态动漫关键帧" in text
+        assert "frozen moment" in text
+        assert "不要描述镜头缓缓推进" in text
+        assert "空间关系必须明确、无歧义" in text
     assert "自动规划" in generation_text
     assert "3—5" in generation_text
 

@@ -138,7 +138,11 @@ def _requests(
     )
 
 
-def _station_requests(tmp_path: Path) -> tuple[ImageGenerationRequest, ...]:
+def _station_requests(
+    tmp_path: Path,
+    *,
+    shot2_visual: str | None = None,
+) -> tuple[ImageGenerationRequest, ...]:
     character = Character(
         id="girl",
         name="短发少女",
@@ -150,12 +154,12 @@ def _station_requests(tmp_path: Path) -> tuple[ImageGenerationRequest, ...]:
     )
     scene_descriptions = (
         "雨夜，末班车站，少女独自等待列车",
-        "少女发现长椅下有一只发着微光的纸飞机",
+        shot2_visual or "少女发现长椅下有一只发着微光的纸飞机",
         "雨渐渐停下，远处列车驶来，她拿着纸飞机走向亮起的车门",
     )
     visuals = (
         "雨夜，少女站在长椅旁等待列车，聚焦在少女身上。",
-        "少女蹲下身，发现长椅下有一只发着微光的纸飞机。",
+        shot2_visual or "少女蹲下身，发现长椅下有一只发着微光的纸飞机。",
         "雨渐渐停下，远处列车驶来，少女拿着纸飞机走向亮起的车门。",
     )
     cameras = (
@@ -382,6 +386,72 @@ def test_station_story_prompt_preserves_entities_actions_and_bound_relations(
     assert "blue and violet night lighting" not in shot3
 
 
+def test_crouching_is_retained_alongside_compound_paper_airplane_relation(
+    tmp_path: Path,
+) -> None:
+    request = _station_requests(tmp_path)[1]
+    prompt, layers = build_positive_prompt(request)
+
+    assert "crouching" in layers["action"]
+    assert "crouching" in prompt
+    assert "glowing paper airplane under the bench" in prompt
+
+
+@pytest.mark.parametrize(
+    "visual",
+    ["少女蹲在长椅旁", "少女蹲着看纸飞机"],
+)
+def test_crouching_synonyms_are_mapped(tmp_path: Path, visual: str) -> None:
+    prompt, layers = build_positive_prompt(
+        _station_requests(tmp_path, shot2_visual=visual)[1]
+    )
+
+    assert "crouching" in layers["action"]
+    assert "crouching" in prompt
+
+
+def test_bound_paper_airplane_is_not_repeated_as_generic_tags(tmp_path: Path) -> None:
+    request = _station_requests(
+        tmp_path,
+        shot2_visual="少女蹲在长椅旁，发现长椅下发光的纸飞机",
+    )[1]
+    prompt, layers = build_positive_prompt(request)
+    tags = [tag.strip() for tag in prompt.split(",")]
+
+    assert "one glowing paper airplane under the bench" in tags
+    assert "glowing paper airplane" not in tags
+    assert "paper airplane" not in tags
+    assert tags.count("one glowing paper airplane under the bench") == 1
+    assert "crouching" in layers["action"]
+
+
+def test_ambiguous_person_under_bench_does_not_bind_prop_under_bench(
+    tmp_path: Path,
+) -> None:
+    request = _station_requests(
+        tmp_path,
+        shot2_visual="短发少女蹲在长椅下，发现一只发着微光的纸飞机。",
+    )[1]
+    prompt, layers = build_positive_prompt(request)
+    tags = [tag.strip() for tag in prompt.split(",")]
+
+    assert "crouching" in layers["action"]
+    assert "glowing paper airplane" in tags
+    assert "under the bench" not in tags
+    assert "one glowing paper airplane under the bench" not in tags
+
+
+def test_entity_binding_does_not_remove_holding_action(tmp_path: Path) -> None:
+    request = _station_requests(
+        tmp_path,
+        shot2_visual="少女拿着纸飞机站在长椅旁",
+    )[1]
+    prompt, layers = build_positive_prompt(request)
+
+    assert "holding a paper airplane" in layers["action"]
+    assert "holding a paper airplane" in prompt
+
+
 def test_prompt_and_seed_are_deterministic_and_workflow_parameters_are_unchanged(
     tmp_path: Path,
 ) -> None:
@@ -434,7 +504,7 @@ def test_station_trace_records_compound_and_unrecognized_semantics(
     audit = trace["semantic_audit"]
     compounds = audit["compound_semantic_cues"]["visual_description"]
     assert any(
-        item["tags"] == "glowing paper airplane under the bench"
+        item["tags"] == "one glowing paper airplane under the bench"
         for item in compounds
     )
     assert "recognized_semantic_cues" in audit

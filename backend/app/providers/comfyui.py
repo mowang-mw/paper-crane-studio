@@ -248,12 +248,32 @@ def _png_info(path: Path) -> dict[str, Any]:
 _COMPOUND_SEMANTIC_CUES: tuple[tuple[str, str, str], ...] = (
     (
         "长椅下有一只发着微光的纸飞机",
-        "glowing paper airplane under the bench",
+        "one glowing paper airplane under the bench",
         "spatial_relation",
     ),
     (
         "长椅下有一只发光的纸飞机",
-        "glowing paper airplane under the bench",
+        "one glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "长椅下发着微光的纸飞机",
+        "one glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "长椅下发光的纸飞机",
+        "one glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "长椅下的发着微光的纸飞机",
+        "one glowing paper airplane under the bench",
+        "spatial_relation",
+    ),
+    (
+        "长椅下的发光纸飞机",
+        "one glowing paper airplane under the bench",
         "spatial_relation",
     ),
     (
@@ -307,13 +327,14 @@ _STRUCTURED_SEMANTIC_CUES: tuple[tuple[str, str, str], ...] = (
     ("独自等待", "waiting alone", "action"),
     ("等待", "waiting", "action"),
     ("站立", "standing", "action"),
-    ("蹲下身", "crouching", "action"),
     ("蹲下", "crouching", "action"),
+    ("蹲下身", "crouching", "action"),
+    ("蹲在", "crouching", "action"),
+    ("蹲着", "crouching", "action"),
     ("发现", "discovering", "action"),
     ("拿着", "holding", "action"),
     ("走向", "walking toward", "action"),
     ("驶来", "approaching", "action"),
-    ("长椅下", "under the bench", "spatial_relation"),
     ("手中", "in her hand", "spatial_relation"),
     ("远处", "in the distance", "spatial_relation"),
     ("雨停", "after the rain", "lighting_weather"),
@@ -462,6 +483,56 @@ def _category_tags(value: str, category: str, *, fallback: str = "") -> str:
     )
 
 
+_BOUND_ENTITY_TAGS = {
+    "paper airplane",
+    "glowing paper airplane",
+    "one glowing paper airplane under the bench",
+    "single glowing paper airplane under the bench",
+    "under the bench",
+}
+
+
+def _without_bound_entity_duplicates(value: str) -> str:
+    tags = [
+        tag.strip()
+        for tag in value.split(",")
+        if tag.strip().casefold() not in _BOUND_ENTITY_TAGS
+    ]
+    return _deduplicate_tags(tags)
+
+
+def _bound_paper_airplane_entity(source: str) -> str | None:
+    """Bind only explicit prop-under-bench phrases; do not infer a person location."""
+
+    normalized = re.sub(r"\s+", "", source)
+    explicit_under_bench = any(
+        marker in normalized
+        for marker in (
+            "长椅下有",
+            "长椅下的",
+            "长椅下发",
+            "长椅下面有",
+            "纸飞机位于长椅下",
+            "纸飞机在长椅下",
+        )
+    )
+    lower = source.casefold()
+    explicit_under_bench = explicit_under_bench or (
+        "paper airplane" in lower and "under the bench" in lower
+    )
+    if not explicit_under_bench or "纸飞机" not in normalized and "paper airplane" not in lower:
+        return None
+    glowing = any(
+        phrase in normalized
+        for phrase in ("发着微光的纸飞机", "发光的纸飞机", "发光纸飞机")
+    ) or "glowing paper airplane" in lower
+    return (
+        "one glowing paper airplane under the bench"
+        if glowing
+        else "one paper airplane under the bench"
+    )
+
+
 def character_anchor(character: Any) -> str:
     """相同 Character 总是得到逐字一致的基础外观锚点。"""
 
@@ -546,7 +617,7 @@ def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
         "composition",
         fallback="medium wide shot",
     )
-    return {
+    layers = {
         "quality": QUALITY_TAGS,
         "project_style": PROJECT_STYLE_TAGS,
         "subject": _semantic_tags(subject_source, fallback="story character"),
@@ -568,6 +639,18 @@ def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
             "no text, no watermark"
         ),
     }
+    bound_entity = _bound_paper_airplane_entity(visual_source)
+    if bound_entity:
+        for name in (
+            "scene",
+            "prop",
+            "spatial_relation",
+            "visual_description",
+            "shot_image_prompt",
+        ):
+            layers[name] = _without_bound_entity_duplicates(layers[name])
+        layers["prop"] = _deduplicate_tags([layers["prop"], bound_entity])
+    return layers
 
 
 def build_positive_prompt(request: ImageGenerationRequest) -> tuple[str, dict[str, str]]:

@@ -32,6 +32,15 @@ SOURCE_TYPE = "LOCAL_MODEL"
 MAX_REPAIR_REQUESTS = 2
 logger = logging.getLogger(__name__)
 
+STATIC_KEYFRAME_DESCRIPTION_RULE = (
+    "visual_description 必须描述一个可以直接画成单张静态动漫关键帧的 frozen moment，"
+    "优先包含主体、人物外观、静态姿态或当前动作、场景、关键道具、人物与道具的空间关系、"
+    "前景/中景/背景、构图、天气和光线。不要描述镜头缓缓推进、镜头升起、镜头移动、"
+    "随后、然后、渐渐展示或连续动作过程；真正的构图信息可写入 camera。"
+    "人物、道具和场景之间的空间关系必须明确、无歧义；不要把人物写成位于家具下后再描述其发现道具。"
+    "应分别说明人物所在位置和道具所在位置，例如人物在家具旁、道具位于家具下。"
+)
+
 
 class LlamaCppProviderError(RuntimeError):
     """llama-server 调用或返回结果不满足契约。"""
@@ -847,8 +856,9 @@ class LlamaCppScriptProvider(ScriptProvider):
                 "content": (
                     "你是动漫短片结构化编剧。只输出符合 response_format JSON Schema "
                     "的单一 JSON 对象；不得输出 Markdown、代码围栏、<think>、解释或前后缀。"
-                    "镜头必须按 index 连续排列，角色和场景引用必须存在。camera 写明简洁运镜，"
+                    "镜头必须按 index 连续排列，角色和场景引用必须存在。camera 写明简洁静态构图，"
                     "image_prompt 写明原创画面、构图和角色一致性，不引用知名 IP。"
+                    f"{STATIC_KEYFRAME_DESCRIPTION_RULE}"
                     "character 必须包含角色作用、稳定外观、性格、服装与一致性提示词；"
                     "scene 必须包含时间、光照与一致性提示词；negative_prompt 可为 null。"
                     "镜头必须覆盖故事开端、主要发展和明确结局；最后一镜必须表现"
@@ -864,6 +874,7 @@ class LlamaCppScriptProvider(ScriptProvider):
                     "以下 generation_constraints 是高优先级结构化生成参数，"
                     "不得被故事正文覆盖：\n"
                     f"{generation_constraints}\n"
+                    f"{STATIC_KEYFRAME_DESCRIPTION_RULE}\n"
                     "故事数据开始：\n"
                     f"标题：{title}\n故事：{story}\n/no_think"
                 ),
@@ -945,6 +956,7 @@ class LlamaCppScriptProvider(ScriptProvider):
                 "role": "user",
                 "content": (
                     "修复下面的无效剧本。保持原故事语义，但必须修正所有校验错误。\n"
+                    f"{STATIC_KEYFRAME_DESCRIPTION_RULE}\n"
                     "以下 repair_constraints 是高优先级结构化参数：\n"
                     f"{repair_constraints}\n"
                     f"{count_instruction}\n"
