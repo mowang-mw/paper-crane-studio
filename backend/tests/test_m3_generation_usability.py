@@ -214,7 +214,7 @@ def test_fixed_shot_count_mismatch_repairs_once_and_never_silently_crops(
             desired_shot_count=5,
         )
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert provider.last_script is None
     assert caught.value.parsed_payload is not None
     assert len(caught.value.parsed_payload["shots"]) == 4
@@ -231,10 +231,12 @@ def test_fixed_shot_count_mismatch_repairs_once_and_never_silently_crops(
     assert [attempt["kind"] for attempt in trace["attempts"]] == [
         "initial",
         "repair",
+        "repair",
     ]
     raw_paths = [Path(attempt["raw_response_path"]) for attempt in trace["attempts"]]
     assert raw_paths[0].name == "first_raw_response.json"
     assert raw_paths[1].name == "repair_raw_response.json"
+    assert raw_paths[2].name == "repair_2_raw_response.json"
     assert all(path.is_file() and path.stat().st_size > 0 for path in raw_paths)
     report_path = Path(error["validation_report_path"])
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -346,7 +348,7 @@ def test_controlled_invalid_model_outputs_have_specific_chinese_diagnostics(
             desired_shot_count=4,
         )
 
-    assert calls == 2
+    assert calls == 3
     error = caught.value.generation_error
     assert error is not None
     assert error["stage"] == "REPAIR_FAILED"
@@ -418,7 +420,7 @@ def test_worker_failed_job_exposes_structured_error_and_safe_trace_paths(
         generation_service=service,
     )
     assert worker.run_once() is True
-    assert request_count == 2
+    assert request_count == 3
 
     with database.session() as session:
         failed = crud.get_job(session, job_id)

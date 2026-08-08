@@ -551,7 +551,7 @@ def _normalize_relaxed_script(
         original_total=original_total,
         normalized_total=normalized_total,
         reason=(
-            "唯一一次修复后仅剩时长约束错误；"
+            "修复后仅剩时长约束错误；"
             f"按原始时长比例缩放并以 0.1 秒确定性取整到 "
             f"{NORMALIZED_TOTAL_BY_SHOT_COUNT[len(script.shots)]:g} 秒，"
             "未增删、合并或重排镜头"

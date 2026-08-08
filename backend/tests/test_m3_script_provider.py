@@ -362,6 +362,88 @@ def test_llamacpp_allows_exactly_one_repair_request(tmp_path: Path) -> None:
     assert "校验错误" in repair_payload["messages"][1]["content"]
 
 
+def test_llamacpp_repairs_narration_with_explicit_bounded_constraints(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    invalid = valid_script_payload()
+    invalid["shots"] = invalid["shots"][:3]
+    invalid["scenes"] = invalid["scenes"][:3]
+    invalid["shots"][0]["narration"] = "字" * 60
+    repaired = copy.deepcopy(invalid)
+    repaired["shots"][0]["narration"] = "少女在雨夜发现发光的纸飞机。"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = invalid if len(requests) == 1 else repaired
+        return httpx.Response(
+            200,
+            json=completion_envelope(json.dumps(payload, ensure_ascii=False)),
+        )
+
+    provider = make_provider(tmp_path, handler)
+    result = provider.generate(
+        title="雨夜车站",
+        story="雨夜里，少女在车站发现了一只发光的纸飞机。",
+        desired_shot_count=3,
+    )
+
+    assert len(requests) == 2
+    assert len(result.script.shots) == 3
+    assert result.script.shots[0].narration == repaired["shots"][0]["narration"]
+    repair_text = json.loads(requests[1].content)["messages"][1]["content"]
+    assert '"shot_id":"shot_01"' in repair_text
+    assert '"shot_duration_seconds":7.0' in repair_text
+    assert '"current_narration_characters":60' in repair_text
+    assert '"maximum_narration_characters":35' in repair_text
+    assert "保留原意" in repair_text
+    assert "不增加新剧情" in repair_text
+    assert "不得修改镜头数量" in repair_text
+    assert "ScriptV1" in repair_text
+    assert "纯 JSON" in repair_text
+
+
+def test_llamacpp_allows_one_additional_bounded_repair(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    invalid = valid_script_payload()
+    invalid["shots"][0]["narration"] = "字" * 60
+    still_invalid = copy.deepcopy(invalid)
+    still_invalid["shots"][0]["narration"] = "更" * 60
+    repaired = valid_script_payload()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = (
+            invalid
+            if len(requests) == 1
+            else still_invalid
+            if len(requests) == 2
+            else repaired
+        )
+        return httpx.Response(
+            200,
+            json=completion_envelope(json.dumps(payload, ensure_ascii=False)),
+        )
+
+    provider = make_provider(tmp_path, handler)
+    result = provider.generate(title="夜航", story="少女与纸鹤飞过夜空。")
+
+    assert isinstance(result.script, ScriptV1)
+    assert len(requests) == 3
+    assert provider.last_trace is not None
+    assert [item["kind"] for item in provider.last_trace["attempts"]] == [
+        "initial",
+        "repair",
+        "repair",
+    ]
+    assert provider.last_trace["attempts"][2]["repair_attempt"] == 2
+    report_path = Path(provider.last_trace["validation_report_path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["repair_request_limit"] == 2
+    assert len(report["repair_attempts"]) == 2
+    assert (report_path.parent / "repair_2_raw_response.json").is_file()
+
+
 def test_llamacpp_unused_entities_are_warnings_without_repair(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -440,12 +522,12 @@ def test_llamacpp_rejects_non_pure_output_without_mock_fallback(
     provider = make_provider(tmp_path, handler)
     with pytest.raises(LlamaCppOutputError, match="未执行 Mock 回退"):
         provider.generate(title="夜航", story="纸鹤飞过夜空。")
-    assert calls == 2
+    assert calls == 3
     assert provider.last_script is None
     assert provider.last_trace is not None
     assert provider.last_trace["status"] == "FAILED"
-    assert len(provider.last_trace["attempts"]) == 2
-    assert len(list((tmp_path / "raw-responses").rglob("attempt_*.response.bin"))) == 2
+    assert len(provider.last_trace["attempts"]) == 3
+    assert len(list((tmp_path / "raw-responses").rglob("attempt_*.response.bin"))) == 3
 
 
 def test_llamacpp_repairs_schema_invalid_pure_json(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from typing import Any
 import httpx
 from ..script_schema import (
     DesiredShotCount,
+    NARRATION_MAX_CHARACTERS_PER_SECOND,
     ScriptCandidateAnalysis,
     ScriptV1,
     analyze_script_candidate,
@@ -27,6 +29,7 @@ from .base import ScriptProvider, ScriptResult, script_result_from_v1
 
 
 SOURCE_TYPE = "LOCAL_MODEL"
+MAX_REPAIR_REQUESTS = 2
 logger = logging.getLogger(__name__)
 
 
@@ -206,6 +209,52 @@ def _default_duration_normalization() -> dict[str, Any]:
     }
 
 
+def _narration_repair_constraints(
+    invalid_payload: dict[str, Any] | None,
+    validation_errors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Extract exact per-shot narration limits from the invalid candidate."""
+
+    if not isinstance(invalid_payload, dict):
+        return []
+    shots = invalid_payload.get("shots")
+    if not isinstance(shots, list):
+        return []
+    failing_paths = {
+        error.get("path")
+        for error in validation_errors
+        if isinstance(error, dict)
+        and error.get("code") == "NARRATION_TOO_LONG_FOR_DURATION"
+    }
+    constraints: list[dict[str, Any]] = []
+    for position, shot in enumerate(shots):
+        path = f"$.shots[{position}].narration"
+        if path not in failing_paths or not isinstance(shot, dict):
+            continue
+        narration = shot.get("narration")
+        duration = shot.get("duration_seconds")
+        if (
+            not isinstance(narration, str)
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+        ):
+            continue
+        current_characters = len(re.sub(r"\s+", "", narration))
+        maximum_characters = int(
+            max(float(duration), 0) * NARRATION_MAX_CHARACTERS_PER_SECOND
+        )
+        constraints.append(
+            {
+                "shot_id": shot.get("id"),
+                "shot_duration_seconds": duration,
+                "current_narration_characters": current_characters,
+                "maximum_narration_characters": maximum_characters,
+                "path": path,
+            }
+        )
+    return constraints
+
+
 def _suggestions_for_stage(stage: str) -> list[str]:
     if stage == "MODEL_REQUEST":
         return [
@@ -246,8 +295,8 @@ def _generation_error_payload(
         else None
     )
     repair_path = (
-        attempt_items[1].get("raw_response_path")
-        if len(attempt_items) >= 2 and isinstance(attempt_items[1], dict)
+        attempt_items[-1].get("raw_response_path")
+        if len(attempt_items) >= 2 and isinstance(attempt_items[-1], dict)
         else None
     )
     return {
@@ -272,7 +321,7 @@ def _generation_error_payload(
 
 
 class LlamaCppScriptProvider(ScriptProvider):
-    """同步文本 Provider；非法输出只允许一次显式修复，不回退 Mock。"""
+    """同步文本 Provider；非法输出最多两次显式修复，不回退 Mock。"""
 
     provider_id = "llamacpp"
 
@@ -287,7 +336,7 @@ class LlamaCppScriptProvider(ScriptProvider):
         max_tokens: int = 4096,
         top_p: float = 0.9,
         seed: int = 4101,
-        prompt_version: str = "script-v1-qwen3-nonthinking-v3",
+        prompt_version: str = "script-v1-qwen3-nonthinking-v4",
         context_size: int = 8192,
         model_file_sha256: str | None = None,
         llama_server_version: str = "unknown",
@@ -366,6 +415,8 @@ class LlamaCppScriptProvider(ScriptProvider):
             "first_parse_succeeded": None,
             "first_attempt_errors": [],
             "repair_requested": False,
+            "repair_request_limit": MAX_REPAIR_REQUESTS,
+            "repair_attempts": [],
             "repair_parse_succeeded": None,
             "repair_attempt_errors": [],
             "duration_normalization": _default_duration_normalization(),
@@ -436,7 +487,7 @@ class LlamaCppScriptProvider(ScriptProvider):
         _atomic_json(validation_report_path, validation_report)
         _atomic_json(trace_path, trace)
         try:
-            for attempt_number in (1, 2):
+            for attempt_number in range(1, MAX_REPAIR_REQUESTS + 2):
                 request_payload = self._request_payload(messages, desired)
                 content, finish_reason = self._send_request(
                     payload=request_payload,
@@ -470,6 +521,13 @@ class LlamaCppScriptProvider(ScriptProvider):
                         repair_attempt_errors = errors
                         validation_report["repair_parse_succeeded"] = parse_succeeded
                         validation_report["repair_attempt_errors"] = errors
+                        validation_report["repair_attempts"].append(
+                            {
+                                "repair_attempt": attempt_number - 1,
+                                "parse_succeeded": parse_succeeded,
+                                "errors": errors,
+                            }
+                        )
                     trace["attempts"][-1]["validation"] = {
                         "status": "INVALID",
                         "parse_succeeded": parse_succeeded,
@@ -477,26 +535,9 @@ class LlamaCppScriptProvider(ScriptProvider):
                     }
                     _atomic_json(validation_report_path, validation_report)
                     _atomic_json(trace_path, trace)
-                    if attempt_number == 1:
-                        validation_report["repair_requested"] = True
-                        actual_shot_count = (
-                            exc.analysis.actual_shot_count
-                            if exc.analysis is not None
-                            else None
-                        )
-                        messages = self._repair_messages(
-                            title=normalized_title,
-                            story=normalized_story,
-                            invalid_output=content,
-                            validation_errors=errors,
-                            desired_shot_count=desired,
-                            actual_shot_count=actual_shot_count,
-                        )
-                        _atomic_json(validation_report_path, validation_report)
-                        continue
-
                     if (
-                        exc.analysis is not None
+                        attempt_number > 1
+                        and exc.analysis is not None
                         and exc.analysis.duration_only
                         and exc.analysis.normalizable_duration_only
                         and exc.parsed_payload is not None
@@ -524,6 +565,25 @@ class LlamaCppScriptProvider(ScriptProvider):
                             "模型镜头时长已进行确定性规范化：%s",
                             normalization_trace,
                         )
+                    elif attempt_number <= MAX_REPAIR_REQUESTS:
+                        validation_report["repair_requested"] = True
+                        actual_shot_count = (
+                            exc.analysis.actual_shot_count
+                            if exc.analysis is not None
+                            else None
+                        )
+                        messages = self._repair_messages(
+                            title=normalized_title,
+                            story=normalized_story,
+                            invalid_output=content,
+                            validation_errors=errors,
+                            desired_shot_count=desired,
+                            actual_shot_count=actual_shot_count,
+                            invalid_payload=exc.parsed_payload,
+                            repair_attempt_number=attempt_number,
+                        )
+                        _atomic_json(validation_report_path, validation_report)
+                        continue
                     else:
                         failed_validation_stage = (
                             errors[0].get("stage")
@@ -552,7 +612,7 @@ class LlamaCppScriptProvider(ScriptProvider):
                             failed_validation_stage=failed_validation_stage,
                         )
                         raise LlamaCppOutputError(
-                            "llama-server 首次输出及唯一一次修复输出均未通过 "
+                            "llama-server 首次输出及两次有界修复输出均未通过 "
                             "ScriptV1；未执行 Mock 回退",
                             diagnostics=errors,
                             parsed_payload=exc.parsed_payload,
@@ -562,6 +622,20 @@ class LlamaCppScriptProvider(ScriptProvider):
 
                 if script is None:
                     raise RuntimeError("内部错误：候选校验结束后没有 ScriptV1")
+                if (
+                    attempt_number > 1
+                    and trace["attempts"][-1].get("validation", {}).get("status")
+                    != "NORMALIZED"
+                ):
+                    validation_report["repair_parse_succeeded"] = True
+                    validation_report["repair_attempt_errors"] = []
+                    validation_report["repair_attempts"].append(
+                        {
+                            "repair_attempt": attempt_number - 1,
+                            "parse_succeeded": True,
+                            "errors": [],
+                        }
+                    )
                 warnings = analyze_script_usage(script).model_dump(mode="json")
                 trace["attempts"][-1]["validation"] = {
                     **trace["attempts"][-1].get("validation", {}),
@@ -581,7 +655,7 @@ class LlamaCppScriptProvider(ScriptProvider):
                         warnings["unused_character_ids"],
                     )
                 trace["status"] = "SUCCEEDED"
-                trace["repair_used"] = attempt_number == 2
+                trace["repair_used"] = attempt_number > 1
                 trace["actual_shot_count"] = len(script.shots)
                 trace["completed_at_utc"] = _utc_now()
                 trace["elapsed_ms"] = round(
@@ -592,7 +666,7 @@ class LlamaCppScriptProvider(ScriptProvider):
                 validation_report["final_result"] = "SUCCEEDED"
                 validation_report["final_failure_code"] = None
                 validation_report["actual_shot_count"] = len(script.shots)
-                validation_report["repair_used"] = attempt_number == 2
+                validation_report["repair_used"] = attempt_number > 1
                 _atomic_json(validation_report_path, validation_report)
                 _atomic_json(trace_path, trace)
                 self.last_script = script
@@ -710,6 +784,15 @@ class LlamaCppScriptProvider(ScriptProvider):
                 "shot_count_rule": count_rule,
                 "single_shot_duration_seconds": {"minimum": 4, "maximum": 10},
                 "total_duration_seconds": {"minimum": 20, "maximum": 40},
+                "narration": {
+                    "maximum_non_whitespace_characters_per_second": (
+                        NARRATION_MAX_CHARACTERS_PER_SECOND
+                    ),
+                    "rule": (
+                        "每个镜头旁白的非空白字符数不得超过 "
+                        "duration_seconds 乘以上述每秒字符数"
+                    ),
+                },
                 "story_coverage": {
                     "must_cover": ["开端", "主要发展", "明确结局"],
                     "last_shot_rule": "最后一镜表现原故事最终事件或结局状态",
@@ -757,6 +840,8 @@ class LlamaCppScriptProvider(ScriptProvider):
         validation_errors: list[dict[str, Any]],
         desired_shot_count: DesiredShotCount,
         actual_shot_count: int | None,
+        invalid_payload: dict[str, Any] | None = None,
+        repair_attempt_number: int = 1,
     ) -> list[dict[str, str]]:
         bounded_output = invalid_output[:12_000]
         bounded_error = json.dumps(
@@ -776,11 +861,30 @@ class LlamaCppScriptProvider(ScriptProvider):
                 f"用户要求恰好 {desired_shot_count} 个镜头，{current}；"
                 f"请保持故事内容并修复为 {desired_shot_count} 个镜头。"
             )
+        narration_repairs = _narration_repair_constraints(
+            invalid_payload,
+            validation_errors,
+        )
         repair_constraints = json.dumps(
             {
                 "desired_shot_count": desired_shot_count,
                 "actual_shot_count": actual_shot_count,
-                "repair_request_limit": 1,
+                "repair_attempt_number": repair_attempt_number,
+                "repair_request_limit": MAX_REPAIR_REQUESTS,
+                "preserve_shot_count_when_valid": True,
+                "narration_rule": {
+                    "maximum_non_whitespace_characters_per_second": (
+                        NARRATION_MAX_CHARACTERS_PER_SECOND
+                    ),
+                    "rewrite_requirements": [
+                        "将超长 narration 改写到 maximum_narration_characters 以内",
+                        "保留原意",
+                        "不增加新剧情",
+                        "不通过字符串截断制造残句",
+                    ],
+                    "failed_shots": narration_repairs,
+                    "check_all_shots": True,
+                },
                 "story_coverage": {
                     "must_cover": ["开端", "主要发展", "明确结局"],
                     "last_shot_rule": "最后一镜表现原故事最终事件或结局状态",
@@ -805,6 +909,12 @@ class LlamaCppScriptProvider(ScriptProvider):
                     "以下 repair_constraints 是高优先级结构化参数：\n"
                     f"{repair_constraints}\n"
                     f"{count_instruction}\n"
+                    "修复结果必须保持 ScriptV1 schema，并且只能输出纯 JSON。\n"
+                    "若 narration_rule.failed_shots 非空，必须逐项按 shot_id、"
+                    "shot_duration_seconds、current_narration_characters 和"
+                    " maximum_narration_characters 改写对应旁白；保留原意，"
+                    "不增加新剧情，不得修改镜头数量，并同时检查其他镜头的"
+                    "旁白是否满足同一规则。不得用机械字符串截断产生残句。\n"
                     "修复后的镜头仍须覆盖故事开端、主要发展和明确结局；"
                     "最后一镜必须表现原故事最终事件或结局状态。若剧情节点多于"
                     "镜头数，应合并相邻节点，不得删除结尾。\n"
@@ -831,12 +941,19 @@ class LlamaCppScriptProvider(ScriptProvider):
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        request_label = "first" if attempt_number == 1 else "repair"
+        request_label = (
+            "first"
+            if attempt_number == 1
+            else "repair"
+            if attempt_number == 2
+            else f"repair_{attempt_number - 1}"
+        )
         request_path = run_dir / f"{request_label}_request.json"
         _atomic_bytes(request_path, request_bytes + b"\n")
         attempt: dict[str, Any] = {
             "attempt": attempt_number,
             "kind": "initial" if attempt_number == 1 else "repair",
+            "repair_attempt": attempt_number - 1 if attempt_number > 1 else None,
             "requested_at_utc": _utc_now(),
             "request_sha256": _sha256_bytes(request_bytes),
             "request_path": str(request_path),
