@@ -345,6 +345,10 @@ def test_real_audio_renderer_pads_short_audio_and_extends_long_audio(
     assert all("aresample=48000" in command for command in render_commands)
     assert all("atempo=" not in command for command in render_commands)
     assert all("-shortest" not in command for command in render_commands)
+    assert all("SHOT " not in command for command in render_commands)
+    assert all("RAINY WINDOW" not in command for command in render_commands)
+    assert all("GLOWING FLIGHT" not in command for command in render_commands)
+    assert all("ROOFTOPS AND CLOUDS" not in command for command in render_commands)
 
 
 def test_real_audio_renderer_enforces_configured_rendered_duration_limit(

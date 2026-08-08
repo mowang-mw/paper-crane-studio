@@ -188,6 +188,10 @@ def test_real_png_keyframes_render_complete_traced_video(tmp_path: Path) -> None
     assert len(render_commands) == 3
     assert all("zoompan=" in command for command in render_commands)
     assert all("textfile=" in command for command in render_commands)
+    assert all("SHOT " not in command for command in render_commands)
+    assert all("RAINY WINDOW" not in command for command in render_commands)
+    assert all("GLOWING FLIGHT" not in command for command in render_commands)
+    assert all("ROOFTOPS AND CLOUDS" not in command for command in render_commands)
     assert all("MOCK VISUAL / FFMPEG MOTION" not in command for command in render_commands)
     for keyframe in keyframes:
         assert sum(str(Path(keyframe["image_path"])) in item for item in render_commands) == 1

@@ -320,14 +320,6 @@ def _create_shot(
             motion_preset=motion_preset,
         )
     )
-    filters.append(
-        _label_filter(
-            font,
-            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
-            30,
-            30,
-        )
-    )
     filters.append(_label_filter(font, "MOCK VISUAL / FFMPEG MOTION", 84, 20))
     filters.append(subtitle.filter_expression)
     fade_out_start = max(0.0, duration - 0.35)
@@ -451,14 +443,6 @@ def _create_image_shot(
             height=height,
             fps=fps,
             motion_preset=motion_preset,
-        ),
-        _label_filter(
-            font,
-            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
-            24,
-            22,
-            box_opacity=0.24,
-            box_border=6,
         ),
         subtitle.filter_expression,
     ]
@@ -1900,14 +1884,6 @@ def _create_real_audio_image_shot(
             height=height,
             fps=fps,
             motion_preset=motion_preset,
-        ),
-        _label_filter(
-            font,
-            f"SHOT {int(shot['sequence_no']):02d} - {parameters['scene_label']}",
-            24,
-            22,
-            box_opacity=0.24,
-            box_border=6,
         ),
         timed_subtitle_filter,
         (
