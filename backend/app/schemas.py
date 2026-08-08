@@ -166,6 +166,13 @@ class ProviderStatusRead(BaseModel):
     model_id: str
     source_type: Literal["MOCK", "LOCAL_MODEL"]
     server_version: str | None = None
+    runtime_state: Literal[
+        "READY_TO_START",
+        "ONLINE",
+        "CONFIG_ERROR",
+        "PORT_CONFLICT",
+        "NOT_APPLICABLE",
+    ]
     detail: str | None = None
 
 

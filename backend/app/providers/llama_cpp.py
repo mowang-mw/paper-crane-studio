@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from ..script_schema import (
@@ -342,6 +342,7 @@ class LlamaCppScriptProvider(ScriptProvider):
         llama_server_version: str = "unknown",
         api_key: str | None = None,
         client: httpx.Client | None = None,
+        server_session_factory: Callable[[], Any] | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("base_url 不得为空")
@@ -372,6 +373,7 @@ class LlamaCppScriptProvider(ScriptProvider):
         self.llama_server_version = llama_server_version.strip() or "unknown"
         self.api_key = api_key
         self.client = client
+        self.server_session_factory = server_session_factory
         self.last_script: ScriptV1 | None = None
         self.last_trace: dict[str, Any] | None = None
         self.last_trace_path: Path | None = None
@@ -386,6 +388,43 @@ class LlamaCppScriptProvider(ScriptProvider):
         return base_url + "/v1/chat/completions"
 
     def generate(
+        self,
+        *,
+        title: str,
+        story: str,
+        desired_shot_count: int | None = None,
+    ) -> ScriptResult:
+        """Keep startup, generation, all repairs, and cleanup in one Job scope."""
+
+        if self.server_session_factory is None:
+            return self._generate_with_server(
+                title=title,
+                story=story,
+                desired_shot_count=desired_shot_count,
+            )
+        self.last_script = None
+        self.last_trace = None
+        self.last_trace_path = None
+        self.last_validation_report_path = None
+        session = self.server_session_factory()
+        try:
+            with session:
+                ready_inspection = getattr(session, "ready_inspection", None)
+                detected_version = getattr(ready_inspection, "server_version", None)
+                if isinstance(detected_version, str) and detected_version.strip():
+                    self.llama_server_version = detected_version.strip()
+                return self._generate_with_server(
+                    title=title,
+                    story=story,
+                    desired_shot_count=desired_shot_count,
+                )
+        finally:
+            if self.last_trace is not None:
+                self.last_trace["server_lifecycle"] = session.snapshot()
+                if self.last_trace_path is not None:
+                    _atomic_json(self.last_trace_path, self.last_trace)
+
+    def _generate_with_server(
         self,
         *,
         title: str,

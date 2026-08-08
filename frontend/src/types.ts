@@ -6,6 +6,12 @@ export type AudioSpeaker = "Serena" | "Vivian";
 export type AudioLanguage = "Chinese";
 export type DesiredShotCount = 3 | 4 | 5 | null;
 export type MotionPreset = "static" | "gentle_zoom" | "cinematic_pan";
+export type ScriptProviderRuntimeState =
+  | "READY_TO_START"
+  | "ONLINE"
+  | "CONFIG_ERROR"
+  | "PORT_CONFLICT"
+  | "NOT_APPLICABLE";
 
 export interface BackgroundAudioAsset {
   asset_id: string;
@@ -37,6 +43,7 @@ export interface ScriptProviderStatus {
   model_id: string | null;
   source_type: string;
   server_version?: string | null;
+  runtime_state: ScriptProviderRuntimeState | null;
   detail?: string | null;
 }
 

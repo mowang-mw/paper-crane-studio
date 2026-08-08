@@ -55,7 +55,6 @@ import type {
 const PAPER_CRANE_STORY =
   "深夜，少女在窗边折出一只纸鹤。纸鹤亮起微光，飞过屋顶、灯火与云层；黎明时，它飞向远方，少女在窗边静静注视。";
 const PAPER_CRANE_TITLE = "纸鹤的夜航";
-const LLM_START_COMMAND = ".\\scripts\\run_llm_server.ps1";
 const REAL_IMAGE_PROVIDER_ID = "comfyui-animagine-xl-4";
 const REAL_AUDIO_PROVIDER_ID = "qwen3-tts-0.6b-customvoice";
 const STORY_MIN_CHARS = 10;
@@ -1127,6 +1126,7 @@ function ProviderSelector({
     (status?.providers ?? []).map((provider) => [provider.provider_id, provider]),
   );
   const llamaAvailable = descriptors.get("llamacpp")?.available === true && !error;
+  const llamaRuntimeState = descriptors.get("llamacpp")?.runtime_state;
   const initialCheckInProgress = checking && status === null;
   const providerIds: ScriptProviderId[] = ["mock", "llamacpp"];
 
@@ -1158,7 +1158,13 @@ function ProviderSelector({
           <option value="mock">Mock（离线保底）</option>
           <option value="llamacpp" disabled={!llamaAvailable || checking}>
             本地 Qwen（llama.cpp）
-            {llamaAvailable ? "" : initialCheckInProgress ? " — 检查中" : " — 离线"}
+            {initialCheckInProgress
+              ? " — 检查中"
+              : llamaRuntimeState === "ONLINE"
+                ? " — 在线"
+                : llamaRuntimeState === "READY_TO_START"
+                  ? " — 可按需启动"
+                  : " — 配置不可用"}
           </option>
         </select>
       </label>
@@ -1172,11 +1178,17 @@ function ProviderSelector({
               ? "离线可用"
               : initialCheckInProgress
                 ? "检查中"
-                : available
+                : descriptor?.runtime_state === "ONLINE"
                   ? "在线"
+                  : descriptor?.runtime_state === "READY_TO_START"
+                    ? "可按需启动"
+                    : available
+                      ? "已配置"
                   : descriptor?.configured === false
                     ? "离线（未配置）"
-                    : "离线";
+                    : descriptor?.runtime_state === "PORT_CONFLICT"
+                      ? "端口冲突"
+                      : "不可用";
           return (
             <article
               className={`provider-status-card ${
@@ -1219,8 +1231,7 @@ function ProviderSelector({
       {error && <p className="provider-warning">{error}；当前仅允许 Mock 离线保底。</p>}
       {!checking && !llamaAvailable && (
         <p className="provider-command">
-          本地 Qwen 当前离线，不会提交 llamacpp 任务。启动后重新检查：
-          <code>{LLM_START_COMMAND}</code>
+          本地 Qwen 配置或端口状态不可用，不会提交任务。请检查可执行文件、GGUF 模型和 8081 端口后重新检查。
         </p>
       )}
     </section>
@@ -1695,7 +1706,7 @@ export default function App() {
           (provider) => provider.provider_id === "llamacpp" && provider.available,
         );
         if (!localQwenReady) {
-          setError(`本地 Qwen 当前离线，未提交生成任务。请先运行 ${LLM_START_COMMAND}，再重新检查。`);
+          setError("本地 Qwen 当前无法按需启动，未提交生成任务。请检查模型配置和 8081 端口后重新检查。");
           return;
         }
       }
@@ -1902,6 +1913,10 @@ export default function App() {
   const llamaAvailable = providerDescriptors.some(
     (provider) => provider.provider_id === "llamacpp" && provider.available,
   ) && !providerError;
+  const llamaRunning = providerDescriptors.some(
+    (provider) =>
+      provider.provider_id === "llamacpp" && provider.runtime_state === "ONLINE",
+  ) && !providerError;
   const realImageProviderDescriptor = imageProviderDescriptors.find(
     (provider) => provider.provider_id === REAL_IMAGE_PROVIDER_ID,
   );
@@ -1912,7 +1927,7 @@ export default function App() {
     );
   const realAudioProviderConfigured = realAudioProviderDescriptor?.configured !== false;
   const gpuHandoffRequired =
-    llamaAvailable ||
+    llamaRunning ||
     realImageProviderDescriptor?.requires_gpu_handoff === true ||
     realAudioProviderDescriptor?.requires_gpu_handoff === true;
   const structuredScript = detail?.project.script_json ?? null;
@@ -2525,7 +2540,7 @@ export default function App() {
                         : generationInProgress
                           ? "任务进行中"
                           : scriptProvider === "llamacpp" && !llamaAvailable
-                            ? "本地 Qwen 未启动"
+                            ? "本地 Qwen 配置不可用"
                             : detail?.latest_export
                               ? `再次生成（${selectedProviderDescriptor?.display_name ?? providerName(scriptProvider)}）`
                               : scriptProvider === "mock"

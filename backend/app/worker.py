@@ -36,6 +36,7 @@ from .providers.base import (
 )
 from .providers.comfyui import ComfyUIImageProvider
 from .providers.llama_cpp import LlamaCppScriptProvider
+from .providers.llama_server import LlamaServerJobSession
 from .providers.mock import MockAudioProvider, MockImageProvider, MockScriptProvider
 from .providers.qwen3_tts import create_qwen3_tts_provider
 from .providers.registry import check_llamacpp
@@ -169,7 +170,7 @@ class Worker:
                             code = "PROVIDER_UNAVAILABLE"
                             summary = str(exc)[:500]
                             suggestions = [
-                                "启动并检查 llama-server 后手动重试。",
+                                "检查 llama-server、GGUF 配置与 8081 端口后手动重试。",
                             ]
                         else:
                             stage = "SCRIPT_SCHEMA_VALIDATION"
@@ -3226,6 +3227,25 @@ class Worker:
                 llama_server_version=str(
                     availability.get("server_version")
                     or self.settings.llama_server_version
+                ),
+                server_session_factory=lambda: LlamaServerJobSession(
+                    executable=Path(self.settings.llama_server_executable),
+                    model_path=model_path,
+                    model_id=self.settings.llama_model_id,
+                    base_url=self.settings.llama_server_base_url,
+                    run_dir=(
+                        self.settings.project_dir(project_id)
+                        / "jobs"
+                        / job_id
+                        / "llama-server"
+                    ),
+                    context_size=self.settings.llama_context_size,
+                    gpu_layers=self.settings.llama_gpu_layers,
+                    startup_timeout_seconds=(
+                        self.settings.llama_startup_timeout_seconds
+                    ),
+                    health_timeout_seconds=self.settings.llama_health_timeout_seconds,
+                    blocked_gpu_ports=(self.settings.comfyui_port,),
                 ),
             )
         else:

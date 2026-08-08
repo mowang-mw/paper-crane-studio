@@ -270,7 +270,7 @@ def generate_project(
                     "first_attempt_errors": [],
                     "repair_attempt_errors": [],
                     "suggestions": [
-                        "在项目根目录运行 .\\scripts\\run_llm_server.ps1 后重新检查。",
+                        "检查 llama-server 可执行文件、GGUF 模型与 8081 端口后重新检查。",
                         "若只需离线保底，请显式选择 Mock Script Provider。",
                     ],
                     "provider_id": "llamacpp",

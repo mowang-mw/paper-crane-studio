@@ -130,6 +130,16 @@ function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function scriptRuntimeState(value: unknown): ScriptProviderStatus["runtime_state"] {
+  return value === "READY_TO_START" ||
+    value === "ONLINE" ||
+    value === "CONFIG_ERROR" ||
+    value === "PORT_CONFLICT" ||
+    value === "NOT_APPLICABLE"
+    ? value
+    : null;
+}
+
 function normalizeProvider(value: unknown): ScriptProviderStatus | null {
   if (!isRecord(value) || !isScriptProviderId(value.provider_id)) return null;
   const fallbackName = value.provider_id === "mock" ? "Mock 离线保底" : "本地 Qwen（llama.cpp）";
@@ -141,6 +151,7 @@ function normalizeProvider(value: unknown): ScriptProviderStatus | null {
     model_id: optionalText(value.model_id),
     source_type: optionalText(value.source_type) ?? "UNKNOWN",
     server_version: optionalText(value.server_version),
+    runtime_state: scriptRuntimeState(value.runtime_state),
     detail: optionalText(value.detail),
   };
 }

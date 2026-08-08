@@ -40,6 +40,7 @@ def test_provider_registry_and_explicit_offline_rejection(
         "model_id": "Qwen3-4B-Q4_K_M.gguf",
         "source_type": "LOCAL_MODEL",
         "server_version": None,
+        "runtime_state": "CONFIG_ERROR",
         "detail": "GGUF 模型文件不存在，请先完成 M3 模型准备。",
     }
     monkeypatch.setattr(
@@ -78,6 +79,7 @@ def test_provider_registry_and_explicit_offline_rejection(
         "model_id": "mock-script.v1",
         "source_type": "MOCK",
         "server_version": None,
+        "runtime_state": "NOT_APPLICABLE",
         "detail": "无需网络、API Key 或模型权重。",
     }
     assert by_id["llamacpp"]["available"] is False
