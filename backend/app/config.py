@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -92,6 +93,14 @@ class Settings:
     audio_lead_in_seconds: float = 0.20
     audio_lead_out_seconds: float = 0.35
     audio_rendered_max_seconds: float = 60.0
+    dashscope_api_key: str | None = field(default=None, repr=False)
+    dashscope_workspace_id: str | None = None
+    dashscope_region: str = "beijing"
+    cloud_wan_model_id: str = "wan2.7-i2v-2026-04-25"
+    cloud_wan_poll_interval_seconds: float = 15.0
+    cloud_wan_timeout_seconds: float = 1_800.0
+    cloud_wan_http_timeout_seconds: float = 30.0
+    cloud_wan_max_source_image_bytes: int = 10 * 1024 * 1024
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -220,6 +229,27 @@ class Settings:
             raise ValueError("Qwen3-TTS Job 总超时不得小于单镜头超时")
         if self.audio_lead_in_seconds < 0 or self.audio_lead_out_seconds < 0:
             raise ValueError("真实旁白 lead-in/lead-out 不得为负数")
+        dashscope_api_key = (self.dashscope_api_key or "").strip() or None
+        dashscope_workspace_id = (self.dashscope_workspace_id or "").strip() or None
+        dashscope_region = self.dashscope_region.strip().lower()
+        if dashscope_region != "beijing":
+            raise ValueError("DASHSCOPE_REGION 当前只支持 beijing")
+        if dashscope_workspace_id is not None and not re.fullmatch(
+            r"[A-Za-z0-9-]+", dashscope_workspace_id
+        ):
+            raise ValueError("DASHSCOPE_WORKSPACE_ID 必须是安全的 DNS 标签")
+        if any(
+            value <= 0
+            for value in (
+                self.cloud_wan_poll_interval_seconds,
+                self.cloud_wan_timeout_seconds,
+                self.cloud_wan_http_timeout_seconds,
+                self.cloud_wan_max_source_image_bytes,
+            )
+        ):
+            raise ValueError("Wan 云视频超时、轮询间隔和图片上限必须大于 0")
+        if self.cloud_wan_timeout_seconds < self.cloud_wan_http_timeout_seconds:
+            raise ValueError("Wan 总超时不得小于单次 HTTP 超时")
         object.__setattr__(self, "root_dir", root_dir)
         object.__setattr__(self, "data_dir", data_dir)
         object.__setattr__(self, "database_url", database_url)
@@ -235,6 +265,9 @@ class Settings:
         object.__setattr__(self, "qwen_tts_python", qwen_tts_python)
         object.__setattr__(self, "qwen_tts_runner", qwen_tts_runner)
         object.__setattr__(self, "qwen_tts_model_path", qwen_tts_model_path)
+        object.__setattr__(self, "dashscope_api_key", dashscope_api_key)
+        object.__setattr__(self, "dashscope_workspace_id", dashscope_workspace_id)
+        object.__setattr__(self, "dashscope_region", dashscope_region)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -417,6 +450,21 @@ class Settings:
             ),
             audio_rendered_max_seconds=float(
                 os.environ.get("AUDIO_RENDERED_MAX_SECONDS", "60")
+            ),
+            dashscope_api_key=os.environ.get("DASHSCOPE_API_KEY") or None,
+            dashscope_workspace_id=os.environ.get("DASHSCOPE_WORKSPACE_ID") or None,
+            dashscope_region=os.environ.get("DASHSCOPE_REGION", "beijing"),
+            cloud_wan_poll_interval_seconds=float(
+                os.environ.get("CLOUD_WAN_POLL_INTERVAL_SECONDS", "15")
+            ),
+            cloud_wan_timeout_seconds=float(
+                os.environ.get("CLOUD_WAN_TIMEOUT_SECONDS", "1800")
+            ),
+            cloud_wan_http_timeout_seconds=float(
+                os.environ.get("CLOUD_WAN_HTTP_TIMEOUT_SECONDS", "30")
+            ),
+            cloud_wan_max_source_image_bytes=int(
+                os.environ.get("CLOUD_WAN_MAX_SOURCE_IMAGE_BYTES", str(10 * 1024 * 1024))
             ),
             cors_origins=origins,
         )

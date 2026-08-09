@@ -17,7 +17,7 @@ from ..database import get_session
 from ..models import Export, JobStatus
 from ..media.background_audio import background_job_snapshot
 from ..media.ffmpeg import MediaToolError
-from ..providers.registry import check_llamacpp
+from ..providers.registry import check_cloud_wan_video, check_llamacpp
 from ..schemas import (
     ExportRead,
     JobQueued,
@@ -51,7 +51,7 @@ from ..services.media_rerender import (
     MEDIA_RERENDER_PROVIDER_ID,
     media_rerender_error_payload,
 )
-from ..services.video_jobs import VIDEO_JOB_TYPE, VIDEO_PROVIDER_ID
+from ..services.video_jobs import VIDEO_JOB_TYPE, VIDEO_PROVIDER_IDS
 from .job_serialization import job_read_with_media_urls
 from ..services.image_jobs import REAL_IMAGE_JOB_TYPE, REAL_IMAGE_PROVIDER_ID
 
@@ -442,9 +442,10 @@ def render_project_with_real_images(
 def render_project_video(
     project_id: str,
     payload: VideoRenderRequest,
+    request: Request,
     session: Session = Depends(get_session),
 ) -> JobQueued:
-    """Queue the optional mock video stage without changing final-media inputs."""
+    """Queue an optional video-provider stage without changing final-media inputs."""
 
     project = crud.get_project(session, project_id)
     if project is None:
@@ -459,6 +460,27 @@ def render_project_video(
     source_images = (source_job.result_json or {}).get("image_shots")
     if not isinstance(source_images, list) or not source_images:
         raise HTTPException(status_code=409, detail="来源 Job 没有可复用的关键帧资产。")
+    if payload.video_provider not in VIDEO_PROVIDER_IDS:
+        raise HTTPException(status_code=422, detail="不支持的 VideoProvider。")
+    if payload.video_provider == "cloud-wan-2.7":
+        if not float(payload.duration_seconds).is_integer() or not 2 <= int(
+            payload.duration_seconds
+        ) <= 15:
+            raise HTTPException(
+                status_code=422, detail="Wan 2.7 duration 必须是 2—15 秒整数。"
+            )
+        cloud_status = check_cloud_wan_video(request.app.state.settings)
+        if not cloud_status["available"]:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "WAN_CONFIG_ERROR",
+                    "stage": "VIDEO_GENERATION",
+                    "summary": cloud_status["detail"],
+                    "provider_id": payload.video_provider,
+                    "retryable": False,
+                },
+            )
 
     job = crud.create_job(
         session,
@@ -470,6 +492,11 @@ def render_project_video(
             "parent_job_id": source_job.id,
             "source_image_job_id": source_job.id,
             "video_provider": payload.video_provider,
+            "video_model_id": (
+                "wan2.7-i2v-2026-04-25"
+                if payload.video_provider == "cloud-wan-2.7"
+                else "deterministic-ffmpeg-keyframe-video"
+            ),
             "video_options": {
                 "width": 1280,
                 "height": 720,
@@ -481,8 +508,6 @@ def render_project_video(
             "fallback_media_path": "KEYFRAME_FFMPEG_MOTION",
         },
     )
-    if job.provider_id != VIDEO_PROVIDER_ID:
-        raise HTTPException(status_code=422, detail="当前仅提供明确标记的 MockVideoProvider。")
     session.commit()
     return JobQueued(job_id=job.id)
 

@@ -11,6 +11,7 @@ from ..config import Settings
 from ..services.audio_jobs import audio_gpu_handoff_status
 from ..services.image_jobs import gpu_handoff_status
 from .llama_server import inspect_llama_server
+from .cloud_wan import CLOUD_WAN_MODEL_ID, CLOUD_WAN_PROVIDER_ID
 
 
 def utc_now() -> datetime:
@@ -126,8 +127,35 @@ def provider_registry(settings: Settings) -> dict[str, Any]:
                 "source_type": "MOCK",
                 "detail": "由已有关键帧确定性生成测试 MP4，不代表真实 AI 视频模型。",
                 "requires_gpu_handoff": False,
-            }
+                "runtime_state": "READY_TO_USE",
+                "requires_api_key": False,
+                "may_incur_cost": False,
+            },
+            check_cloud_wan_video(settings),
         ],
+    }
+
+
+def check_cloud_wan_video(settings: Settings) -> dict[str, Any]:
+    configured = bool(settings.dashscope_api_key and settings.dashscope_workspace_id)
+    if configured:
+        detail = "后端云凭据已配置；提交真实任务可能产生阿里云费用。"
+        runtime_state = "READY_TO_USE"
+    else:
+        detail = "缺少后端 DASHSCOPE_API_KEY 或 DASHSCOPE_WORKSPACE_ID。"
+        runtime_state = "CONFIG_ERROR"
+    return {
+        "provider_id": CLOUD_WAN_PROVIDER_ID,
+        "display_name": "Wan 2.7 Cloud · 阿里云百炼",
+        "available": configured,
+        "configured": configured,
+        "model_id": CLOUD_WAN_MODEL_ID,
+        "source_type": "REAL_CLOUD_MODEL",
+        "detail": detail,
+        "requires_gpu_handoff": False,
+        "runtime_state": runtime_state,
+        "requires_api_key": True,
+        "may_incur_cost": True,
     }
 
 

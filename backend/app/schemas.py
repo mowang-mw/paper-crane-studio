@@ -140,7 +140,7 @@ class RealAudioRenderRequest(MediaPolishOptions):
 
 class VideoRenderRequest(BaseModel):
     source_image_job_id: str = Field(min_length=1, max_length=36)
-    video_provider: Literal["mock-video"] = "mock-video"
+    video_provider: Literal["mock-video", "cloud-wan-2.7"] = "mock-video"
     duration_seconds: float = Field(default=2.0, gt=0, le=60)
     motion_preset: Literal["static", "gentle_zoom", "cinematic_pan"] = (
         "gentle_zoom"
@@ -211,14 +211,17 @@ class AudioProviderStatusRead(BaseModel):
 
 
 class VideoProviderStatusRead(BaseModel):
-    provider_id: Literal["mock-video"]
+    provider_id: Literal["mock-video", "cloud-wan-2.7"]
     display_name: str
     available: bool
     configured: bool
     model_id: str
-    source_type: Literal["MOCK"]
+    source_type: Literal["MOCK", "REAL_CLOUD_MODEL"]
     detail: str | None = None
     requires_gpu_handoff: bool = False
+    runtime_state: Literal["READY_TO_USE", "CONFIG_ERROR"]
+    requires_api_key: bool = False
+    may_incur_cost: bool = False
 
 
 class ProvidersRead(BaseModel):
@@ -229,7 +232,7 @@ class ProvidersRead(BaseModel):
     image_providers: list[ImageProviderStatusRead]
     default_audio_provider: Literal["mock", "qwen3-tts-0.6b-customvoice"]
     audio_providers: list[AudioProviderStatusRead]
-    default_video_provider: Literal["none", "mock-video"]
+    default_video_provider: Literal["none", "mock-video", "cloud-wan-2.7"]
     video_providers: list[VideoProviderStatusRead]
 
 

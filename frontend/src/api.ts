@@ -125,7 +125,7 @@ function isAudioProviderId(value: unknown): value is AudioProviderId {
 }
 
 function isVideoProviderId(value: unknown): value is VideoProviderId {
-  return value === "mock-video";
+  return value === "mock-video" || value === "cloud-wan-2.7";
 }
 
 function isAudioSpeaker(value: unknown): value is AudioSpeaker {
@@ -205,13 +205,21 @@ function normalizeVideoProvider(value: unknown): VideoProviderStatus | null {
   if (!isRecord(value) || !isVideoProviderId(value.provider_id)) return null;
   return {
     provider_id: value.provider_id,
-    display_name: optionalText(value.display_name) ?? "Mock 动态视频",
+    display_name:
+      optionalText(value.display_name) ??
+      (value.provider_id === "mock-video" ? "Mock 动态视频" : "Wan 2.7 Cloud"),
     available: value.available === true,
     configured: typeof value.configured === "boolean" ? value.configured : null,
     model_id: optionalText(value.model_id),
     source_type: optionalText(value.source_type) ?? "MOCK",
     detail: optionalText(value.detail),
     requires_gpu_handoff: value.requires_gpu_handoff === true,
+    runtime_state:
+      value.runtime_state === "READY_TO_USE" || value.runtime_state === "CONFIG_ERROR"
+        ? value.runtime_state
+        : undefined,
+    requires_api_key: value.requires_api_key === true,
+    may_incur_cost: value.may_incur_cost === true,
   };
 }
 
@@ -376,14 +384,15 @@ export async function renderVideo(
   projectId: string,
   sourceImageJobId: string,
   motionPreset: MediaPolishOptions["motionPreset"],
+  videoProvider: VideoProviderId,
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-video`, {
       method: "POST",
       body: JSON.stringify({
         source_image_job_id: sourceImageJobId,
-        video_provider: "mock-video",
-        duration_seconds: 2,
+        video_provider: videoProvider,
+        duration_seconds: videoProvider === "cloud-wan-2.7" ? 5 : 2,
         motion_preset: motionPreset,
       }),
     }),

@@ -65,7 +65,7 @@ def _script() -> ScriptV1:
 
 def _write_source_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"fake-png")
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fake-png")
 
 
 def _seed_source_image_job(database: Database, settings) -> tuple[str, str]:

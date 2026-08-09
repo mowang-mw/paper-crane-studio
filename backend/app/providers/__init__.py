@@ -13,6 +13,7 @@ from .base import (
     VideoProvider,
 )
 from .comfyui import ComfyUIImageProvider, ComfyUIJobSession, ImageProviderError
+from .cloud_wan import CloudWanVideoProvider, CloudWanVideoProviderError
 from .llama_cpp import (
     LlamaCppOutputError,
     LlamaCppProtocolError,
@@ -26,6 +27,8 @@ __all__ = [
     "AudioProvider",
     "ComfyUIImageProvider",
     "ComfyUIJobSession",
+    "CloudWanVideoProvider",
+    "CloudWanVideoProviderError",
     "GeneratedImageAsset",
     "ImageGenerationOptions",
     "ImageGenerationRequest",

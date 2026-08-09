@@ -1841,12 +1841,17 @@ export default function App() {
   };
 
   const startVideoGeneration = async () => {
-    if (!selectedId || !sourceImageJob || videoMode !== "mock-video") return;
+    if (!selectedId || !sourceImageJob || videoMode === "keyframe_motion") return;
     setBusy("video");
     setError("");
     setNotice(null);
     try {
-      const job = await renderVideo(selectedId, sourceImageJob.id, motionPreset);
+      const job = await renderVideo(
+        selectedId,
+        sourceImageJob.id,
+        motionPreset,
+        videoMode,
+      );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
@@ -1964,6 +1969,14 @@ export default function App() {
   const realAudioProviderConfigured = realAudioProviderDescriptor?.configured !== false;
   const mockVideoProviderDescriptor: VideoProviderStatus | undefined =
     videoProviderDescriptors.find((provider) => provider.provider_id === "mock-video");
+  const cloudVideoProviderDescriptor: VideoProviderStatus | undefined =
+    videoProviderDescriptors.find((provider) => provider.provider_id === "cloud-wan-2.7");
+  const selectedVideoProviderDescriptor =
+    videoMode === "mock-video"
+      ? mockVideoProviderDescriptor
+      : videoMode === "cloud-wan-2.7"
+        ? cloudVideoProviderDescriptor
+        : undefined;
   const gpuHandoffRequired =
     llamaRunning ||
     realImageProviderDescriptor?.requires_gpu_handoff === true ||
@@ -2896,26 +2909,30 @@ export default function App() {
               summary={
                 videoMode === "keyframe_motion"
                   ? "不生成 AI 视频 · 沿用关键帧动效"
-                  : `${mockVideoProviderDescriptor?.display_name ?? "MockVideoProvider"} · ${generatedVideoShots.length}/${scriptShots.length} 个测试片段`
+                  : `${selectedVideoProviderDescriptor?.display_name ?? "VideoProvider"} · ${generatedVideoShots.length}/${scriptShots.length} 个视频片段`
               }
               status={
                 videoMode === "keyframe_motion"
                   ? "已跳过"
                   : videoDisplayJob?.status === "SUCCEEDED"
-                    ? "Mock 已完成"
+                    ? videoDisplayJob.result_json?.video_source_type === "REAL_CLOUD_MODEL"
+                      ? "真实云视频已完成"
+                      : "Mock 已完成"
                     : videoGenerationInProgress
                       ? "处理中"
                       : "可选"
               }
-              open={videoMode === "mock-video" || videoGenerationInProgress}
+              open={videoMode !== "keyframe_motion" || videoGenerationInProgress}
             >
               <section className="real-image-control optional-video-control" aria-labelledby="optional-video-title">
                 <div className="real-image-heading">
                   <div>
-                    <p className="eyebrow">M8-A1 · OPTIONAL VIDEO PROVIDER</p>
+                    <p className="eyebrow">M8-A2 · OPTIONAL VIDEO PROVIDER</p>
                     <h3 id="optional-video-title">选择关键帧之后的可选动态视频阶段</h3>
                   </div>
-                  <span className="visual-source-badge is-mock">当前仅 Mock</span>
+                  <span className={`visual-source-badge ${videoMode === "cloud-wan-2.7" ? "is-real" : "is-mock"}`}>
+                    {videoMode === "cloud-wan-2.7" ? "Cloud · Real AI Video" : "安全默认 / Mock"}
+                  </span>
                 </div>
                 <fieldset className="motion-preset-selector" disabled={busy !== null || generationInProgress}>
                   <legend>视频阶段模式</legend>
@@ -2945,22 +2962,45 @@ export default function App() {
                       <small>由已有 PNG 确定性生成测试 MP4，不是真实 AI 视频</small>
                     </span>
                   </label>
+                  <label className={videoMode === "cloud-wan-2.7" ? "is-selected" : ""}>
+                    <input
+                      type="radio"
+                      name="video-mode"
+                      value="cloud-wan-2.7"
+                      checked={videoMode === "cloud-wan-2.7"}
+                      onChange={() => setVideoMode("cloud-wan-2.7")}
+                    />
+                    <span>
+                      <strong>Wan 2.7 Cloud · 阿里云百炼</strong>
+                      <small>真实云端 Image-to-Video · 需要后端 API Key · 可能产生费用</small>
+                    </span>
+                  </label>
                 </fieldset>
                 <div className="real-image-provider-line">
-                  <strong>{mockVideoProviderDescriptor?.display_name ?? "Mock 动态视频"}</strong>
-                  <span>Provider ID：mock-video</span>
-                  <span>Source type：MOCK</span>
-                  <span>最终成片：M8-A1 暂不消费 VideoAsset</span>
-                  {mockVideoProviderDescriptor?.detail && (
-                    <span className="image-provider-detail">{mockVideoProviderDescriptor.detail}</span>
+                  <strong>{selectedVideoProviderDescriptor?.display_name ?? "不生成 AI 视频"}</strong>
+                  <span>Provider ID：{videoMode === "keyframe_motion" ? "none" : videoMode}</span>
+                  <span>
+                    Source type：{videoMode === "cloud-wan-2.7" ? "REAL_CLOUD_MODEL" : videoMode === "mock-video" ? "MOCK" : "FFMPEG_KEYFRAME_MOTION"}
+                  </span>
+                  <span>最终成片：M8-A2 暂不消费 VideoAsset</span>
+                  {selectedVideoProviderDescriptor?.detail && (
+                    <span className="image-provider-detail">{selectedVideoProviderDescriptor.detail}</span>
                   )}
                 </div>
-                {videoMode === "mock-video" && !sourceImageJob && (
+                {videoMode !== "keyframe_motion" && !sourceImageJob && (
                   <p className="provider-warning">请先完成一个带有逐镜头关键帧的图片 Job。</p>
+                )}
+                {videoMode === "cloud-wan-2.7" && cloudVideoProviderDescriptor?.configured !== true && (
+                  <p className="provider-warning" role="status">
+                    云 Provider 配置不完整。请在后端配置 DASHSCOPE_API_KEY 和 DASHSCOPE_WORKSPACE_ID；密钥不会进入浏览器。
+                  </p>
+                )}
+                {videoMode === "cloud-wan-2.7" && cloudVideoProviderDescriptor?.configured === true && (
+                  <p className="rights-notice">提交后会调用真实阿里云 Wan 2.7 服务，并可能产生云端费用。</p>
                 )}
                 {videoDisplayJob?.status === "FAILED" && (
                   <p className="provider-warning" role="alert">
-                    Mock 动态视频生成失败：{videoDisplayJob.error_message ?? "请查看任务技术详情。"}
+                    动态视频生成失败：{videoDisplayJob.error_message ?? "请查看任务技术详情。"}
                   </p>
                 )}
                 <div className="real-image-actions">
@@ -2969,18 +3009,22 @@ export default function App() {
                     type="button"
                     onClick={() => void startVideoGeneration()}
                     disabled={
-                      videoMode !== "mock-video" ||
+                      videoMode === "keyframe_motion" ||
                       !sourceImageJob ||
                       busy !== null ||
                       generationInProgress ||
-                      mockVideoProviderDescriptor?.available === false
+                      selectedVideoProviderDescriptor?.available !== true
                     }
                   >
                     {busy === "video"
-                      ? "正在提交 Mock 视频任务…"
+                      ? videoMode === "cloud-wan-2.7"
+                        ? "正在提交真实云视频任务…"
+                        : "正在提交 Mock 视频任务…"
                       : videoGenerationInProgress
-                        ? `正在生成测试片段 ${activeJob?.progress ?? 0}%`
-                        : "生成 Mock 动态视频"}
+                        ? `正在生成视频片段 ${activeJob?.progress ?? 0}%`
+                        : videoMode === "cloud-wan-2.7"
+                          ? "生成 Wan 2.7 云视频"
+                          : "生成 Mock 动态视频"}
                   </button>
                 </div>
                 {generatedVideoShots.length > 0 && (
@@ -2995,7 +3039,9 @@ export default function App() {
                           ) : (
                             <p role="alert">视频媒体 URL 不可用。</p>
                           )}
-                          <small>MOCK · {shot.duration_seconds?.toFixed(1) ?? "—"} 秒</small>
+                          <small>
+                            {shot.source_type === "REAL_CLOUD_MODEL" ? "REAL CLOUD AI" : "MOCK"} · {shot.duration_seconds?.toFixed(1) ?? "—"} 秒
+                          </small>
                         </article>
                       );
                     })}

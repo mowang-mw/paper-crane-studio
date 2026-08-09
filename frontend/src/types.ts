@@ -2,7 +2,7 @@ export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export type ScriptProviderId = "mock" | "llamacpp";
 export type ImageProviderId = "mock" | "comfyui-animagine-xl-4";
 export type AudioProviderId = "mock" | "qwen3-tts-0.6b-customvoice";
-export type VideoProviderId = "mock-video";
+export type VideoProviderId = "mock-video" | "cloud-wan-2.7";
 export type VideoMode = "keyframe_motion" | VideoProviderId;
 export type AudioSpeaker = "Serena" | "Vivian";
 export type AudioLanguage = "Chinese";
@@ -95,6 +95,9 @@ export interface VideoProviderStatus {
   source_type: "MOCK" | string;
   detail?: string | null;
   requires_gpu_handoff?: boolean;
+  runtime_state?: "READY_TO_USE" | "CONFIG_ERROR";
+  requires_api_key?: boolean;
+  may_incur_cost?: boolean;
 }
 
 export interface ScriptCharacter {
@@ -317,6 +320,7 @@ export interface GeneratedVideoShot {
   video_sha256?: string;
   mock?: boolean;
   ai_video_generated?: boolean;
+  metadata?: Record<string, unknown>;
   video_url_error?: { code: string; summary: string };
   [key: string]: unknown;
 }

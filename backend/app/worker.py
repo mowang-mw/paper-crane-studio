@@ -39,6 +39,11 @@ from .providers.base import (
     script_result_from_v1,
 )
 from .providers.comfyui import ComfyUIImageProvider
+from .providers.cloud_wan import (
+    CLOUD_WAN_PROVIDER_ID,
+    CLOUD_WAN_SOURCE_TYPE,
+    CloudWanVideoProvider,
+)
 from .providers.llama_cpp import LlamaCppScriptProvider
 from .providers.llama_server import LlamaServerJobSession
 from .providers.mock import (
@@ -77,9 +82,9 @@ from .services.media_rerender import (
     MediaRerenderJobError,
 )
 from .services.video_jobs import (
+    MOCK_VIDEO_PROVIDER_ID,
     VIDEO_JOB_TYPE,
-    VIDEO_PROVIDER_ID,
-    VIDEO_SOURCE_TYPE,
+    VIDEO_PROVIDER_IDS,
     VideoJobError,
 )
 
@@ -291,11 +296,12 @@ class Worker:
                         "Job provider_id 与 VideoProvider 快照不一致。",
                         retryable=False,
                     )
-                if video_provider_id != VIDEO_PROVIDER_ID:
+                if video_provider_id not in VIDEO_PROVIDER_IDS:
                     raise VideoJobError(
                         "VIDEO_PROVIDER_UNSUPPORTED",
                         f"不支持的 VideoProvider：{video_provider_id}",
                         retryable=False,
+                        provider_id=video_provider_id,
                     )
 
             if audio_provider_id is not None:
@@ -877,16 +883,35 @@ class Worker:
                 "VIDEO_OPTIONS_INVALID", f"Video Job 参数无效：{exc}", retryable=False
             ) from exc
 
-        provider = (
-            self.video_provider_factory(self.settings)
-            if self.video_provider_factory is not None
-            else MockVideoProvider()
-        )
-        if provider.provider_id != VIDEO_PROVIDER_ID:
+        selected_provider_id = str(request_snapshot.get("video_provider") or "")
+        if self.video_provider_factory is not None:
+            provider = self.video_provider_factory(self.settings)
+        elif selected_provider_id == MOCK_VIDEO_PROVIDER_ID:
+            provider = MockVideoProvider()
+        elif selected_provider_id == CLOUD_WAN_PROVIDER_ID:
+            provider = CloudWanVideoProvider(
+                api_key=self.settings.dashscope_api_key,
+                workspace_id=self.settings.dashscope_workspace_id,
+                region=self.settings.dashscope_region,
+                model_id=self.settings.cloud_wan_model_id,
+                poll_interval_seconds=self.settings.cloud_wan_poll_interval_seconds,
+                overall_timeout_seconds=self.settings.cloud_wan_timeout_seconds,
+                http_timeout_seconds=self.settings.cloud_wan_http_timeout_seconds,
+                max_source_image_bytes=self.settings.cloud_wan_max_source_image_bytes,
+            )
+        else:
             raise VideoJobError(
                 "VIDEO_PROVIDER_UNSUPPORTED",
-                f"Worker 得到未注册的 VideoProvider：{provider.provider_id}",
+                f"Worker 不支持 VideoProvider：{selected_provider_id}",
                 retryable=False,
+                provider_id=selected_provider_id,
+            )
+        if provider.provider_id != selected_provider_id:
+            raise VideoJobError(
+                "VIDEO_PROVIDER_UNSUPPORTED",
+                f"Worker Provider={provider.provider_id} 与 Job={selected_provider_id} 不一致。",
+                retryable=False,
+                provider_id=selected_provider_id,
             )
         output_dir = self.settings.project_dir(project_id) / "jobs" / job_id / "video"
         script_shots = script_result_from_v1(
@@ -936,8 +961,12 @@ class Worker:
                 ),
             )
         except Exception as exc:
+            if isinstance(getattr(exc, "generation_error", None), dict):
+                raise
             raise VideoJobError(
-                "VIDEO_GENERATION_FAILED", f"Mock 动态视频生成失败：{str(exc)[:500]}"
+                "VIDEO_GENERATION_FAILED",
+                f"动态视频生成失败：{str(exc)[:500]}",
+                provider_id=selected_provider_id,
             ) from exc
         if len(generated) != len(script.shots):
             raise VideoJobError(
@@ -945,25 +974,39 @@ class Worker:
             )
 
         serialized: list[dict[str, Any]] = []
+        is_mock_provider = selected_provider_id == MOCK_VIDEO_PROVIDER_ID
+        expected_source_type = "MOCK" if is_mock_provider else CLOUD_WAN_SOURCE_TYPE
         with self.database.session() as session:
             job = crud.get_job(session, job_id)
             if job is None or job.status != JobStatus.RUNNING:
                 raise RuntimeError(f"Video Job is no longer RUNNING: {job_id}")
             for shot_index, asset in enumerate(generated, start=1):
                 if (
-                    asset.provider_id != VIDEO_PROVIDER_ID
-                    or asset.source_type != VIDEO_SOURCE_TYPE
+                    asset.provider_id != selected_provider_id
+                    or asset.source_type != expected_source_type
                     or asset.status != "SUCCEEDED"
                     or asset.success is not True
                 ):
                     raise VideoJobError(
                         "VIDEO_SOURCE_TYPE_INVALID",
-                        "MockVideoProvider 产物必须明确标记 source_type=MOCK。",
+                        f"VideoProvider 产物必须明确标记 source_type={expected_source_type}。",
                         retryable=False,
+                        provider_id=selected_provider_id,
                     )
                 relative_video = self._relative_project_path(asset.video_path, project_id)
                 relative_trace = self._relative_project_path(asset.trace_path, project_id)
                 source_item = source_items[asset.shot_id]
+                provider_metadata = (
+                    asset.metadata
+                    if not is_mock_provider
+                    else {
+                        "mock": True,
+                        "ai_video_generated": False,
+                        "method": asset.metadata.get("method"),
+                        "options": asset.metadata.get("options"),
+                        "plan": asset.metadata.get("plan"),
+                    }
+                )
                 database_asset = crud.create_asset(
                     session,
                     project_id=project_id,
@@ -982,8 +1025,9 @@ class Worker:
                         "fps": asset.fps,
                         "trace_path": relative_trace,
                         "source_image_asset_id": source_item.get("image_asset_id"),
-                        "mock": True,
-                        "ai_video_generated": False,
+                        "mock": is_mock_provider,
+                        "ai_video_generated": not is_mock_provider,
+                        "provider_metadata": provider_metadata,
                     },
                 )
                 serialized.append(
@@ -1005,15 +1049,17 @@ class Worker:
                         "video_sha256": asset.video_sha256,
                         "trace_path": relative_trace,
                         "source_image_asset_id": source_item.get("image_asset_id"),
-                        "mock": True,
-                        "ai_video_generated": False,
+                        "mock": is_mock_provider,
+                        "ai_video_generated": not is_mock_provider,
+                        "metadata": provider_metadata,
                     }
                 )
             result = {
                 "stage": "SUCCEEDED",
-                "video_provider": VIDEO_PROVIDER_ID,
-                "video_source_type": VIDEO_SOURCE_TYPE,
-                "mock_video_fallback": True,
+                "video_provider": selected_provider_id,
+                "video_model_id": request_snapshot.get("video_model_id"),
+                "video_source_type": expected_source_type,
+                "mock_video_fallback": is_mock_provider,
                 "video_provider_calls": len(generated),
                 "video_shots": serialized,
                 "video_completed_count": len(serialized),
