@@ -152,6 +152,71 @@ def test_generation_and_repair_prompts_require_explicit_story_ending() -> None:
         assert "frozen moment" in text
         assert "不要描述镜头缓缓推进" in text
         assert "空间关系必须明确、无歧义" in text
+        assert "visual_description" in text
+        assert "剧情推进" in text
+        assert "角色关键行动" in text
+        assert "必要结局" in text
+        assert "服装" in text
+        assert "灯光" in text
+        assert "构图" in text
+        assert "静态环境" in text
+    assert "只负责画面中可见的信息" in generation_text
+    assert "只负责观众需要听到" in generation_text
+    assert "原始故事已经存在的剧情事实" in generation_text
+    assert "抽取、概括和精炼" in generation_text
+    assert "不得创作性扩写" in generation_text
+    assert "文学性扩写" in generation_text
+    assert "氛围渲染性扩写" in generation_text
+    assert "不是 visual_description 的口语版本" in generation_text
+    assert "不是重新创作的文学旁白" in generation_text
+    assert "面向 ImageProvider 和 VideoProvider 的视觉扩展字段" in generation_text
+    assert "增加重要新事件或新角色" in generation_text
+    assert "改变故事走向的道具" in generation_text
+    for text in (generation_text, repair_text):
+        assert "最大安全容量" in text
+        assert "不是建议写满的目标" in text
+        assert "不需要用旁白填满全部时长" in text
+        assert "一句短而自然的中文" in text
+        assert "没有 narration 的视觉时间" in text
+        assert "画面展示" in text
+        assert "BGM" in text
+        assert "环境声" in text
+        assert "VideoProvider" in text
+        assert "不得因为" in text
+        assert "visual_description 已" in text
+    assert "雨夜，少女独自在末班车站等待。" in generation_text
+    assert "视觉细节应留在 visual_description" in generation_text
+    assert "Narration concision rules apply ONLY to narration" in generation_text
+    assert "Do not shorten visual_description" in generation_text
+    assert "visual_description should remain visually informative" in generation_text
+    for visual_dimension in (
+        "主体",
+        "外观",
+        "服装",
+        "姿态",
+        "动作瞬间",
+        "环境",
+        "天气",
+        "关键物体",
+        "灯光",
+        "空间关系",
+        "构图重点",
+    ):
+        assert visual_dimension in generation_text
+    assert "make implicit visual information explicit" in generation_text
+    assert "invent new story facts" in generation_text
+    assert "image_prompt 应主要从 visual_description" in generation_text
+    assert "不得简单复述 narration" in generation_text
+    assert "优先删除属于 visual_description" in repair_text
+    assert "不是重新创作完整故事" in repair_text
+    assert "概括成更短的原故事剧情事实表达" in repair_text
+    assert "不得为了压缩而删除必要剧情事件" in repair_text
+    assert "不得新增剧情、改变结局" in repair_text
+    assert "把视觉细节换一种说法继续塞回 narration" in repair_text
+    assert "narration 简洁规则只作用于 narration" in repair_text
+    assert "不得同步缩短已经合法的 visual_description 或 image_prompt" in repair_text
+    assert "visual_description 即使对应一句短 narration" in repair_text
+    assert "image_prompt 应继续主要从 visual_description" in repair_text
     assert "自动规划" in generation_text
     assert "3—5" in generation_text
 

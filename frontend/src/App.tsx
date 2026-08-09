@@ -689,7 +689,7 @@ function FailureCard({
         )}
         {repairErrors.length > 0 && (
           <div className="attempt-errors">
-            <strong>唯一一次修复输出</strong>
+            <strong>最后一次修复输出</strong>
             <ul>{repairErrors.map((item, index) => <li key={index}>{attemptErrorText(item)}</li>)}</ul>
           </div>
         )}

@@ -840,6 +840,93 @@ class LlamaCppScriptProvider(ScriptProvider):
                         "每个镜头旁白的非空白字符数不得超过 "
                         "duration_seconds 乘以上述每秒字符数"
                     ),
+                    "responsibility": (
+                        "只写观众需要听到的剧情推进、角色关键行动、必要事件和必要结局信息，"
+                        "表达简洁自然"
+                    ),
+                    "source_contract": (
+                        "只能从原始故事已经存在的剧情事实中抽取、概括和精炼；"
+                        "允许为自然中文口语做轻度改写，但不得创作性扩写"
+                    ),
+                    "length_budget_semantics": {
+                        "ceiling_not_target": (
+                            "duration_seconds 乘以每秒字符数是最大安全容量，不是建议写满的目标"
+                        ),
+                        "preferred_expression": "优先用一句短而自然的中文表达本镜头最重要的剧情事实",
+                        "visual_time_allowed": (
+                            "镜头不需要用旁白填满全部时长；允许并鼓励保留没有 narration 的视觉时间，"
+                            "用于画面展示、环境氛围、动作、BGM、环境声和 VideoProvider 视觉运动"
+                        ),
+                    },
+                    "allowed_transformations": [
+                        "抽取原故事事实",
+                        "概括与压缩",
+                        "为真实 TTS 做简洁自然的轻度改写",
+                    ],
+                    "exclude_visible_details": [
+                        "人物服装与外观细节",
+                        "灯光",
+                        "环境与静态场景细节",
+                        "构图、摄影描述与空间关系",
+                        "visual_description 已包含的可见信息",
+                    ],
+                    "prohibited": [
+                        "新增原故事不存在的剧情事实或角色",
+                        "创作新情节、文学性扩写或氛围渲染性扩写",
+                        "把 visual_description 改写成口语旁白",
+                        "为了完整描述画面而增加旁白长度",
+                    ],
+                },
+                "visual_description": {
+                    "responsibility": (
+                        "面向 ImageProvider 和 VideoProvider 的视觉扩展字段，可以比 narration 丰富得多"
+                    ),
+                    "field_isolation": (
+                        "narration 的简洁、不扩写和不填满时长规则只适用于 narration；"
+                        "不得因此缩短 visual_description，即使 narration 只有一句话也要保持视觉信息充分"
+                    ),
+                    "required_visual_dimensions": [
+                        "主体",
+                        "已知外观与服装一致性",
+                        "当前姿态或动作瞬间",
+                        "环境、背景、天气与时间氛围",
+                        "当前剧情已有的关键物体",
+                        "不改变剧情的灯光与视觉氛围",
+                        "角色、场景和物体之间的空间关系",
+                        "主体清楚且可直接构图的构图重点",
+                    ],
+                    "expansion_policy": (
+                        "把原故事隐含的视觉信息具体化，使 ImageProvider 和 VideoProvider 能直接据此构图；"
+                        "只允许 make implicit visual information explicit，不允许 invent new story facts"
+                    ),
+                    "allowed_expansion": [
+                        "人物外观、服装、表情与姿态",
+                        "环境、天气与灯光",
+                        "空间关系、构图与动作瞬间",
+                        "不改变原剧情的具体视觉细节",
+                    ],
+                    "prohibited": [
+                        "改变原剧情",
+                        "增加重要新事件或新角色",
+                        "发明改变故事走向的道具",
+                    ],
+                },
+                "image_prompt": {
+                    "source_priority": (
+                        "主要从 visual_description 提取和转换视觉信息，不得简单复述 narration"
+                    ),
+                    "required_visual_information": [
+                        "主体",
+                        "外观一致性",
+                        "环境",
+                        "动作",
+                        "关键物体",
+                        "空间关系",
+                        "构图意图",
+                    ],
+                    "limits": (
+                        "信息应足够支持图像构图，但不得无限扩写、发明新剧情或增加新角色"
+                    ),
                 },
                 "story_coverage": {
                     "must_cover": ["开端", "主要发展", "明确结局"],
@@ -861,6 +948,32 @@ class LlamaCppScriptProvider(ScriptProvider):
                     f"{STATIC_KEYFRAME_DESCRIPTION_RULE}"
                     "character 必须包含角色作用、稳定外观、性格、服装与一致性提示词；"
                     "scene 必须包含时间、光照与一致性提示词；negative_prompt 可为 null。"
+                    "visual_description 只负责画面中可见的信息，包括人物服装与外观、灯光、"
+                    "环境、构图、空间关系和静态视觉细节。narration 只负责观众需要听到的"
+                    "剧情推进、角色关键行动、必要事件和必要结局信息，应简洁自然；不得重复"
+                    "服装、灯光、构图、摄影描述或 visual_description 已包含的静态环境信息。"
+                    "narration 只能抽取、概括和精炼原始故事已经存在的剧情事实，允许为真实 TTS"
+                    "做轻度自然口语改写，但不得新增事实、创作新情节、文学性扩写或氛围渲染性扩写；"
+                    "它不是 visual_description 的口语版本，也不是重新创作的文学旁白。"
+                    "旁白的 duration_seconds×每秒字符数只是最大安全容量，不是建议写满的目标；"
+                    "镜头不需要用旁白填满全部时长。优先用一句短而自然的中文只表达本镜头"
+                    "最重要的剧情事实，并允许、鼓励保留没有 narration 的视觉时间，用于画面展示、"
+                    "环境氛围、动作、BGM、环境声和后续 VideoProvider 的视觉运动。不得因为镜头较长"
+                    "而向 narration 添加环境、灯光、服装、构图、氛围或 visual_description 已有细节。"
+                    "例如，与其旁白详述空旷月台、昏暗灯光、湿润地面和车灯，更应简洁写成："
+                    "“雨夜，少女独自在末班车站等待。”视觉细节应留在 visual_description。"
+                    "Narration concision rules apply ONLY to narration. Do not shorten visual_description "
+                    "merely because narration must be concise. visual_description should remain visually "
+                    "informative even when narration is only one short sentence."
+                    "visual_description 是面向 ImageProvider 和 VideoProvider 的视觉扩展字段，"
+                    "允许具体化外观、服装、表情、姿态、天气、灯光、空间关系、构图和动作瞬间，"
+                    "可以比 narration 丰富得多，但不得改变剧情、增加重要新事件或新角色，"
+                    "也不得发明改变故事走向的道具。每个 visual_description 应在当前剧情支持范围内"
+                    "说明主体、已知外观与服装、姿态或动作瞬间、环境与天气、关键物体、灯光、"
+                    "空间关系和构图重点，让模型明确谁在哪里、正在做什么。视觉扩展只能把隐含视觉"
+                    "信息具体化，不能发明新的故事事实。image_prompt 应主要从 visual_description"
+                    "提取和转换主体、外观一致性、环境、动作、关键物体、空间关系和构图意图，"
+                    "不得简单复述 narration，也不得无限扩写或发明新剧情。"
                     "镜头必须覆盖故事开端、主要发展和明确结局；最后一镜必须表现"
                     "原故事的最终事件或结局状态。剧情节点多于镜头数时合并相邻节点，"
                     "不得为满足镜头数量而删除故事末尾事件。"
@@ -928,12 +1041,32 @@ class LlamaCppScriptProvider(ScriptProvider):
                     ),
                     "rewrite_requirements": [
                         "将超长 narration 改写到 maximum_narration_characters 以内",
+                        "maximum_narration_characters 是最大安全容量而非建议写满的目标",
+                        "优先用一句短而自然的中文表达本镜头最重要的剧情事实，不用旁白填满镜头时长",
+                        "允许保留没有 narration 的视觉时间用于画面、动作、声音和 VideoProvider 视觉运动",
+                        "只从原始故事已有剧情事实中抽取、概括和精炼，不重新创作完整故事",
+                        "优先删除属于 visual_description 的服装、灯光、环境、构图和摄影描述等视觉重复信息",
+                        "其次将复杂旁白概括成更短的剧情事实表达，再删除非必要修饰",
+                        "保留剧情推进、角色关键行动、必要事件和必要结局信息",
                         "保留原意",
                         "不增加新剧情",
+                        "不把视觉细节换一种说法继续写回 narration",
                         "不通过字符串截断制造残句",
                     ],
                     "failed_shots": narration_repairs,
                     "check_all_shots": True,
+                },
+                "field_isolation": {
+                    "narration_concision_applies_only_to": "narration",
+                    "preserve_visual_description_when_valid": True,
+                    "preserve_image_prompt_when_valid": True,
+                    "rule": (
+                        "修复 narration 长度时，不得同步压缩 visual_description 或 image_prompt；"
+                        "不得删除其主体、外观、动作、环境、关键物体、灯光、空间关系或构图信息"
+                    ),
+                    "image_prompt_source": (
+                        "image_prompt 继续以 visual_description 为主要视觉来源，不复述 narration"
+                    ),
                 },
                 "story_coverage": {
                     "must_cover": ["开端", "主要发展", "明确结局"],
@@ -965,7 +1098,22 @@ class LlamaCppScriptProvider(ScriptProvider):
                     "shot_duration_seconds、current_narration_characters 和"
                     " maximum_narration_characters 改写对应旁白；保留原意，"
                     "不增加新剧情，不得修改镜头数量，并同时检查其他镜头的"
-                    "旁白是否满足同一规则。不得用机械字符串截断产生残句。\n"
+                    "旁白是否满足同一规则。优先删除属于 visual_description 的服装、灯光、"
+                    "静态环境、构图和摄影描述等视觉重复信息；必须保留剧情推进、角色关键行动、"
+                    "必要事件和必要结局信息，不得为了压缩而删除必要剧情事件，也不得用机械"
+                    "字符串截断产生残句。repair 不是重新创作完整故事；应先删除视觉重复，"
+                    "再把复杂旁白概括成更短的原故事剧情事实表达，最后删除非必要修饰。"
+                    "不得新增剧情、改变结局，或把视觉细节换一种说法继续塞回 narration。\n"
+                    "maximum_narration_characters 只是最大安全容量，不是建议写满的目标。"
+                    "镜头不需要用旁白填满全部时长；优先保留一句短而自然的核心剧情事实，"
+                    "允许并鼓励留下没有 narration 的视觉时间，用于画面展示、环境氛围、动作、"
+                    "BGM、环境声和后续 VideoProvider 的视觉运动。不得因为 duration 较长而补写"
+                    "环境、灯光、服装、构图、氛围或 visual_description 已表达的细节。\n"
+                    "上述 narration 简洁规则只作用于 narration。修复 narration 长度时，不得同步"
+                    "缩短已经合法的 visual_description 或 image_prompt，也不得删除其中必要的主体、"
+                    "外观一致性、动作、环境、关键物体、灯光、空间关系和构图信息。"
+                    "visual_description 即使对应一句短 narration 也必须保持视觉信息充分；"
+                    "image_prompt 应继续主要从 visual_description 转换视觉信息，而不是复述 narration。\n"
                     "修复后的镜头仍须覆盖故事开端、主要发展和明确结局；"
                     "最后一镜必须表现原故事最终事件或结局状态。若剧情节点多于"
                     "镜头数，应合并相邻节点，不得删除结尾。\n"

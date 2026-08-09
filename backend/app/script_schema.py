@@ -428,9 +428,12 @@ def _proportional_duration_tenths(
     script: _DurationRelaxedScript,
 ) -> list[int]:
     shot_count = len(script.shots)
-    target_tenths = int(NORMALIZED_TOTAL_BY_SHOT_COUNT[shot_count] * 10)
+    preferred_target_tenths = int(
+        NORMALIZED_TOTAL_BY_SHOT_COUNT[shot_count] * 10
+    )
     lower_bounds = [_duration_lower_bound_tenths(shot) for shot in script.shots]
     upper_bound = int(SHOT_DURATION_MAX_SECONDS * 10)
+    hard_total_upper_bound = int(SCRIPT_DURATION_MAX_SECONDS * 10)
 
     if any(not math.isfinite(shot.duration_seconds) for shot in script.shots):
         raise DurationNormalizationError("时长包含非有限数字，无法规范化")
@@ -440,10 +443,12 @@ def _proportional_duration_tenths(
         raise DurationNormalizationError(
             "至少一个镜头的旁白即使按 10 秒计算仍然过长，无法仅调整时长"
         )
-    if sum(lower_bounds) > target_tenths:
+    minimum_feasible_total = sum(lower_bounds)
+    if minimum_feasible_total > hard_total_upper_bound:
         raise DurationNormalizationError(
-            "旁白所需的最短总时长超过本镜头数量的规范化目标，无法仅调整时长"
+            "旁白所需的最短总时长超过 40 秒业务上限，无法仅调整时长"
         )
+    target_tenths = max(preferred_target_tenths, minimum_feasible_total)
 
     weights = [Decimal(str(shot.duration_seconds)) for shot in script.shots]
     allocations: list[Decimal | None] = [None] * shot_count
@@ -536,6 +541,15 @@ def _normalize_relaxed_script(
 
     original_total = sum(original_durations)
     normalized_total = sum(normalized_durations)
+    preferred_total = NORMALIZED_TOTAL_BY_SHOT_COUNT[len(script.shots)]
+    target_reason = (
+        f"优选目标 {preferred_total:g} 秒"
+        if math.isclose(normalized_total, preferred_total, abs_tol=1e-9)
+        else (
+            f"旁白最小时长超过优选目标 {preferred_total:g} 秒，"
+            f"采用最小可行总时长 {normalized_total:g} 秒"
+        )
+    )
     return DurationNormalizationResult(
         normalized=any(
             not math.isclose(before, after, abs_tol=1e-9)
@@ -552,8 +566,7 @@ def _normalize_relaxed_script(
         normalized_total=normalized_total,
         reason=(
             "修复后仅剩时长约束错误；"
-            f"按原始时长比例缩放并以 0.1 秒确定性取整到 "
-            f"{NORMALIZED_TOTAL_BY_SHOT_COUNT[len(script.shots)]:g} 秒，"
+            f"按原始时长比例缩放并以 0.1 秒确定性取整，{target_reason}，"
             "未增删、合并或重排镜头"
         ),
     )

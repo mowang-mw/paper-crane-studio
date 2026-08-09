@@ -396,8 +396,22 @@ def test_llamacpp_repairs_narration_with_explicit_bounded_constraints(
     assert '"shot_duration_seconds":7.0' in repair_text
     assert '"current_narration_characters":60' in repair_text
     assert '"maximum_narration_characters":35' in repair_text
+    assert "maximum_narration_characters 是最大安全容量而非建议写满的目标" in repair_text
+    assert "不用旁白填满镜头时长" in repair_text
+    assert "允许保留没有 narration 的视觉时间" in repair_text
+    assert '"narration_concision_applies_only_to":"narration"' in repair_text
+    assert '"preserve_visual_description_when_valid":true' in repair_text
+    assert '"preserve_image_prompt_when_valid":true' in repair_text
+    assert "不得同步压缩 visual_description 或 image_prompt" in repair_text
+    assert "image_prompt 继续以 visual_description 为主要视觉来源" in repair_text
     assert "保留原意" in repair_text
     assert "不增加新剧情" in repair_text
+    assert "只从原始故事已有剧情事实中抽取、概括和精炼" in repair_text
+    assert "不重新创作完整故事" in repair_text
+    assert "优先删除属于 visual_description" in repair_text
+    assert "其次将复杂旁白概括成更短的剧情事实表达" in repair_text
+    assert "不把视觉细节换一种说法继续写回 narration" in repair_text
+    assert "不得为了压缩而删除必要剧情事件" in repair_text
     assert "不得修改镜头数量" in repair_text
     assert "ScriptV1" in repair_text
     assert "纯 JSON" in repair_text

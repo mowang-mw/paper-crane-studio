@@ -154,6 +154,53 @@ def test_normalization_targets_by_shot_count(shot_count: int, target: float) -> 
     assert all(4.0 <= value <= 10.0 for value in result.normalized_durations)
 
 
+def test_normalization_expands_preferred_total_to_narration_minimum() -> None:
+    payload = _payload(3, [8.0, 6.0, 6.0])
+    for shot, character_count in zip(
+        payload["shots"],
+        [39, 39, 47],
+        strict=True,
+    ):
+        shot["narration"] = "字" * character_count
+
+    analysis = analyze_script_candidate(payload, desired_shot_count=3)
+    result = normalize_script_durations(payload, desired_shot_count=3)
+
+    assert analysis.duration_only is True
+    assert analysis.normalizable_duration_only is True
+    assert result.original_durations == [8.0, 6.0, 6.0]
+    assert result.normalized_durations == [7.8, 7.8, 9.4]
+    assert result.normalized_total == 25.0
+    assert "优选目标 24 秒" in result.reason
+    assert "最小可行总时长 25 秒" in result.reason
+    ScriptV1.model_validate(result.script.model_dump(mode="json"))
+
+
+def test_normalization_still_rejects_narration_over_single_shot_hard_limit() -> None:
+    payload = _payload(3, [8.0, 6.0, 6.0])
+    payload["shots"][0]["narration"] = "字" * 51
+
+    analysis = analyze_script_candidate(payload, desired_shot_count=3)
+
+    assert analysis.duration_only is True
+    assert analysis.normalizable_duration_only is False
+    with pytest.raises(DurationNormalizationError, match="10 秒"):
+        normalize_script_durations(payload, desired_shot_count=3)
+
+
+def test_normalization_still_rejects_required_total_over_hard_limit() -> None:
+    payload = _payload(5, [8.0] * 5)
+    for shot in payload["shots"]:
+        shot["narration"] = "字" * 41
+
+    analysis = analyze_script_candidate(payload, desired_shot_count=5)
+
+    assert analysis.duration_only is True
+    assert analysis.normalizable_duration_only is False
+    with pytest.raises(DurationNormalizationError, match="40 秒业务上限"):
+        normalize_script_durations(payload, desired_shot_count=5)
+
+
 def test_normalization_never_mutates_or_masks_structural_errors() -> None:
     payload = _payload(durations=[3.0, 6.0, 9.0, 12.0])
     original = copy.deepcopy(payload)
