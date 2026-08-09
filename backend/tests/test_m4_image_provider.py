@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,30 @@ def _station_requests(
     )
 
 
+def _with_shot_text(
+    request: ImageGenerationRequest,
+    *,
+    visual_description: str,
+    camera: str,
+) -> ImageGenerationRequest:
+    shot = request.shot.model_copy(
+        update={
+            "visual_description": visual_description,
+            "image_prompt": visual_description,
+            "camera": camera,
+        }
+    )
+    script = request.script.model_copy(
+        update={
+            "shots": [
+                shot if item.id == request.shot.id else item
+                for item in request.script.shots
+            ]
+        }
+    )
+    return replace(request, script=script, shot=shot)
+
+
 class _FakeSession:
     def __init__(self, owner: "_FakeSessionFactory", **kwargs: Any) -> None:
         self.owner = owner
@@ -384,6 +409,88 @@ def test_station_story_prompt_preserves_entities_actions_and_bound_relations(
     assert "after the rain" in shot3
     assert "illuminated train door prominent in frame" in shot3
     assert "blue and violet night lighting" not in shot3
+
+
+def test_approaching_train_variant_preserves_headlights_and_depth(
+    tmp_path: Path,
+) -> None:
+    request = _with_shot_text(
+        _station_requests(tmp_path)[0],
+        visual_description=(
+            "雨夜，少女站在空旷的月台，远处一列列车亮着车灯缓缓驶来。"
+        ),
+        camera="静态构图，列车位于画面右侧",
+    )
+
+    prompt, layers = build_positive_prompt(request)
+
+    assert "approaching train in the distance" in layers["action"]
+    assert "front of train visible" in layers["action"]
+    assert "bright headlights" in layers["action"]
+    assert "distant train in the background" in layers["spatial_relation"]
+    assert "deep perspective" in layers["spatial_relation"]
+    assert all(
+        expected in prompt for expected in ("bright headlights", "deep perspective")
+    )
+
+
+def test_looking_train_stop_and_illuminated_door_relations_are_bound(
+    tmp_path: Path,
+) -> None:
+    request = _with_shot_text(
+        _station_requests(tmp_path)[1],
+        visual_description=(
+            "雨渐渐停下，少女安静地望向靠近的列车，"
+            "列车停在站台旁，明亮的车门亮起。"
+        ),
+        camera="静态构图，少女位于月台中央",
+    )
+
+    _, layers = build_positive_prompt(request)
+
+    assert "looking toward the arriving train" in layers["action"]
+    assert "head and body oriented toward train" in layers["action"]
+    assert "train stopped beside the platform" in layers["spatial_relation"]
+    assert "bright illuminated train door" in layers["lighting_weather"]
+
+
+def test_camera_contributes_mapped_walking_staging_without_raw_text(
+    tmp_path: Path,
+) -> None:
+    request = _with_shot_text(
+        _station_requests(tmp_path)[2],
+        visual_description="列车停在站台旁，明亮的车门亮起。",
+        camera="少女朝车门方向走去",
+    )
+
+    prompt, layers = build_positive_prompt(request)
+
+    for expected in (
+        "walking toward an illuminated train door",
+        "mid-step pose",
+        "one foot forward",
+        "three-quarter back view",
+        "body facing toward the train door",
+    ):
+        assert expected in layers["action"]
+    assert "train door ahead of her" in layers["spatial_relation"]
+    assert "train stopped beside the platform" in layers["spatial_relation"]
+    assert "朝车门方向走去" not in prompt
+
+
+def test_unrelated_camera_does_not_pollute_action_or_spatial_layers(
+    tmp_path: Path,
+) -> None:
+    request = _with_shot_text(
+        _station_requests(tmp_path)[0],
+        visual_description="少女穿着深色雨衣。",
+        camera="静态构图，少女位于月台中央，列车位于画面右侧",
+    )
+
+    _, layers = build_positive_prompt(request)
+
+    assert layers["action"] == ""
+    assert layers["spatial_relation"] == ""
 
 
 def test_crouching_is_retained_alongside_compound_paper_airplane_relation(

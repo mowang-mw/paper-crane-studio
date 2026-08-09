@@ -286,6 +286,64 @@ _COMPOUND_SEMANTIC_CUES: tuple[tuple[str, str, str], ...] = (
         "approaching train in the distance",
         "action",
     ),
+    (
+        "亮着车灯缓缓驶来",
+        "approaching train in the distance, front of train visible, bright headlights",
+        "action",
+    ),
+    (
+        "亮着车灯驶来",
+        "approaching train in the distance, front of train visible, bright headlights",
+        "action",
+    ),
+    (
+        "远处一列列车",
+        "distant train in the background, deep perspective",
+        "spatial_relation",
+    ),
+    (
+        "望向靠近的列车",
+        "looking toward the arriving train, head and body oriented toward train",
+        "action",
+    ),
+    (
+        "望向驶来的列车",
+        "looking toward the arriving train, head and body oriented toward train",
+        "action",
+    ),
+    (
+        "朝车门方向走去",
+        (
+            "walking toward an illuminated train door, mid-step pose, one foot forward, "
+            "three-quarter back view, body facing toward the train door"
+        ),
+        "action",
+    ),
+    (
+        "朝车门方向",
+        "train door ahead of her",
+        "spatial_relation",
+    ),
+    (
+        "列车停在站台旁",
+        "train stopped beside the platform",
+        "spatial_relation",
+    ),
+    (
+        "列车停靠在站台旁",
+        "train stopped beside the platform",
+        "spatial_relation",
+    ),
+    (
+        "明亮的车门亮起",
+        "bright illuminated train door",
+        "lighting_weather",
+    ),
+    (
+        "亮起的车门",
+        "bright illuminated train door",
+        "lighting_weather",
+    ),
     ("手中拿着纸飞机", "holding a paper airplane", "action"),
     ("拿着纸飞机", "holding a paper airplane", "action"),
     ("发着微光的纸飞机", "glowing paper airplane", "prop"),
@@ -612,6 +670,7 @@ def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
         [request.shot.visual_description, request.shot.image_prompt]
     )
     camera_source = ", ".join([request.shot.camera, request.shot.visual_description])
+    staging_source = ", ".join([visual_source, request.shot.camera])
     composition = _category_tags(
         camera_source,
         "composition",
@@ -624,9 +683,9 @@ def build_prompt_layers(request: ImageGenerationRequest) -> dict[str, str]:
         "character_anchor": _deduplicate_tags(character_tags),
         "shared_character_anchors": _deduplicate_tags(character_tags),
         "scene": _semantic_tags(scene_source, fallback="detailed story environment"),
-        "action": _category_tags(visual_source, "action"),
+        "action": _category_tags(staging_source, "action"),
         "prop": _category_tags(visual_source, "prop"),
-        "spatial_relation": _category_tags(visual_source, "spatial_relation"),
+        "spatial_relation": _category_tags(staging_source, "spatial_relation"),
         "lighting_weather": _category_tags(
             f"{scene_source}, {visual_source}",
             "lighting_weather",
