@@ -115,6 +115,19 @@ def provider_registry(settings: Settings) -> dict[str, Any]:
             },
             audio_status,
         ],
+        "default_video_provider": "none",
+        "video_providers": [
+            {
+                "provider_id": "mock-video",
+                "display_name": "Mock 动态视频",
+                "available": True,
+                "configured": True,
+                "model_id": "deterministic-ffmpeg-keyframe-video",
+                "source_type": "MOCK",
+                "detail": "由已有关键帧确定性生成测试 MP4，不代表真实 AI 视频模型。",
+                "requires_gpu_handoff": False,
+            }
+        ],
     }
 
 

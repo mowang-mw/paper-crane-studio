@@ -657,6 +657,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--teal); box-shado
 .download-actions { gap: 8px; }
 .button-light, .button-outline-light { min-height: 40px; border-radius: 5px; }
 .task-shortcut { border-radius: 6px; }
+.optional-video-control { border-top-color: #6d78a8; background: #f5f6fa; }
+.optional-video-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+.optional-video-grid article { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.optional-video-grid video { width: 100%; aspect-ratio: 16 / 9; background: #172035; }
+.optional-video-grid strong, .optional-video-grid small { overflow-wrap: anywhere; }
+.optional-video-grid small { color: var(--muted); }
 footer { max-width: 1240px; min-height: 76px; padding: 0 24px; letter-spacing: .02em; }
 
 @media (max-width: 900px) {
@@ -666,6 +672,7 @@ footer { max-width: 1240px; min-height: 76px; padding: 0 24px; letter-spacing: .
   .stage-navigation { margin-left: 24px; margin-right: 24px; }
   .result-section { padding-left: 24px; padding-right: 24px; }
   .shot-grid { grid-template-columns: 1fr; }
+  .optional-video-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 580px) {
   .topbar { height: 68px; }

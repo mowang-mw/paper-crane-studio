@@ -24,8 +24,10 @@ import {
   getProviders,
   imageAssetUrl,
   listProjects,
+  mediaAssetUrl,
   renderRealAudio,
   renderRealImages,
+  renderVideo,
   rerenderMediaOnly,
   retryJob,
   uploadBackgroundAudio,
@@ -38,6 +40,7 @@ import type {
   DurationNormalization,
   GeneratedAudioShot,
   GeneratedImageShot,
+  GeneratedVideoShot,
   GenerationAttemptError,
   GenerationErrorDetail,
   GenerationJob,
@@ -50,6 +53,8 @@ import type {
   ProvidersStatus,
   ScriptProviderId,
   ScriptProviderStatus,
+  VideoMode,
+  VideoProviderStatus,
 } from "./types";
 
 const PAPER_CRANE_STORY =
@@ -169,6 +174,19 @@ function isRealAudioJob(job: GenerationJob | null | undefined): boolean {
     job.job_type === "MEDIA_RERENDER" ||
     textValue(job.request_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID ||
     textValue(job.result_json?.audio_provider) === REAL_AUDIO_PROVIDER_ID
+  );
+}
+
+function isVideoJob(job: GenerationJob | null | undefined): boolean {
+  return job?.job_type === "GENERATE_VIDEO";
+}
+
+function jobVideoShots(job: GenerationJob | null | undefined): GeneratedVideoShot[] {
+  const videos = job?.result_json?.video_shots;
+  if (!Array.isArray(videos)) return [];
+  return videos.filter(
+    (item): item is GeneratedVideoShot =>
+      recordValue(item) !== null && typeof item.shot_id === "string" && item.shot_id.length > 0,
   );
 }
 
@@ -1313,6 +1331,7 @@ export default function App() {
   const [providerChecking, setProviderChecking] = useState(false);
   const [scriptProvider, setScriptProvider] = useState<ScriptProviderId>("mock");
   const [audioSpeaker, setAudioSpeaker] = useState<AudioSpeaker>("Serena");
+  const [videoMode, setVideoMode] = useState<VideoMode>("keyframe_motion");
   const [motionPreset, setMotionPreset] = useState<MotionPreset>("gentle_zoom");
   const [backgroundAudioEnabled, setBackgroundAudioEnabled] = useState(false);
   const [backgroundVolume, setBackgroundVolume] = useState(0.12);
@@ -1821,6 +1840,22 @@ export default function App() {
     }
   };
 
+  const startVideoGeneration = async () => {
+    if (!selectedId || !sourceImageJob || videoMode !== "mock-video") return;
+    setBusy("video");
+    setError("");
+    setNotice(null);
+    try {
+      const job = await renderVideo(selectedId, sourceImageJob.id, motionPreset);
+      setActiveJob({ ...job, project_id: job.project_id || selectedId });
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      setError(`动态视频任务提交失败：${readableError(cause)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const startMediaOnlyRerender = async () => {
     if (!selectedId || !successfulRealAudioJob) return;
     setBusy("media-rerender");
@@ -1907,6 +1942,7 @@ export default function App() {
   const providerDescriptors = providersStatus?.providers ?? [];
   const imageProviderDescriptors = providersStatus?.image_providers ?? [];
   const audioProviderDescriptors = providersStatus?.audio_providers ?? [];
+  const videoProviderDescriptors = providersStatus?.video_providers ?? [];
   const selectedProviderDescriptor = providerDescriptors.find(
     (provider) => provider.provider_id === scriptProvider,
   );
@@ -1926,6 +1962,8 @@ export default function App() {
       (provider) => provider.provider_id === REAL_AUDIO_PROVIDER_ID,
     );
   const realAudioProviderConfigured = realAudioProviderDescriptor?.configured !== false;
+  const mockVideoProviderDescriptor: VideoProviderStatus | undefined =
+    videoProviderDescriptors.find((provider) => provider.provider_id === "mock-video");
   const gpuHandoffRequired =
     llamaRunning ||
     realImageProviderDescriptor?.requires_gpu_handoff === true ||
@@ -2018,6 +2056,14 @@ export default function App() {
   const generatedImageShots = jobImageShots(imageDisplayJob);
   const imageGenerationInProgress =
     isRealImageJob(activeJob) &&
+    (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
+  const videoDisplayJob =
+    (isVideoJob(latestVisibleJob) ? latestVisibleJob : null) ??
+    detail?.recent_jobs.find((job) => isVideoJob(job)) ??
+    null;
+  const generatedVideoShots = jobVideoShots(videoDisplayJob);
+  const videoGenerationInProgress =
+    isVideoJob(activeJob) &&
     (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
   const audioDisplayJob =
     (isRealAudioJob(latestVisibleJob) ? latestVisibleJob : null) ??
@@ -2843,6 +2889,119 @@ export default function App() {
                 />
               )}
             </section>
+            </StageAccordion>
+
+            <StageAccordion
+              title="动态视频（可选）"
+              summary={
+                videoMode === "keyframe_motion"
+                  ? "不生成 AI 视频 · 沿用关键帧动效"
+                  : `${mockVideoProviderDescriptor?.display_name ?? "MockVideoProvider"} · ${generatedVideoShots.length}/${scriptShots.length} 个测试片段`
+              }
+              status={
+                videoMode === "keyframe_motion"
+                  ? "已跳过"
+                  : videoDisplayJob?.status === "SUCCEEDED"
+                    ? "Mock 已完成"
+                    : videoGenerationInProgress
+                      ? "处理中"
+                      : "可选"
+              }
+              open={videoMode === "mock-video" || videoGenerationInProgress}
+            >
+              <section className="real-image-control optional-video-control" aria-labelledby="optional-video-title">
+                <div className="real-image-heading">
+                  <div>
+                    <p className="eyebrow">M8-A1 · OPTIONAL VIDEO PROVIDER</p>
+                    <h3 id="optional-video-title">选择关键帧之后的可选动态视频阶段</h3>
+                  </div>
+                  <span className="visual-source-badge is-mock">当前仅 Mock</span>
+                </div>
+                <fieldset className="motion-preset-selector" disabled={busy !== null || generationInProgress}>
+                  <legend>视频阶段模式</legend>
+                  <label className={videoMode === "keyframe_motion" ? "is-selected" : ""}>
+                    <input
+                      type="radio"
+                      name="video-mode"
+                      value="keyframe_motion"
+                      checked={videoMode === "keyframe_motion"}
+                      onChange={() => setVideoMode("keyframe_motion")}
+                    />
+                    <span>
+                      <strong>不生成 AI 视频</strong>
+                      <small>继续使用现有 PNG 关键帧与 FFmpeg 镜头动效</small>
+                    </span>
+                  </label>
+                  <label className={videoMode === "mock-video" ? "is-selected" : ""}>
+                    <input
+                      type="radio"
+                      name="video-mode"
+                      value="mock-video"
+                      checked={videoMode === "mock-video"}
+                      onChange={() => setVideoMode("mock-video")}
+                    />
+                    <span>
+                      <strong>MockVideoProvider</strong>
+                      <small>由已有 PNG 确定性生成测试 MP4，不是真实 AI 视频</small>
+                    </span>
+                  </label>
+                </fieldset>
+                <div className="real-image-provider-line">
+                  <strong>{mockVideoProviderDescriptor?.display_name ?? "Mock 动态视频"}</strong>
+                  <span>Provider ID：mock-video</span>
+                  <span>Source type：MOCK</span>
+                  <span>最终成片：M8-A1 暂不消费 VideoAsset</span>
+                  {mockVideoProviderDescriptor?.detail && (
+                    <span className="image-provider-detail">{mockVideoProviderDescriptor.detail}</span>
+                  )}
+                </div>
+                {videoMode === "mock-video" && !sourceImageJob && (
+                  <p className="provider-warning">请先完成一个带有逐镜头关键帧的图片 Job。</p>
+                )}
+                {videoDisplayJob?.status === "FAILED" && (
+                  <p className="provider-warning" role="alert">
+                    Mock 动态视频生成失败：{videoDisplayJob.error_message ?? "请查看任务技术详情。"}
+                  </p>
+                )}
+                <div className="real-image-actions">
+                  <button
+                    className="button button-primary"
+                    type="button"
+                    onClick={() => void startVideoGeneration()}
+                    disabled={
+                      videoMode !== "mock-video" ||
+                      !sourceImageJob ||
+                      busy !== null ||
+                      generationInProgress ||
+                      mockVideoProviderDescriptor?.available === false
+                    }
+                  >
+                    {busy === "video"
+                      ? "正在提交 Mock 视频任务…"
+                      : videoGenerationInProgress
+                        ? `正在生成测试片段 ${activeJob?.progress ?? 0}%`
+                        : "生成 Mock 动态视频"}
+                  </button>
+                </div>
+                {generatedVideoShots.length > 0 && (
+                  <div className="optional-video-grid">
+                    {generatedVideoShots.map((shot) => {
+                      const videoUrl = mediaAssetUrl(shot.video_url);
+                      return (
+                        <article key={shot.shot_id}>
+                          <strong>镜头 {shot.shot_index ?? shot.shot_id}</strong>
+                          {videoUrl ? (
+                            <video controls preload="metadata" src={videoUrl} />
+                          ) : (
+                            <p role="alert">视频媒体 URL 不可用。</p>
+                          )}
+                          <small>MOCK · {shot.duration_seconds?.toFixed(1) ?? "—"} 秒</small>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
             </StageAccordion>
 
             <StageAccordion

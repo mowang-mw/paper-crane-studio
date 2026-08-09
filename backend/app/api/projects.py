@@ -26,6 +26,7 @@ from ..schemas import (
     MediaRerenderRequest,
     RealAudioRenderRequest,
     RealImageRenderRequest,
+    VideoRenderRequest,
     ProjectCreate,
     ProjectDetail,
     ProjectRead,
@@ -50,6 +51,7 @@ from ..services.media_rerender import (
     MEDIA_RERENDER_PROVIDER_ID,
     media_rerender_error_payload,
 )
+from ..services.video_jobs import VIDEO_JOB_TYPE, VIDEO_PROVIDER_ID
 from .job_serialization import job_read_with_media_urls
 from ..services.image_jobs import REAL_IMAGE_JOB_TYPE, REAL_IMAGE_PROVIDER_ID
 
@@ -428,6 +430,59 @@ def render_project_with_real_images(
         "actual_shot_count": len(script.shots),
         **_media_polish_snapshot(settings, project.id, payload),
     }
+    session.commit()
+    return JobQueued(job_id=job.id)
+
+
+@router.post(
+    "/{project_id}/render-video",
+    response_model=JobQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def render_project_video(
+    project_id: str,
+    payload: VideoRenderRequest,
+    session: Session = Depends(get_session),
+) -> JobQueued:
+    """Queue the optional mock video stage without changing final-media inputs."""
+
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    if crud.project_has_active_jobs(session, project.id):
+        raise HTTPException(status_code=409, detail="当前项目仍有任务正在运行。")
+    source_job = crud.get_job(session, payload.source_image_job_id)
+    if source_job is None or source_job.project_id != project.id:
+        raise HTTPException(status_code=409, detail="来源图片 Job 不属于当前项目。")
+    if source_job.status != JobStatus.SUCCEEDED:
+        raise HTTPException(status_code=409, detail="来源图片 Job 尚未成功。")
+    source_images = (source_job.result_json or {}).get("image_shots")
+    if not isinstance(source_images, list) or not source_images:
+        raise HTTPException(status_code=409, detail="来源 Job 没有可复用的关键帧资产。")
+
+    job = crud.create_job(
+        session,
+        project=project,
+        provider_id=payload.video_provider,
+        job_type=VIDEO_JOB_TYPE,
+        request_json={
+            "project_id": project.id,
+            "parent_job_id": source_job.id,
+            "source_image_job_id": source_job.id,
+            "video_provider": payload.video_provider,
+            "video_options": {
+                "width": 1280,
+                "height": 720,
+                "fps": 24,
+                "duration_seconds": payload.duration_seconds,
+                "motion_preset": payload.motion_preset,
+            },
+            "final_media_consumes_video": False,
+            "fallback_media_path": "KEYFRAME_FFMPEG_MOTION",
+        },
+    )
+    if job.provider_id != VIDEO_PROVIDER_ID:
+        raise HTTPException(status_code=422, detail="当前仅提供明确标记的 MockVideoProvider。")
     session.commit()
     return JobQueued(job_id=job.id)
 

@@ -138,6 +138,15 @@ class RealAudioRenderRequest(MediaPolishOptions):
     language: Literal["Chinese"] = "Chinese"
 
 
+class VideoRenderRequest(BaseModel):
+    source_image_job_id: str = Field(min_length=1, max_length=36)
+    video_provider: Literal["mock-video"] = "mock-video"
+    duration_seconds: float = Field(default=2.0, gt=0, le=60)
+    motion_preset: Literal["static", "gentle_zoom", "cinematic_pan"] = (
+        "gentle_zoom"
+    )
+
+
 class MediaRerenderRequest(MediaPolishOptions):
     source_audio_job_id: str = Field(min_length=1, max_length=36)
 
@@ -201,6 +210,17 @@ class AudioProviderStatusRead(BaseModel):
     language: Literal["Chinese"]
 
 
+class VideoProviderStatusRead(BaseModel):
+    provider_id: Literal["mock-video"]
+    display_name: str
+    available: bool
+    configured: bool
+    model_id: str
+    source_type: Literal["MOCK"]
+    detail: str | None = None
+    requires_gpu_handoff: bool = False
+
+
 class ProvidersRead(BaseModel):
     default_script_provider: Literal["mock", "llamacpp"]
     checked_at: datetime
@@ -209,6 +229,8 @@ class ProvidersRead(BaseModel):
     image_providers: list[ImageProviderStatusRead]
     default_audio_provider: Literal["mock", "qwen3-tts-0.6b-customvoice"]
     audio_providers: list[AudioProviderStatusRead]
+    default_video_provider: Literal["none", "mock-video"]
+    video_providers: list[VideoProviderStatusRead]
 
 
 class HealthRead(BaseModel):

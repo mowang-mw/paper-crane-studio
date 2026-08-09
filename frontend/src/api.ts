@@ -16,6 +16,8 @@ import type {
   ScriptProviderId,
   ScriptProviderStatus,
   Shot,
+  VideoProviderId,
+  VideoProviderStatus,
 } from "./types";
 
 const configuredBase = import.meta.env.VITE_API_BASE_URL?.trim();
@@ -122,6 +124,10 @@ function isAudioProviderId(value: unknown): value is AudioProviderId {
   return value === "mock" || value === "qwen3-tts-0.6b-customvoice";
 }
 
+function isVideoProviderId(value: unknown): value is VideoProviderId {
+  return value === "mock-video";
+}
+
 function isAudioSpeaker(value: unknown): value is AudioSpeaker {
   return value === "Serena" || value === "Vivian";
 }
@@ -195,6 +201,20 @@ function normalizeAudioProvider(value: unknown): AudioProviderStatus | null {
   };
 }
 
+function normalizeVideoProvider(value: unknown): VideoProviderStatus | null {
+  if (!isRecord(value) || !isVideoProviderId(value.provider_id)) return null;
+  return {
+    provider_id: value.provider_id,
+    display_name: optionalText(value.display_name) ?? "Mock 动态视频",
+    available: value.available === true,
+    configured: typeof value.configured === "boolean" ? value.configured : null,
+    model_id: optionalText(value.model_id),
+    source_type: optionalText(value.source_type) ?? "MOCK",
+    detail: optionalText(value.detail),
+    requires_gpu_handoff: value.requires_gpu_handoff === true,
+  };
+}
+
 export async function getHealth(): Promise<HealthStatus> {
   return request<HealthStatus>("/health");
 }
@@ -219,6 +239,11 @@ export async function getProviders(): Promise<ProvidersStatus> {
         .map(normalizeAudioProvider)
         .filter((item): item is AudioProviderStatus => item !== null)
     : [];
+  const videoProviders = Array.isArray(payload.video_providers)
+    ? payload.video_providers
+        .map(normalizeVideoProvider)
+        .filter((item): item is VideoProviderStatus => item !== null)
+    : [];
   return {
     default_script_provider: isScriptProviderId(payload.default_script_provider)
       ? payload.default_script_provider
@@ -229,10 +254,15 @@ export async function getProviders(): Promise<ProvidersStatus> {
     default_audio_provider: isAudioProviderId(payload.default_audio_provider)
       ? payload.default_audio_provider
       : null,
+    default_video_provider:
+      payload.default_video_provider === "none" || isVideoProviderId(payload.default_video_provider)
+        ? payload.default_video_provider
+        : null,
     checked_at: optionalText(payload.checked_at),
     providers,
     image_providers: imageProviders,
     audio_providers: audioProviders,
+    video_providers: videoProviders,
   };
 }
 
@@ -342,6 +372,24 @@ export async function renderRealAudio(
   );
 }
 
+export async function renderVideo(
+  projectId: string,
+  sourceImageJobId: string,
+  motionPreset: MediaPolishOptions["motionPreset"],
+): Promise<GenerationJob> {
+  return unwrapJob(
+    await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-video`, {
+      method: "POST",
+      body: JSON.stringify({
+        source_image_job_id: sourceImageJobId,
+        video_provider: "mock-video",
+        duration_seconds: 2,
+        motion_preset: motionPreset,
+      }),
+    }),
+  );
+}
+
 export async function rerenderMediaOnly(
   projectId: string,
   sourceAudioJobId: string,
@@ -407,6 +455,10 @@ function absoluteMediaUrl(value: string | undefined): string | null {
 }
 
 export function imageAssetUrl(value: string | undefined): string | null {
+  return absoluteMediaUrl(value);
+}
+
+export function mediaAssetUrl(value: string | undefined): string | null {
   return absoluteMediaUrl(value);
 }
 

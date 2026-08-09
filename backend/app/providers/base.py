@@ -249,6 +249,102 @@ class AudioGenerationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoGenerationOptions:
+    """Deterministic options for an optional per-shot video provider."""
+
+    width: int = 1280
+    height: int = 720
+    fps: int = 24
+    duration_seconds: float = 2.0
+    motion_preset: str = "gentle_zoom"
+
+    def __post_init__(self) -> None:
+        if self.width < 320 or self.height < 180 or self.width % 8 or self.height % 8:
+            raise ValueError("video dimensions must be at least 320x180 and divisible by 8")
+        if self.fps <= 0 or self.fps > 120:
+            raise ValueError("video fps must be between 1 and 120")
+        if self.duration_seconds <= 0 or self.duration_seconds > 60:
+            raise ValueError("video duration must be between 0 and 60 seconds")
+        if self.motion_preset not in {"static", "gentle_zoom", "cinematic_pan"}:
+            raise ValueError("unsupported video motion preset")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "duration_seconds": self.duration_seconds,
+            "motion_preset": self.motion_preset,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VideoGenerationRequest:
+    project_id: str
+    job_id: str
+    shot: ScriptShot
+    source_image_path: Path
+    prompt: str
+    motion_description: str
+    output_dir: Path
+    options: VideoGenerationOptions
+
+    def __post_init__(self) -> None:
+        if not self.project_id.strip() or not self.job_id.strip():
+            raise ValueError("project_id and job_id must not be empty")
+        source_image_path = Path(self.source_image_path).resolve()
+        if not source_image_path.is_file():
+            raise ValueError("source keyframe image does not exist")
+        if not self.prompt.strip():
+            raise ValueError("video prompt must not be empty")
+        object.__setattr__(self, "source_image_path", source_image_path)
+        object.__setattr__(self, "output_dir", Path(self.output_dir).resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPlan:
+    provider_id: str
+    source_type: str
+    parameters: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedVideoAsset:
+    provider_id: str
+    shot_id: str
+    video_path: Path
+    duration_seconds: float
+    width: int
+    height: int
+    fps: int
+    source_type: str
+    video_sha256: str
+    trace_path: Path
+    metadata: dict[str, Any]
+    status: str = "SUCCEEDED"
+    success: bool = True
+    warnings: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "shot_id": self.shot_id,
+            "video_path": str(self.video_path),
+            "duration_seconds": self.duration_seconds,
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "source_type": self.source_type,
+            "video_sha256": self.video_sha256,
+            "trace_path": str(self.trace_path),
+            "metadata": self.metadata,
+            "status": self.status,
+            "success": self.success,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratedAudioAsset:
     """AudioProvider 返回的真实 PCM WAV 与完整追溯。"""
 
@@ -370,6 +466,34 @@ class AudioProvider(ABC):
 
         del reusable_assets
         generated: list[GeneratedAudioAsset] = []
+        for request in requests:
+            asset = self.generate(request=request)
+            generated.append(asset)
+            if progress_callback:
+                progress_callback(len(generated), len(requests), asset)
+        return tuple(generated)
+
+
+class VideoProvider(ABC):
+    """Optional image-to-video stage; final media may ignore these assets."""
+
+    provider_id: str
+
+    @abstractmethod
+    def plan(self, *, shot: ScriptShot) -> VideoPlan:
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate(self, *, request: VideoGenerationRequest) -> GeneratedVideoAsset:
+        raise NotImplementedError
+
+    def generate_batch(
+        self,
+        *,
+        requests: tuple[VideoGenerationRequest, ...],
+        progress_callback: Callable[[int, int, GeneratedVideoAsset], None] | None = None,
+    ) -> tuple[GeneratedVideoAsset, ...]:
+        generated: list[GeneratedVideoAsset] = []
         for request in requests:
             asset = self.generate(request=request)
             generated.append(asset)

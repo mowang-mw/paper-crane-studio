@@ -7,6 +7,10 @@ from .base import (
     ImageGenerationRequest,
     ImageProvider,
     ScriptProvider,
+    GeneratedVideoAsset,
+    VideoGenerationOptions,
+    VideoGenerationRequest,
+    VideoProvider,
 )
 from .comfyui import ComfyUIImageProvider, ComfyUIJobSession, ImageProviderError
 from .llama_cpp import (
@@ -16,7 +20,7 @@ from .llama_cpp import (
     LlamaCppScriptProvider,
     LlamaCppTransportError,
 )
-from .mock import MockAudioProvider, MockImageProvider, MockScriptProvider
+from .mock import MockAudioProvider, MockImageProvider, MockScriptProvider, MockVideoProvider
 
 __all__ = [
     "AudioProvider",
@@ -35,5 +39,10 @@ __all__ = [
     "MockAudioProvider",
     "MockImageProvider",
     "MockScriptProvider",
+    "MockVideoProvider",
     "ScriptProvider",
+    "GeneratedVideoAsset",
+    "VideoGenerationOptions",
+    "VideoGenerationRequest",
+    "VideoProvider",
 ]

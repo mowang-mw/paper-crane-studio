@@ -2,6 +2,8 @@ export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export type ScriptProviderId = "mock" | "llamacpp";
 export type ImageProviderId = "mock" | "comfyui-animagine-xl-4";
 export type AudioProviderId = "mock" | "qwen3-tts-0.6b-customvoice";
+export type VideoProviderId = "mock-video";
+export type VideoMode = "keyframe_motion" | VideoProviderId;
 export type AudioSpeaker = "Serena" | "Vivian";
 export type AudioLanguage = "Chinese";
 export type DesiredShotCount = 3 | 4 | 5 | null;
@@ -51,10 +53,12 @@ export interface ProvidersStatus {
   default_script_provider: ScriptProviderId | null;
   default_image_provider: ImageProviderId | null;
   default_audio_provider: AudioProviderId | null;
+  default_video_provider: "none" | VideoProviderId | null;
   checked_at: string | null;
   providers: ScriptProviderStatus[];
   image_providers: ImageProviderStatus[];
   audio_providers: AudioProviderStatus[];
+  video_providers: VideoProviderStatus[];
 }
 
 export interface ImageProviderStatus {
@@ -80,6 +84,17 @@ export interface AudioProviderStatus {
   speakers?: AudioSpeaker[];
   default_speaker?: AudioSpeaker;
   language?: AudioLanguage;
+}
+
+export interface VideoProviderStatus {
+  provider_id: VideoProviderId;
+  display_name: string;
+  available: boolean;
+  configured: boolean | null;
+  model_id: string | null;
+  source_type: "MOCK" | string;
+  detail?: string | null;
+  requires_gpu_handoff?: boolean;
 }
 
 export interface ScriptCharacter {
@@ -135,6 +150,8 @@ export interface GenerationRequestSnapshot {
   source_audio_job_id?: string;
   parent_job_id?: string;
   audio_provider?: AudioProviderId;
+  video_provider?: VideoProviderId;
+  video_options?: Record<string, unknown>;
   speaker?: AudioSpeaker;
   language?: AudioLanguage;
   base_seed?: number;
@@ -284,6 +301,26 @@ export interface GeneratedAudioShot {
   [key: string]: unknown;
 }
 
+export interface GeneratedVideoShot {
+  shot_id: string;
+  shot_index?: number;
+  status?: JobStatus | string;
+  provider_id?: VideoProviderId | string;
+  source_type?: string;
+  video_path?: string;
+  video_url?: string;
+  video_asset_id?: string;
+  duration_seconds?: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  video_sha256?: string;
+  mock?: boolean;
+  ai_video_generated?: boolean;
+  video_url_error?: { code: string; summary: string };
+  [key: string]: unknown;
+}
+
 export interface MediaTimingShot {
   shot_id: string;
   shot_index?: number;
@@ -379,6 +416,12 @@ export interface GenerationResult {
   audio_extension_seconds?: number;
   extended_by_seconds?: number;
   video_source_type?: string;
+  video_provider?: string;
+  video_shots?: GeneratedVideoShot[];
+  video_completed_count?: number;
+  video_total_count?: number;
+  mock_video_fallback?: boolean;
+  final_media_consumes_video?: boolean;
   media_only?: boolean;
   source_type?: string;
   [key: string]: unknown;

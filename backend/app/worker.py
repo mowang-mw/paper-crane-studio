@@ -33,11 +33,20 @@ from .providers.base import (
     ImageGenerationOptions,
     ImageGenerationRequest,
     ImageProvider,
+    VideoGenerationOptions,
+    VideoGenerationRequest,
+    VideoProvider,
+    script_result_from_v1,
 )
 from .providers.comfyui import ComfyUIImageProvider
 from .providers.llama_cpp import LlamaCppScriptProvider
 from .providers.llama_server import LlamaServerJobSession
-from .providers.mock import MockAudioProvider, MockImageProvider, MockScriptProvider
+from .providers.mock import (
+    MockAudioProvider,
+    MockImageProvider,
+    MockScriptProvider,
+    MockVideoProvider,
+)
 from .providers.qwen3_tts import create_qwen3_tts_provider
 from .providers.registry import check_llamacpp
 from .script_schema import ScriptV1
@@ -67,11 +76,18 @@ from .services.media_rerender import (
     MEDIA_RERENDER_PROVIDER_ID,
     MediaRerenderJobError,
 )
+from .services.video_jobs import (
+    VIDEO_JOB_TYPE,
+    VIDEO_PROVIDER_ID,
+    VIDEO_SOURCE_TYPE,
+    VideoJobError,
+)
 
 
 Renderer = Callable[..., dict[str, Any]]
 ImageProviderFactory = Callable[[Settings], ImageProvider]
 AudioProviderFactory = Callable[[Settings], AudioProvider]
+VideoProviderFactory = Callable[[Settings], VideoProvider]
 
 
 class MediaResumeError(RuntimeError):
@@ -115,6 +131,7 @@ class Worker:
         image_provider_factory: ImageProviderFactory | None = None,
         real_audio_renderer: Renderer | None = None,
         audio_provider_factory: AudioProviderFactory | None = None,
+        video_provider_factory: VideoProviderFactory | None = None,
     ) -> None:
         self.settings = settings or Settings.from_env()
         self.settings.ensure_directories()
@@ -127,6 +144,7 @@ class Worker:
         self.image_provider_factory = image_provider_factory
         self.real_audio_renderer = real_audio_renderer
         self.audio_provider_factory = audio_provider_factory
+        self.video_provider_factory = video_provider_factory
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -244,6 +262,7 @@ class Worker:
             request_snapshot = dict(job.request_json or {})
             image_provider_id: str | None = None
             audio_provider_id: str | None = None
+            video_provider_id: str | None = None
             media_only = job.job_type == MEDIA_RERENDER_JOB_TYPE
             if media_only:
                 project_id = project.id
@@ -259,6 +278,25 @@ class Worker:
                 project_title = project.title
                 project_story = project.story
                 image_provider_id = job.provider_id
+            elif job.job_type == VIDEO_JOB_TYPE:
+                project_id = project.id
+                project_title = project.title
+                project_script_json = copy.deepcopy(project.script_json)
+                video_provider_id = job.provider_id
+
+            if video_provider_id is not None:
+                if request_snapshot.get("video_provider") != video_provider_id:
+                    raise VideoJobError(
+                        "VIDEO_PROVIDER_SNAPSHOT_MISMATCH",
+                        "Job provider_id 与 VideoProvider 快照不一致。",
+                        retryable=False,
+                    )
+                if video_provider_id != VIDEO_PROVIDER_ID:
+                    raise VideoJobError(
+                        "VIDEO_PROVIDER_UNSUPPORTED",
+                        f"不支持的 VideoProvider：{video_provider_id}",
+                        retryable=False,
+                    )
 
             if audio_provider_id is not None:
                 if request_snapshot.get("audio_provider") != audio_provider_id:
@@ -295,6 +333,15 @@ class Worker:
                         retryable=False,
                     )
                 project_script_json = copy.deepcopy(project.script_json)
+
+        if video_provider_id is not None:
+            self._process_video_job(
+                job_id=job_id,
+                project_id=project_id,
+                project_script_json=project_script_json,
+                request_snapshot=request_snapshot,
+            )
+            return
 
         if media_only:
             self._process_media_rerender_job(
@@ -756,6 +803,229 @@ class Worker:
             crud.mark_job_succeeded(session, job=job, result_json=result_json)
             session.commit()
         print(f"[worker] job={job_id} SUCCEEDED export={export.id}", flush=True)
+
+    def _process_video_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        project_script_json: dict[str, Any] | None,
+        request_snapshot: dict[str, Any],
+    ) -> None:
+        """Generate optional mock shot videos; final-media inputs remain unchanged."""
+
+        try:
+            script = ScriptV1.model_validate(project_script_json)
+        except Exception as exc:
+            raise VideoJobError(
+                "VIDEO_SOURCE_SCRIPT_INVALID",
+                "当前项目缺少可校验的 ScriptV1。",
+                retryable=False,
+            ) from exc
+        source_job_id = str(request_snapshot.get("source_image_job_id") or "")
+        with self.database.session() as session:
+            source_job = crud.get_job(session, source_job_id)
+            if source_job is None or source_job.project_id != project_id:
+                raise VideoJobError(
+                    "VIDEO_SOURCE_IMAGE_JOB_INVALID",
+                    "来源图片 Job 不存在或不属于当前项目。",
+                    retryable=False,
+                )
+            if source_job.status != JobStatus.SUCCEEDED:
+                raise VideoJobError(
+                    "VIDEO_SOURCE_IMAGE_JOB_INVALID",
+                    "来源图片 Job 尚未成功。",
+                    retryable=False,
+                )
+            source_result = copy.deepcopy(source_job.result_json or {})
+        raw_images = source_result.get("image_shots")
+        if not isinstance(raw_images, list):
+            raise VideoJobError(
+                "VIDEO_SOURCE_IMAGE_MISSING",
+                "来源 Job 没有逐镜头关键帧记录。",
+                retryable=False,
+            )
+        images_by_id = {
+            str(item.get("shot_id")): item
+            for item in raw_images
+            if isinstance(item, dict)
+            and item.get("shot_id")
+            and item.get("status") in {"SUCCEEDED", "REUSED"}
+        }
+        if set(images_by_id) != {shot.id for shot in script.shots}:
+            raise VideoJobError(
+                "VIDEO_SOURCE_IMAGE_MISSING",
+                "来源 Job 的关键帧集合与当前 ScriptV1 不一致。",
+                retryable=False,
+            )
+
+        raw_options = request_snapshot.get("video_options")
+        if not isinstance(raw_options, dict):
+            raise VideoJobError(
+                "VIDEO_OPTIONS_INVALID", "Video Job 缺少生成参数快照。", retryable=False
+            )
+        try:
+            options = VideoGenerationOptions(
+                width=int(raw_options.get("width", 1280)),
+                height=int(raw_options.get("height", 720)),
+                fps=int(raw_options.get("fps", 24)),
+                duration_seconds=float(raw_options.get("duration_seconds", 2.0)),
+                motion_preset=str(raw_options.get("motion_preset", "gentle_zoom")),
+            )
+        except (TypeError, ValueError) as exc:
+            raise VideoJobError(
+                "VIDEO_OPTIONS_INVALID", f"Video Job 参数无效：{exc}", retryable=False
+            ) from exc
+
+        provider = (
+            self.video_provider_factory(self.settings)
+            if self.video_provider_factory is not None
+            else MockVideoProvider()
+        )
+        if provider.provider_id != VIDEO_PROVIDER_ID:
+            raise VideoJobError(
+                "VIDEO_PROVIDER_UNSUPPORTED",
+                f"Worker 得到未注册的 VideoProvider：{provider.provider_id}",
+                retryable=False,
+            )
+        output_dir = self.settings.project_dir(project_id) / "jobs" / job_id / "video"
+        script_shots = script_result_from_v1(
+            script,
+            provider_id="reused",
+            source_type="REUSED_SCRIPT",
+        ).shots
+        requests: list[VideoGenerationRequest] = []
+        source_items: dict[str, dict[str, Any]] = {}
+        for provider_shot in script_shots:
+            item = images_by_id[provider_shot.provider_shot_id]
+            stored_path = item.get("image_path")
+            if not isinstance(stored_path, str) or not stored_path:
+                raise VideoJobError(
+                    "VIDEO_SOURCE_IMAGE_MISSING",
+                    f"镜头 {provider_shot.provider_shot_id} 缺少关键帧路径。",
+                    retryable=False,
+                )
+            source_path = self._stored_project_path(stored_path, project_id)
+            if not source_path.is_file() or source_path.stat().st_size <= 0:
+                raise VideoJobError(
+                    "VIDEO_SOURCE_IMAGE_MISSING",
+                    f"镜头 {provider_shot.provider_shot_id} 的关键帧文件不存在。",
+                    retryable=False,
+                )
+            source_items[provider_shot.provider_shot_id] = item
+            requests.append(
+                VideoGenerationRequest(
+                    project_id=project_id,
+                    job_id=job_id,
+                    shot=provider_shot,
+                    source_image_path=source_path,
+                    prompt=provider_shot.image_prompt or provider_shot.visual_description,
+                    motion_description=provider_shot.camera,
+                    output_dir=output_dir,
+                    options=options,
+                )
+            )
+
+        try:
+            generated = provider.generate_batch(
+                requests=tuple(requests),
+                progress_callback=lambda completed, total, _asset: (
+                    self._set_running_job_progress(
+                        job_id, 5 + int(80 * completed / max(1, total))
+                    )
+                ),
+            )
+        except Exception as exc:
+            raise VideoJobError(
+                "VIDEO_GENERATION_FAILED", f"Mock 动态视频生成失败：{str(exc)[:500]}"
+            ) from exc
+        if len(generated) != len(script.shots):
+            raise VideoJobError(
+                "VIDEO_GENERATION_FAILED", "VideoProvider 返回的镜头数量不完整。"
+            )
+
+        serialized: list[dict[str, Any]] = []
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"Video Job is no longer RUNNING: {job_id}")
+            for shot_index, asset in enumerate(generated, start=1):
+                if (
+                    asset.provider_id != VIDEO_PROVIDER_ID
+                    or asset.source_type != VIDEO_SOURCE_TYPE
+                    or asset.status != "SUCCEEDED"
+                    or asset.success is not True
+                ):
+                    raise VideoJobError(
+                        "VIDEO_SOURCE_TYPE_INVALID",
+                        "MockVideoProvider 产物必须明确标记 source_type=MOCK。",
+                        retryable=False,
+                    )
+                relative_video = self._relative_project_path(asset.video_path, project_id)
+                relative_trace = self._relative_project_path(asset.trace_path, project_id)
+                source_item = source_items[asset.shot_id]
+                database_asset = crud.create_asset(
+                    session,
+                    project_id=project_id,
+                    asset_type="VIDEO_SHOT",
+                    provider_id=asset.provider_id,
+                    source_type=asset.source_type,
+                    file_path=relative_video,
+                    sha256=asset.video_sha256,
+                    metadata_json={
+                        "job_id": job_id,
+                        "shot_id": asset.shot_id,
+                        "shot_index": shot_index,
+                        "duration_seconds": asset.duration_seconds,
+                        "width": asset.width,
+                        "height": asset.height,
+                        "fps": asset.fps,
+                        "trace_path": relative_trace,
+                        "source_image_asset_id": source_item.get("image_asset_id"),
+                        "mock": True,
+                        "ai_video_generated": False,
+                    },
+                )
+                serialized.append(
+                    {
+                        "shot_id": asset.shot_id,
+                        "shot_index": shot_index,
+                        "status": "SUCCEEDED",
+                        "provider_id": asset.provider_id,
+                        "source_type": asset.source_type,
+                        "video_path": relative_video,
+                        "video_asset_id": database_asset.id,
+                        "video_url": (
+                            f"/api/projects/{project_id}/assets/{database_asset.id}/content"
+                        ),
+                        "duration_seconds": asset.duration_seconds,
+                        "width": asset.width,
+                        "height": asset.height,
+                        "fps": asset.fps,
+                        "video_sha256": asset.video_sha256,
+                        "trace_path": relative_trace,
+                        "source_image_asset_id": source_item.get("image_asset_id"),
+                        "mock": True,
+                        "ai_video_generated": False,
+                    }
+                )
+            result = {
+                "stage": "SUCCEEDED",
+                "video_provider": VIDEO_PROVIDER_ID,
+                "video_source_type": VIDEO_SOURCE_TYPE,
+                "mock_video_fallback": True,
+                "video_provider_calls": len(generated),
+                "video_shots": serialized,
+                "video_completed_count": len(serialized),
+                "video_total_count": len(script.shots),
+                "source_image_job_id": source_job_id,
+                "video_options": options.as_dict(),
+                "final_media_consumes_video": False,
+                "fallback_media_path": "KEYFRAME_FFMPEG_MOTION",
+            }
+            crud.mark_job_succeeded(session, job=job, result_json=result)
+            session.commit()
+        print(f"[worker] video job={job_id} SUCCEEDED shots={len(serialized)}", flush=True)
 
     def _process_media_rerender_job(
         self,

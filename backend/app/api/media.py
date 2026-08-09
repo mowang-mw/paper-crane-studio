@@ -79,7 +79,7 @@ def _find_public_media_asset(session: Session, project_id: str, asset_id: str):
     if (
         asset is None
         or asset.project_id != project_id
-        or asset.asset_type not in {"KEYFRAME_IMAGE", "NARRATION_AUDIO"}
+        or asset.asset_type not in {"KEYFRAME_IMAGE", "NARRATION_AUDIO", "VIDEO_SHOT"}
     ):
         raise HTTPException(status_code=404, detail="媒体资产不存在")
     return asset
@@ -289,6 +289,7 @@ def get_image_asset(
     expected = {
         "KEYFRAME_IMAGE": (".png", "image/png"),
         "NARRATION_AUDIO": (".wav", "audio/wav"),
+        "VIDEO_SHOT": (".mp4", "video/mp4"),
     }[asset.asset_type]
     if path.suffix.lower() != expected[0]:
         raise HTTPException(status_code=404, detail="媒体资产格式无效")

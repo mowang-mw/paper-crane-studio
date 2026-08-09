@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable, Sequence
 
+from ..media.ffmpeg import resolve_media_tools, run_command, sha256_file
 from ..script_schema import Character, Scene, ScriptV1, Shot
 from .base import (
     AudioPlan,
     AudioProvider,
     ImageProvider,
+    GeneratedVideoAsset,
     ScriptProvider,
     ScriptResult,
     ScriptShot,
     VisualPlan,
+    VideoGenerationRequest,
+    VideoPlan,
+    VideoProvider,
     script_result_from_v1,
 )
 
@@ -281,4 +287,100 @@ class MockAudioProvider(AudioProvider):
                 "sample_rate": 48_000,
                 "method": "deterministic_pcm_wave",
             },
+        )
+
+
+VideoCommandRunner = Callable[[Sequence[str]], None]
+
+
+class MockVideoProvider(VideoProvider):
+    """Create a traceable mock MP4 from a keyframe without claiming AI inference."""
+
+    provider_id = "mock-video"
+    source_type = "MOCK"
+
+    def __init__(
+        self,
+        *,
+        ffmpeg_path: Path | None = None,
+        command_runner: VideoCommandRunner | None = None,
+    ) -> None:
+        self.ffmpeg_path = ffmpeg_path
+        self.command_runner = command_runner
+
+    def plan(self, *, shot: ScriptShot) -> VideoPlan:
+        return VideoPlan(
+            provider_id=self.provider_id,
+            source_type=self.source_type,
+            parameters={
+                "method": "deterministic_ffmpeg_keyframe_video",
+                "shot_index": shot.shot_index,
+                "seed": 81_000 + shot.shot_index,
+            },
+        )
+
+    def generate(self, *, request: VideoGenerationRequest) -> GeneratedVideoAsset:
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = request.output_dir / f"{request.shot.provider_shot_id}.mp4"
+        trace_path = request.output_dir / f"{request.shot.provider_shot_id}.video-trace.json"
+        ffmpeg = self.ffmpeg_path or resolve_media_tools().ffmpeg
+        options = request.options
+        duration = f"{options.duration_seconds:.3f}"
+        filter_graph = (
+            f"scale={options.width}:{options.height}:force_original_aspect_ratio=decrease,"
+            f"pad={options.width}:{options.height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={options.fps},format=yuv420p"
+        )
+        command = [
+            str(ffmpeg),
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(request.source_image_path),
+            "-t",
+            duration,
+            "-vf",
+            filter_graph,
+            "-an",
+            "-c:v",
+            "libx264",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        if self.command_runner is None:
+            run_command(command, timeout_seconds=max(60, int(options.duration_seconds * 10)))
+        else:
+            self.command_runner(command)
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise RuntimeError("MockVideoProvider did not create a non-empty MP4")
+
+        metadata = {
+            "mock": True,
+            "ai_video_generated": False,
+            "method": "deterministic_ffmpeg_keyframe_video",
+            "source_keyframe": str(request.source_image_path),
+            "prompt": request.prompt,
+            "motion_description": request.motion_description,
+            "options": options.as_dict(),
+            "plan": self.plan(shot=request.shot).parameters,
+            "command": command,
+        }
+        trace_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return GeneratedVideoAsset(
+            provider_id=self.provider_id,
+            shot_id=request.shot.provider_shot_id,
+            video_path=output_path,
+            duration_seconds=options.duration_seconds,
+            width=options.width,
+            height=options.height,
+            fps=options.fps,
+            source_type=self.source_type,
+            video_sha256=sha256_file(output_path),
+            trace_path=trace_path,
+            metadata=metadata,
         )
