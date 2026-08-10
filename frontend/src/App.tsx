@@ -67,6 +67,7 @@ import type {
   VideoProviderStatus,
 } from "./types";
 import { formatLocalDateTime } from "./local-time.js";
+import { describeVideoVersion, selectVideoDisplayJob } from "./video-version.js";
 
 const PAPER_CRANE_STORY =
   "深夜，少女在窗边折出一只纸鹤。纸鹤亮起微光，飞过屋顶、灯火与云层；黎明时，它飞向远方，少女在窗边静静注视。";
@@ -2347,10 +2348,10 @@ export default function App() {
     ) ?? [];
   const successfulVideoJob =
     successfulVideoJobs.find((job) => job.id === selectedFinalVideoJobId) ?? null;
-  const videoDisplayJob =
-    (isVideoJob(latestVisibleJob) ? latestVisibleJob : null) ??
-    successfulVideoJob ??
-    null;
+  const videoDisplayJob = selectVideoDisplayJob({
+    selectedJob: successfulVideoJob,
+    latestJob: isVideoJob(latestVisibleJob) ? latestVisibleJob : null,
+  });
   const generatedVideoShots = jobVideoShots(videoDisplayJob);
   const finalMediaVideoShotIds = new Set(
     jobVideoShots(successfulVideoJob).map((shot) => shot.shot_id),
@@ -3999,22 +4000,14 @@ export default function App() {
                 <div className="video-version-list">
                   {successfulVideoJobs.map((job) => {
                     const shots = jobVideoShots(job);
-                    const hasStaleLineage = shots.some((shot) => {
-                      const currentImageId = selectedVideoImageAssets[shot.shot_id];
-                      return Boolean(
-                        currentImageId &&
-                        shot.source_image_asset_id &&
-                        currentImageId !== shot.source_image_asset_id,
-                      );
-                    });
-                    const isBasedOnCurrent =
-                      shots.length > 0 &&
-                      shots.every(
-                        (shot) =>
-                          Boolean(selectedVideoImageAssets[shot.shot_id]) &&
-                          selectedVideoImageAssets[shot.shot_id] === shot.source_image_asset_id,
-                      );
                     const isCurrent = selectedFinalVideoJobId === job.id;
+                    const presentation = describeVideoVersion({
+                      jobId: job.id,
+                      jobStatus: job.status,
+                      selectedJobId: selectedFinalVideoJobId,
+                      shots,
+                      selectedImageAssetIds: selectedVideoImageAssets,
+                    });
                     const isReal = job.result_json?.video_source_type === "REAL_CLOUD_MODEL";
                     return (
                       <article
@@ -4026,24 +4019,33 @@ export default function App() {
                           <strong>{isReal ? "Wan 2.7 Cloud" : "Mock Video"}</strong>
                           <span>{isReal ? "REAL" : "MOCK"} · Job {job.id.slice(0, 8)}</span>
                           <span>
-                            {hasStaleLineage
-                              ? "基于旧关键帧"
-                              : isBasedOnCurrent
-                                ? "基于当前关键帧"
-                                : "关键帧关系待确认"}
+                            {shots.length} 个动态镜头
                             {job.created_at ? ` · ${formatCheckedAt(job.created_at)}` : ""}
                           </span>
                         </div>
                         <div className="video-version-actions">
-                          <span className={`video-version-state ${hasStaleLineage ? "is-stale" : "is-ready"}`}>
-                            {hasStaleLineage ? "STALE · 旧关键帧" : "READY · 当前关键帧"}
-                          </span>
+                          <div className="video-version-badges" aria-label="任务、采用状态与首帧兼容性">
+                            <span className="video-version-state is-execution">
+                              {presentation.executionStatus}
+                            </span>
+                            <span className={`video-version-state ${isCurrent ? "is-selected" : "is-history"}`}>
+                              {presentation.selectionLabel}
+                            </span>
+                            <span className={`video-version-state is-lineage-${presentation.lineage.toLowerCase()}`}>
+                              {presentation.lineageLabel}
+                            </span>
+                          </div>
                           <button
                             className="button button-ghost"
                             type="button"
                             aria-pressed={isCurrent}
                             disabled={isCurrent || busy !== null || generationInProgress}
                             onClick={() => void persistVideoSelection(job.id)}
+                            title={
+                              presentation.lineage === "STALE"
+                                ? "可以设为当前用于追溯，但成片计划仍会拒绝使用首帧已变更的视频。"
+                                : "将这个精确 Video Job 设为当前采用版本。"
+                            }
                           >
                             {isCurrent
                               ? "当前版本"
@@ -4091,7 +4093,9 @@ export default function App() {
                     <ul>
                       {item.plan?.shots.map((shot, index) => (
                         <li key={shot.shot_id}>
-                          镜头{index + 1} · {shot.selected_type === "VIDEO_SHOT" ? `${shot.is_mock ? "MOCK" : "REAL"} · Video` : `Image · ${shot.provider_hint ?? shot.provider}`}
+                          镜头{index + 1} · {shot.selected_type === "VIDEO_SHOT"
+                            ? `${shot.is_mock ? "MOCK" : "REAL"} · ${shot.provider} Video${shot.source_job_id ? ` · Job ${shot.source_job_id.slice(0, 8)}` : ""}`
+                            : `Image · ${shot.provider_hint ?? shot.provider}`}
                         </li>
                       ))}
                       {item.plan?.audio && (

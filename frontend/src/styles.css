@@ -128,11 +128,16 @@
 .video-version-item > div:first-child { display: grid; min-width: 0; gap: 3px; }
 .video-version-item strong { color: var(--navy); font-size: 12px; }
 .video-version-item span { overflow-wrap: anywhere; color: var(--muted); font-size: 9px; }
-.video-version-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.video-version-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+.video-version-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; max-width: 290px; }
 .video-version-actions .button { min-height: 30px; padding: 0 10px; font-size: 9px; }
 .video-version-state { padding: 4px 6px; border-radius: 3px; font-weight: 900; }
-.video-version-state.is-ready { background: #e6f4eb; color: #26734b; }
-.video-version-state.is-stale { background: #fff2df; color: #965b18; }
+.video-version-state.is-execution { background: #edf0f4; color: #4b5563; }
+.video-version-state.is-selected { background: #dff3ed; color: #17664f; }
+.video-version-state.is-history { background: #f1f2f4; color: #68707c; }
+.video-version-state.is-lineage-matched { background: #e6f4eb; color: #26734b; }
+.video-version-state.is-lineage-stale { background: #fff2df; color: #965b18; }
+.video-version-state.is-lineage-unknown { background: #f2edf7; color: #705486; }
 
 @media (max-width: 580px) {
   .demo-status-heading { align-items: flex-start; flex-direction: column; gap: 7px; }
