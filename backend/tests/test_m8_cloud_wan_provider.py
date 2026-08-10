@@ -219,6 +219,94 @@ def test_configured_cloud_job_snapshot_never_persists_credentials(
     assert API_KEY not in registry_text
 
 
+def test_single_shot_cloud_job_freezes_explicit_current_image_without_network(
+    database: Database, settings: Settings, monkeypatch
+) -> None:
+    project_id, source_job_id = _seed_source_image_job(database, settings)
+    with database.session() as session:
+        project = crud.get_project(session, project_id)
+        assert project is not None
+        shots = crud.list_shots(session, project_id)
+        shot3 = next(item for item in shots if item.shot_index == 3)
+        source_job = crud.get_job(session, source_job_id)
+        assert source_job is not None
+        source_item = next(
+            item for item in source_job.result_json["image_shots"] if item["shot_id"] == "shot_03"
+        )
+        asset = crud.create_asset(
+            session,
+            project_id=project_id,
+            shot_id=shot3.id,
+            asset_type="KEYFRAME_IMAGE",
+            provider_id="external-import",
+            source_type="EXTERNAL_IMPORT",
+            file_path=source_item["image_path"],
+            sha256="test-sha",
+            metadata_json={
+                "shot_id": "shot_03",
+                "provider_hint": "ChatGPT Images",
+                "external_source_type": "AI_GENERATED",
+            },
+        )
+        asset_id = asset.id
+        session.commit()
+    monkeypatch.setattr(
+        "backend.app.api.projects.validate_image_asset_file",
+        lambda **_kwargs: None,
+    )
+    configured = replace(
+        settings,
+        dashscope_api_key=API_KEY,
+        dashscope_workspace_id=WORKSPACE_ID,
+    )
+    with TestClient(create_app(configured, database=database)) as test_client:
+        persisted = test_client.put(
+            f"/api/projects/{project_id}/visual-selection",
+            json={
+                "source_image_asset_ids": {"shot_03": asset_id},
+                "source_video_job_id": None,
+            },
+        )
+        assert persisted.status_code == 200
+        response = test_client.post(
+            f"/api/projects/{project_id}/render-video",
+            json={
+                "source_image_asset_ids": {"shot_03": asset_id},
+                "target_shot_ids": ["shot_03"],
+                "video_provider": CLOUD_WAN_PROVIDER_ID,
+                "duration_seconds": 5,
+            },
+        )
+        assert response.status_code == 202
+        job = test_client.get(f"/api/jobs/{response.json()['job_id']}").json()
+    assert job["request_json"]["target_shot_ids"] == ["shot_03"]
+    assert job["request_json"]["source_image_asset_ids"] == {"shot_03": asset_id}
+    assert job["request_json"]["source_image_job_id"] is None
+
+
+def test_single_shot_cloud_job_without_explicit_image_is_blocked_before_queue(
+    database: Database, settings: Settings
+) -> None:
+    project_id, source_job_id = _seed_source_image_job(database, settings)
+    configured = replace(
+        settings,
+        dashscope_api_key=API_KEY,
+        dashscope_workspace_id=WORKSPACE_ID,
+    )
+    with TestClient(create_app(configured, database=database)) as test_client:
+        response = test_client.post(
+            f"/api/projects/{project_id}/render-video",
+            json={
+                "source_image_job_id": source_job_id,
+                "target_shot_ids": ["shot_03"],
+                "video_provider": CLOUD_WAN_PROVIDER_ID,
+                "duration_seconds": 5,
+            },
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "WAN_SOURCE_IMAGE_NOT_SELECTED"
+
+
 def test_pending_running_succeeded_downloads_and_traces_without_secrets(
     tmp_path: Path,
 ) -> None:
@@ -668,3 +756,47 @@ def test_succeeded_cloud_worker_job_persists_real_video_assets(
     assert all(item["ai_video_generated"] is True for item in result["video_shots"])
     assert all(item["source_type"] == "REAL_CLOUD_MODEL" for item in result["video_shots"])
     assert all(item["video_url"] for item in result["video_shots"])
+
+
+def test_single_shot_cloud_worker_creates_exactly_one_task(
+    client, database: Database, settings: Settings
+) -> None:
+    project_id, job_id = _queue_cloud_worker_job(database, settings)
+    with database.session() as session:
+        job = crud.get_job(session, job_id)
+        assert job is not None
+        job.request_json = {**job.request_json, "target_shot_ids": ["shot_03"]}
+        session.commit()
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "output": {
+                        "task_id": "task-shot-3",
+                        "task_status": "SUCCEEDED",
+                        "video_url": VIDEO_URL,
+                    }
+                },
+            )
+        return httpx.Response(200, content=b"valid-cloud-mp4")
+
+    worker = Worker(
+        settings=settings,
+        database=database,
+        video_provider_factory=lambda _settings: _provider(handler),
+    )
+    assert worker.run_once() is True
+    payload = client.get(f"/api/jobs/{job_id}").json()
+    assert payload["status"] == "SUCCEEDED"
+    assert post_calls == 1
+    assert payload["result_json"]["video_provider_calls"] == 1
+    assert [
+        item["shot_id"] for item in payload["result_json"]["video_shots"]
+    ] == ["shot_03"]
+    detail = client.get(f"/api/projects/{project_id}").json()
+    assert detail["visual_selection"]["source_video_job_id"] == job_id

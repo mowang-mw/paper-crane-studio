@@ -72,7 +72,28 @@ def _seed_source_image_job(database: Database, settings) -> tuple[str, str]:
     script = _script()
     with database.session() as session:
         project = crud.create_project(session, title=script.title, story=script.synopsis)
-        project.script_json = script.model_dump(mode="json")
+        database_shots = crud.replace_shots(
+            session,
+            project=project,
+            script_json=script.model_dump(mode="json"),
+            shots=[
+                {
+                    "shot_index": shot.index,
+                    "title": shot.title,
+                    "visual_description": shot.visual_description,
+                    "narration": shot.narration,
+                    "duration_seconds": shot.duration_seconds,
+                    "provider_id": "comfyui-animagine-xl-4",
+                    "parameters_json": {
+                        "provider_shot_id": shot.id,
+                        "camera": shot.camera,
+                        "image_prompt": shot.image_prompt,
+                    },
+                }
+                for shot in script.shots
+            ],
+        )
+        assert len(database_shots) == len(script.shots)
         source_job = crud.create_job(
             session,
             project=project,
@@ -176,9 +197,97 @@ def test_video_job_succeeds_and_exposes_mock_assets(
     assert result["video_provider"] == "mock-video"
     assert result["video_source_type"] == "MOCK"
     assert result["mock_video_fallback"] is True
-    assert result["final_media_consumes_video"] is False
+    assert result["final_media_consumes_video"] is True
     assert len(result["video_shots"]) == 3
     assert all(item["video_url"] for item in result["video_shots"])
+    assert result["visual_selection_updated"] is True
+    detail = client.get(f"/api/projects/{project_id}").json()
+    assert detail["visual_selection"]["source_video_job_id"] == job_id
+
+
+def test_single_shot_video_job_only_generates_target_and_becomes_current(
+    client: TestClient, database: Database, settings
+) -> None:
+    project_id, source_job_id = _seed_source_image_job(database, settings)
+    queued = client.post(
+        f"/api/projects/{project_id}/render-video",
+        json={
+            "source_image_job_id": source_job_id,
+            "video_provider": "mock-video",
+            "target_shot_ids": ["shot_03"],
+        },
+    )
+    assert queued.status_code == 202
+    job_id = queued.json()["job_id"]
+    worker = Worker(
+        settings=settings,
+        database=database,
+        video_provider_factory=lambda _settings: MockVideoProvider(
+            ffmpeg_path=Path("ffmpeg.exe"), command_runner=_fake_video_runner
+        ),
+    )
+    assert worker.run_once() is True
+
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "SUCCEEDED"
+    assert job["request_json"]["target_shot_ids"] == ["shot_03"]
+    assert job["result_json"]["target_shot_ids"] == ["shot_03"]
+    assert job["result_json"]["video_provider_calls"] == 1
+    assert [item["shot_id"] for item in job["result_json"]["video_shots"]] == [
+        "shot_03"
+    ]
+    detail = client.get(f"/api/projects/{project_id}").json()
+    assert detail["visual_selection"]["source_video_job_id"] == job_id
+
+
+def test_new_video_version_preserves_history_and_manual_selection(
+    client: TestClient, database: Database, settings, monkeypatch
+) -> None:
+    project_id, source_job_id = _seed_source_image_job(database, settings)
+    worker = Worker(
+        settings=settings,
+        database=database,
+        video_provider_factory=lambda _settings: MockVideoProvider(
+            ffmpeg_path=Path("ffmpeg.exe"), command_runner=_fake_video_runner
+        ),
+    )
+    job_ids: list[str] = []
+    for _ in range(2):
+        queued = client.post(
+            f"/api/projects/{project_id}/render-video",
+            json={"source_image_job_id": source_job_id, "video_provider": "mock-video"},
+        )
+        assert queued.status_code == 202
+        job_ids.append(queued.json()["job_id"])
+        assert worker.run_once() is True
+
+    monkeypatch.setattr(
+        "backend.app.api.projects.validate_video_asset_file",
+        lambda **_kwargs: None,
+    )
+    detail = client.get(f"/api/projects/{project_id}").json()
+    assert detail["visual_selection"]["source_video_job_id"] == job_ids[1]
+    assert {job["id"] for job in detail["video_jobs"]} == set(job_ids)
+    plan = client.get(
+        f"/api/projects/{project_id}/best-media-plan",
+        params={"mode": "VIDEO_PREFERRED"},
+    ).json()
+    assert not any(item["code"] == "AMBIGUOUS_VISUAL" for item in plan["problems"])
+    assert {
+        item["source_job_id"]
+        for item in plan["shots"]
+        if item["selected_type"] == "VIDEO_SHOT"
+    } == {job_ids[1]}
+
+    switched = client.put(
+        f"/api/projects/{project_id}/visual-selection",
+        json={"source_image_asset_ids": {}, "source_video_job_id": job_ids[0]},
+    )
+    assert switched.status_code == 200
+    assert switched.json()["source_video_job_id"] == job_ids[0]
+    refreshed = client.get(f"/api/projects/{project_id}").json()
+    assert refreshed["visual_selection"]["source_video_job_id"] == job_ids[0]
+    assert {job["id"] for job in refreshed["video_jobs"]} == set(job_ids)
 
 
 def test_video_provider_failure_marks_job_failed_without_success_fallback(

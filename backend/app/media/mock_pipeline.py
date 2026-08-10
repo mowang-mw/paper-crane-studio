@@ -819,6 +819,136 @@ def _validate_real_keyframes(
     return by_shot
 
 
+def _normalize_final_visual_sources(
+    *,
+    tools: MediaTools,
+    shots: list[dict[str, Any]],
+    keyframes_by_shot: dict[str, dict[str, Any]],
+    visual_sources: Any,
+    command_log: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Validate resolved per-shot sources without changing legacy keyframe behavior."""
+
+    expected_ids = {str(shot["shot_id"]) for shot in shots}
+    if visual_sources is None:
+        return {
+            shot_id: {
+                "shot_id": shot_id,
+                "visual_source_type": "IMAGE",
+                "selection_reason": "LEGACY_IMAGE_JOB_FALLBACK",
+                "source_asset_id": keyframe.get("image_asset_id"),
+                "source_image_job_id": None,
+                "source_video_job_id": None,
+                "source_provider": keyframe["provider_id"],
+                "source_type": keyframe.get("source_type", _REAL_IMAGE_SOURCE_TYPE),
+                "source_path": str(keyframe["image_path"]),
+                "source_sha256": keyframe["image_sha256"],
+                "source_duration_seconds": None,
+                "source_has_audio": False,
+            }
+            for shot_id, keyframe in keyframes_by_shot.items()
+        }
+    if not isinstance(visual_sources, (list, tuple)):
+        raise MediaToolError("Final Media visual_sources 必须是逐镜头数组")
+    normalized: dict[str, dict[str, Any]] = {}
+    for position, raw in enumerate(visual_sources, start=1):
+        source = _trace_mapping(raw, label=f"visual_sources[{position - 1}]")
+        shot_id = _required_trace_text(
+            source, "shot_id", label=f"visual_sources[{position - 1}]"
+        )
+        if shot_id not in expected_ids or shot_id in normalized:
+            raise MediaToolError(f"Final Media 视觉源 Shot 绑定无效：{shot_id}")
+        source_kind = _required_trace_text(
+            source, "visual_source_type", label=f"visual_sources {shot_id}"
+        )
+        if source_kind not in {"IMAGE", "VIDEO_SHOT"}:
+            raise MediaToolError(f"Final Media 视觉源类型无效：{source_kind}")
+        source_provider = _required_trace_text(
+            source, "source_provider", label=f"visual_sources {shot_id}"
+        )
+        source_type = _required_trace_text(
+            source, "source_type", label=f"visual_sources {shot_id}"
+        )
+        source_path = Path(
+            _required_trace_text(
+                source, "source_path", label=f"visual_sources {shot_id}"
+            )
+        ).resolve()
+        expected_sha = _required_trace_text(
+            source, "source_sha256", label=f"visual_sources {shot_id}"
+        ).lower()
+        if not source_path.is_file() or source_path.stat().st_size <= 0:
+            raise MediaToolError(f"Final Media 视觉源不存在或为空：{source_path}")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise MediaToolError(f"Final Media 视觉源 SHA256 格式无效：{shot_id}")
+        if sha256_file(source_path) != expected_sha:
+            raise MediaToolError(f"Final Media 视觉源 SHA256 不符：{shot_id}")
+        probe = ffprobe_json(tools, source_path, command_log=command_log)
+        streams = probe.get("streams")
+        videos = (
+            [item for item in streams if isinstance(item, dict) and item.get("codec_type") == "video"]
+            if isinstance(streams, list)
+            else []
+        )
+        if len(videos) != 1:
+            raise MediaToolError(f"Final Media 视觉源必须有且只有一个视频流：{shot_id}")
+        video = videos[0]
+        codec = str(video.get("codec_name") or "")
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+        if width <= 0 or height <= 0:
+            raise MediaToolError(f"Final Media 视觉源尺寸无效：{shot_id}")
+        if source_kind == "IMAGE" and codec not in {"png", "mjpeg"}:
+            raise MediaToolError(f"Final Media 图片源只接受 PNG/JPEG：{shot_id}")
+        if source_kind == "VIDEO_SHOT" and not source.get("source_video_job_id"):
+            raise MediaToolError(f"VIDEO_SHOT 缺少显式 source_video_job_id：{shot_id}")
+        run_command(
+            [
+                tools.ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                source_path,
+                "-map",
+                "0:v:0",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout_seconds=240,
+            command_log=command_log,
+        )
+        actual_duration = (
+            float((probe.get("format") or {}).get("duration") or 0.0)
+            if source_kind == "VIDEO_SHOT"
+            else None
+        )
+        if source_kind == "VIDEO_SHOT" and (actual_duration or 0.0) <= 0:
+            raise MediaToolError(f"VIDEO_SHOT 时长无效：{shot_id}")
+        normalized[shot_id] = {
+            **source,
+            "shot_id": shot_id,
+            "visual_source_type": source_kind,
+            "source_provider": source_provider,
+            "source_type": source_type,
+            "source_path": str(source_path),
+            "source_sha256": expected_sha,
+            "source_width": width,
+            "source_height": height,
+            "source_codec": codec,
+            "source_duration_seconds": actual_duration,
+            "source_has_audio": any(
+                isinstance(item, dict) and item.get("codec_type") == "audio"
+                for item in streams
+            ),
+        }
+    if set(normalized) != expected_ids:
+        raise MediaToolError("Final Media visual_sources 未完整覆盖 ScriptV1")
+    return normalized
+
+
 def _trace_mapping(value: Any, *, label: str) -> dict[str, Any]:
     """把 Provider dataclass 或普通字典收敛为只读追溯字典。"""
 
@@ -1847,6 +1977,7 @@ def _create_real_audio_image_shot(
     height: int,
     fps: int,
     motion_preset: str | None = None,
+    visual_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把真实 PNG 与完整真实旁白合成为单镜头，不变速也不截断旁白。"""
 
@@ -1975,6 +2106,151 @@ def _create_real_audio_image_shot(
         "subtitle_start_seconds": round(lead_in, 6),
         "subtitle_end_seconds": round(subtitle_end, 6),
         "keyframe": keyframe,
+        "visual_source": visual_source,
+        "audio": audio,
+        "timing": timing,
+    }
+
+
+def _create_real_audio_video_shot(
+    *,
+    tools: MediaTools,
+    subtitle: BurnedSubtitle,
+    shot: dict[str, Any],
+    visual_source: dict[str, Any],
+    audio: dict[str, Any],
+    timing: dict[str, Any],
+    output_path: Path,
+    command_log: list[str],
+    width: int,
+    height: int,
+    fps: int,
+) -> dict[str, Any]:
+    """Normalize one VIDEO_SHOT and combine only its video track with project audio."""
+
+    rendered_duration = float(timing["rendered_shot_duration"])
+    audio_duration = float(timing["audio_duration"])
+    lead_in = float(timing["lead_in_seconds"])
+    lead_out = float(timing["lead_out_seconds"])
+    if lead_in + audio_duration + lead_out > rendered_duration + 1e-6:
+        raise MediaToolError(
+            f"镜头 {shot['shot_id']} 的渲染时长不足以容纳完整旁白与前后留白"
+        )
+    frame_count = int(round(rendered_duration * fps))
+    if frame_count <= 0 or abs(frame_count / fps - rendered_duration) > 1e-6:
+        raise MediaToolError(f"镜头 {shot['shot_id']} 渲染时长未对齐视频帧")
+
+    subtitle_end = lead_in + audio_duration
+    timed_subtitle_filter = (
+        subtitle.filter_expression
+        + f":enable='between(t,{lead_in:.6f},{subtitle_end:.6f})'"
+    )
+    filters = [
+        f"scale={width}:{height}:force_original_aspect_ratio=increase",
+        f"crop={width}:{height}",
+        "setsar=1",
+        f"fps={fps}",
+        f"tpad=stop_mode=clone:stop_duration={rendered_duration:.6f}",
+        f"trim=start=0:duration={rendered_duration:.6f}",
+        "setpts=PTS-STARTPTS",
+        timed_subtitle_filter,
+        (
+            f"fade=t=in:st=0:d=0.35,"
+            f"fade=t=out:st={max(0.0, rendered_duration - 0.35):.6f}:d=0.35"
+        ),
+        "format=yuv420p",
+    ]
+    audio_filter = (
+        f"adelay={int(round(lead_in * 1000))}:all=1,"
+        f"apad=whole_dur={rendered_duration:.6f},"
+        f"atrim=start=0:duration={rendered_duration:.6f},"
+        "asetpts=N/SR/TB,aresample=48000"
+    )
+    temporary = _atomic_media_target(output_path)
+    run_command(
+        [
+            tools.ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            Path(str(visual_source["source_path"])),
+            "-i",
+            Path(str(audio["audio_path"])),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            ",".join(filters),
+            "-af",
+            audio_filter,
+            "-t",
+            f"{rendered_duration:.6f}",
+            "-r",
+            str(fps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            temporary,
+        ],
+        timeout_seconds=300,
+        command_log=command_log,
+    )
+    validation = verify_media(
+        tools,
+        temporary,
+        expected_duration_seconds=rendered_duration,
+        expected_width=width,
+        expected_height=height,
+        expected_fps=float(fps),
+        command_log=command_log,
+    )
+    os.replace(temporary, output_path)
+    source_duration = float(visual_source["source_duration_seconds"])
+    frame_tolerance = 1.0 / fps
+    if source_duration < rendered_duration - frame_tolerance:
+        duration_normalization = "PLAY_THEN_FREEZE_LAST_FRAME"
+    elif source_duration > rendered_duration + frame_tolerance:
+        duration_normalization = "TRIM_TO_TARGET"
+    else:
+        duration_normalization = "MATCH_TARGET"
+    return {
+        "video_path": output_path,
+        "validation": validation,
+        "sha256": sha256_file(output_path),
+        "narration": subtitle.narration,
+        "rendered_subtitle_text": subtitle.rendered_text,
+        "subtitle_path": subtitle.text_path,
+        "subtitle_filter": timed_subtitle_filter,
+        "subtitle_font_path": subtitle.font_path,
+        "subtitle_rendering": "burned_in",
+        "subtitle_start_seconds": round(lead_in, 6),
+        "subtitle_end_seconds": round(subtitle_end, 6),
+        "keyframe": None,
+        "visual_source": {
+            **visual_source,
+            "source_duration_seconds": source_duration,
+            "target_duration_seconds": rendered_duration,
+            "duration_normalization": duration_normalization,
+            "source_audio_ignored": True,
+        },
         "audio": audio,
         "timing": timing,
     }
@@ -2018,6 +2294,7 @@ def render_real_audio_project_short(
     keyframes: list[Any] | tuple[Any, ...],
     audio_assets: list[Any] | tuple[Any, ...],
     timing_plan: Any,
+    visual_sources: Any = None,
     output_dir: Path,
     output_filename: str | None = None,
     width: int = WIDTH,
@@ -2093,18 +2370,29 @@ def render_real_audio_project_short(
         keyframes=normalized_keyframes,
         command_log=command_log,
     )
+    visual_sources_by_shot = _normalize_final_visual_sources(
+        tools=tools,
+        shots=normalized_shots,
+        keyframes_by_shot=keyframes_by_shot,
+        visual_sources=visual_sources,
+        command_log=command_log,
+    )
     actual_image_provider_id = next(iter(keyframes_by_shot.values()))["provider_id"]
     if actual_image_provider_id.lower() == "mock":
         raise MediaToolError("真实旁白短片禁止复用 Mock 图片")
     for shot in normalized_shots:
-        shot["provider_id"] = actual_image_provider_id
-        shot["source_type"] = _REAL_IMAGE_SOURCE_TYPE
+        source = visual_sources_by_shot[str(shot["shot_id"])]
+        shot["provider_id"] = source["source_provider"]
+        shot["source_type"] = source["source_type"]
         shot["generation_parameters"]["visual_provider_id"] = (
-            actual_image_provider_id
+            source["source_provider"]
         )
         shot["generation_parameters"]["image_source_type"] = (
-            "REUSED_REAL_LOCAL_MODEL"
+            source["source_type"]
         )
+        shot["generation_parameters"]["visual_source_type"] = source[
+            "visual_source_type"
+        ]
         shot["generation_parameters"]["audio_provider_id"] = provider_id
         shot["generation_parameters"]["audio_source_type"] = (
             _REAL_AUDIO_SOURCE_TYPE
@@ -2168,21 +2456,50 @@ def render_real_audio_project_short(
             height=height,
             font_path=font,
         )
-        generated = _create_real_audio_image_shot(
-            tools=tools,
-            font=font,
-            subtitle=subtitle,
-            shot=shot,
-            keyframe=keyframes_by_shot[shot_id],
-            audio=audio_by_shot[shot_id],
-            timing=timing,
-            output_path=shot_dir / f"{shot_stem}.mp4",
-            command_log=command_log,
-            width=width,
-            height=height,
-            fps=fps,
-            motion_preset=motion_preset,
-        )
+        visual_source = visual_sources_by_shot[shot_id]
+        if visual_source["visual_source_type"] == "VIDEO_SHOT":
+            generated = _create_real_audio_video_shot(
+                tools=tools,
+                subtitle=subtitle,
+                shot=shot,
+                visual_source=visual_source,
+                audio=audio_by_shot[shot_id],
+                timing=timing,
+                output_path=shot_dir / f"{shot_stem}.mp4",
+                command_log=command_log,
+                width=width,
+                height=height,
+                fps=fps,
+            )
+        else:
+            keyframe = dict(keyframes_by_shot[shot_id])
+            if visual_source.get("selection_reason") == "EXPLICIT_IMAGE_ASSET":
+                keyframe = {
+                    "shot_id": shot_id,
+                    "provider_id": visual_source["source_provider"],
+                    "source_type": visual_source["source_type"],
+                    "image_path": visual_source["source_path"],
+                    "image_sha256": visual_source["source_sha256"],
+                    "width": visual_source.get("source_width"),
+                    "height": visual_source.get("source_height"),
+                    "image_asset_id": visual_source.get("source_asset_id"),
+                }
+            generated = _create_real_audio_image_shot(
+                tools=tools,
+                font=font,
+                subtitle=subtitle,
+                shot=shot,
+                keyframe=keyframe,
+                visual_source=visual_source,
+                audio=audio_by_shot[shot_id],
+                timing=timing,
+                output_path=shot_dir / f"{shot_stem}.mp4",
+                command_log=command_log,
+                width=width,
+                height=height,
+                fps=fps,
+                motion_preset=motion_preset,
+            )
         shot_outputs.append(generated)
         if progress_callback:
             progress_callback(65 + int(index * 25 / len(normalized_shots)))
@@ -2278,21 +2595,40 @@ def render_real_audio_project_short(
 
     context = dict(generation_context or {})
     media_only = bool(context.get("media_only"))
+    video_shot_count = sum(
+        source["visual_source_type"] == "VIDEO_SHOT"
+        for source in visual_sources_by_shot.values()
+    )
+    image_shot_count = len(normalized_shots) - video_shot_count
+    explicit_image_shot_count = sum(
+        source.get("selection_reason") == "EXPLICIT_IMAGE_ASSET"
+        for source in visual_sources_by_shot.values()
+    )
     media_video_source_type = (
-        "MEDIA_ONLY_RERENDER_FFMPEG"
-        if media_only
-        else "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION"
+        "VIDEO_SHOT_WITH_IMAGE_FALLBACK"
+        if video_shot_count
+        else (
+            "MEDIA_ONLY_RERENDER_FFMPEG"
+            if media_only
+            else "REAL_IMAGE_REAL_TTS_FFMPEG_MOTION"
+        )
     )
     shot_manifest: list[dict[str, Any]] = []
     for shot, generated in zip(normalized_shots, shot_outputs, strict=True):
-        keyframe = dict(generated["keyframe"])
-        keyframe["image_path"] = _repo_relative(
-            root, Path(str(keyframe["image_path"]))
+        raw_keyframe = generated.get("keyframe")
+        keyframe = dict(raw_keyframe) if isinstance(raw_keyframe, dict) else None
+        if keyframe is not None:
+            keyframe["image_path"] = _repo_relative(
+                root, Path(str(keyframe["image_path"]))
+            )
+            for trace_field in ("workflow_path", "trace_path"):
+                trace_value = keyframe.get(trace_field)
+                if isinstance(trace_value, str) and trace_value:
+                    keyframe[trace_field] = _repo_relative(root, Path(trace_value))
+        visual_source = dict(generated["visual_source"])
+        visual_source["source_path"] = _repo_relative(
+            root, Path(str(visual_source["source_path"]))
         )
-        for trace_field in ("workflow_path", "trace_path"):
-            trace_value = keyframe.get(trace_field)
-            if isinstance(trace_value, str) and trace_value:
-                keyframe[trace_field] = _repo_relative(root, Path(trace_value))
         audio = generated["audio"]
         timing = generated["timing"]
         audio_trace_path = audio.get("trace_path")
@@ -2329,10 +2665,30 @@ def render_real_audio_project_short(
                 "clip_sha256": generated["sha256"],
                 "clip_validation": generated["validation"],
                 "keyframe": keyframe,
-                "keyframe_path": keyframe["image_path"],
-                "keyframe_sha256": keyframe["image_sha256"],
-                "image_provider": keyframe["provider_id"],
-                "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+                "keyframe_path": keyframe["image_path"] if keyframe else None,
+                "keyframe_sha256": keyframe["image_sha256"] if keyframe else None,
+                "image_provider": keyframe["provider_id"] if keyframe else None,
+                "image_source_type": (
+                    "REUSED_REAL_LOCAL_MODEL"
+                    if visual_source.get("selection_reason")
+                    == "LEGACY_IMAGE_JOB_FALLBACK"
+                    else visual_source["source_type"]
+                ),
+                "visual_source": visual_source,
+                "visual_source_type": visual_source["visual_source_type"],
+                "source_asset_id": visual_source.get("source_asset_id"),
+                "source_provider": visual_source["source_provider"],
+                "source_type": visual_source["source_type"],
+                "source_video_job_id": visual_source.get("source_video_job_id"),
+                "source_video_duration_seconds": visual_source.get(
+                    "source_duration_seconds"
+                ),
+                "video_duration_normalization": visual_source.get(
+                    "duration_normalization"
+                ),
+                "source_video_audio_ignored": visual_source.get(
+                    "source_audio_ignored", False
+                ),
                 "audio_provider": audio["provider_id"],
                 "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
                 "audio_model_id": audio["model_id"],
@@ -2363,7 +2719,10 @@ def render_real_audio_project_short(
                 "media_reuse": {
                     "media_only": media_only,
                     "script": media_only,
-                    "keyframe": media_only,
+                    "keyframe": (
+                        media_only
+                        and visual_source["visual_source_type"] == "IMAGE"
+                    ),
                     "audio": media_only,
                     "source_jobs": context.get("source_jobs", {}),
                 },
@@ -2411,10 +2770,18 @@ def render_real_audio_project_short(
             else None
         ),
     }
+    context["visual_sources"] = {
+        "video_shot_count": video_shot_count,
+        "image_shot_count": image_shot_count,
+        "explicit_image_shot_count": explicit_image_shot_count,
+        "priority": ["VIDEO_SHOT", "EXPLICIT_IMAGE_ASSET", "LEGACY_IMAGE_JOB"],
+    }
     script_provider = str(provider_trace.get("script_provider", "reused"))
     extension_total = round(rendered_total - source_total, 6)
     manifest = {
         "manifest_version": M6_MEDIA_MANIFEST_VERSION,
+        "selection_mode": context.get("selection_mode", "MANUAL"),
+        "selection_plan": context.get("selection_plan"),
         "media_only": media_only,
         "reused_providers": context.get("reused_providers"),
         "provider_calls": context.get("provider_calls", {}),
@@ -2435,6 +2802,11 @@ def render_real_audio_project_short(
         "speaker": next(iter(speaker_values)),
         "language": next(iter(language_values)),
         "video_source_type": media_video_source_type,
+        "visual_source_summary": {
+            "video_shot_count": video_shot_count,
+            "image_shot_count": image_shot_count,
+            "explicit_image_shot_count": explicit_image_shot_count,
+        },
         "motion_preset": motion_preset or "legacy_shot_motion",
         "background_audio": _background_manifest(
             resolved_background, duration=rendered_total
@@ -2474,8 +2846,16 @@ def render_real_audio_project_short(
             "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
             "video_source_type": media_video_source_type,
             "visual_method": (
-                "reused validated real PNG keyframes -> FFmpeg deterministic "
-                "structured motion/fade"
+                "explicit VIDEO_SHOT normalized to target duration with image "
+                "fallback -> FFmpeg final media"
+                if video_shot_count
+                else (
+                    "selected validated image assets with legacy image fallback -> "
+                    "FFmpeg deterministic structured motion/fade"
+                    if explicit_image_shot_count
+                    else "reused validated real PNG keyframes -> FFmpeg deterministic "
+                    "structured motion/fade"
+                )
             ),
             "motion_preset": motion_preset or "legacy_shot_motion",
             "audio_method": (

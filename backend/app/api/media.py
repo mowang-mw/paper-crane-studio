@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .. import crud
@@ -24,7 +25,23 @@ from ..media.background_audio import (
     write_background_metadata,
 )
 from ..media.ffmpeg import MediaToolError, sha256_file
-from ..schemas import BackgroundAudioRead
+from ..models import utc_now
+from ..schemas import BackgroundAudioRead, ImageAssetRead
+from ..script_schema import ScriptV1
+from ..services.external_images import (
+    EXTERNAL_IMAGE_GENERATION_MODE,
+    EXTERNAL_IMAGE_PROVIDER_ID,
+    EXTERNAL_IMAGE_SOURCE_TYPE,
+    MAX_EXTERNAL_IMAGE_BYTES,
+    ExternalImageError,
+    build_external_image_prompt_bundle,
+    database_shot_for_script_shot,
+    inspect_external_image,
+    selected_script_shot,
+    serialize_image_asset,
+    validate_external_filename,
+)
+from ..services.visual_selection import SELECTED_IMAGE_ASSET_KEY
 
 
 router = APIRouter(prefix="/projects", tags=["media"])
@@ -277,6 +294,146 @@ def get_background_audio_content(
     return FileResponse(path, media_type=payload["mime_type"], filename=payload["original_filename"])
 
 
+@router.post(
+    "/{project_id}/shots/{shot_id}/external-images",
+    response_model=ImageAssetRead,
+    status_code=201,
+)
+async def import_external_image(
+    project_id: str,
+    shot_id: str,
+    request: Request,
+    filename: str = Query(min_length=1, max_length=255),
+    external_source_type: str = Query("AI_GENERATED"),
+    provider_hint: str | None = Query(default=None, max_length=120),
+    session: Session = Depends(get_session),
+) -> ImageAssetRead:
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    if external_source_type not in {"AI_GENERATED", "HUMAN_CREATED", "OTHER"}:
+        raise HTTPException(status_code=422, detail="不支持的外部图片来源类型。")
+    try:
+        original_filename = validate_external_filename(filename)
+        script = ScriptV1.model_validate(project.script_json)
+        script_shot = selected_script_shot(script, shot_id)
+        database_shot = database_shot_for_script_shot(
+            crud.list_shots(session, project.id), script_shot
+        )
+        prompt_bundle = build_external_image_prompt_bundle(
+            project_story=project.story,
+            script=script,
+            shot_id=shot_id,
+        )
+    except (ValueError, ExternalImageError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    settings = request.app.state.settings
+    directory = (
+        settings.project_dir(project.id) / "external-images" / database_shot.id
+    ).resolve()
+    project_root = settings.project_dir(project.id).resolve()
+    try:
+        directory.relative_to(project_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="外部图片存储目录越界。") from exc
+    directory.mkdir(parents=True, exist_ok=True)
+    upload_id = uuid4().hex
+    temporary = directory / f".upload-{upload_id}.tmp"
+    destination: Path | None = None
+    sidecar: Path | None = None
+    temporary_sidecar: Path | None = None
+    size = 0
+    try:
+        with temporary.open("wb") as handle:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_EXTERNAL_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="外部图片不能超过 10MB。")
+                handle.write(chunk)
+        if size <= 0:
+            raise HTTPException(status_code=422, detail="上传图片为空。")
+        try:
+            probe = inspect_external_image(temporary)
+        except ExternalImageError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        digest = sha256_file(temporary)
+        extension = ".png" if probe["format"] == "png" else ".jpg"
+        destination = directory / f"external-{upload_id}{extension}"
+        os.replace(temporary, destination)
+        imported_at = utc_now().isoformat()
+        provider_hint_value = provider_hint.strip() if provider_hint else None
+        if external_source_type != "AI_GENERATED":
+            provider_hint_value = None
+        relative_image = destination.relative_to(settings.data_dir).as_posix()
+        sidecar = destination.with_suffix(destination.suffix + ".metadata.json")
+        relative_sidecar = sidecar.relative_to(settings.data_dir).as_posix()
+        metadata = {
+            "shot_id": script_shot.id,
+            "shot_index": script_shot.index,
+            "generation_mode": EXTERNAL_IMAGE_GENERATION_MODE,
+            "external_source_type": external_source_type,
+            "provider_hint": provider_hint_value,
+            "exported_prompt": prompt_bundle,
+            "original_filename": original_filename,
+            "declared_mime_type": request.headers.get(
+                "content-type", "application/octet-stream"
+            ).split(";", 1)[0].strip().lower(),
+            "actual_mime_type": probe["mime_type"],
+            "sha256": digest,
+            "width": probe["width"],
+            "height": probe["height"],
+            "size_bytes": probe["size_bytes"],
+            "codec_name": probe["codec_name"],
+            "imported_at": imported_at,
+            "sidecar_path": relative_sidecar,
+        }
+        temporary_sidecar = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        temporary_sidecar.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_sidecar, sidecar)
+        asset = crud.create_asset(
+            session,
+            project_id=project.id,
+            shot_id=database_shot.id,
+            asset_type="KEYFRAME_IMAGE",
+            provider_id=EXTERNAL_IMAGE_PROVIDER_ID,
+            source_type=EXTERNAL_IMAGE_SOURCE_TYPE,
+            file_path=relative_image,
+            sha256=digest,
+            metadata_json=metadata,
+        )
+        parameters = dict(
+            database_shot.parameters_json
+            if isinstance(database_shot.parameters_json, dict)
+            else {}
+        )
+        parameters[SELECTED_IMAGE_ASSET_KEY] = asset.id
+        database_shot.parameters_json = parameters
+        session.commit()
+        return ImageAssetRead.model_validate(serialize_image_asset(asset))
+    except SQLAlchemyError as exc:
+        session.rollback()
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        if sidecar is not None:
+            sidecar.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="外部图片资产保存失败。") from exc
+    except OSError as exc:
+        session.rollback()
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        if sidecar is not None:
+            sidecar.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="外部图片文件保存失败。") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+        if temporary_sidecar is not None:
+            temporary_sidecar.unlink(missing_ok=True)
+
+
 @router.get("/{project_id}/assets/{asset_id}/content")
 def get_image_asset(
     project_id: str,
@@ -287,10 +444,15 @@ def get_image_asset(
     asset = _find_public_media_asset(session, project_id, asset_id)
     path = _safe_export_path(request, project_id, asset.file_path)
     expected = {
-        "KEYFRAME_IMAGE": (".png", "image/png"),
-        "NARRATION_AUDIO": (".wav", "audio/wav"),
-        "VIDEO_SHOT": (".mp4", "video/mp4"),
+        "KEYFRAME_IMAGE": {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        },
+        "NARRATION_AUDIO": {".wav": "audio/wav"},
+        "VIDEO_SHOT": {".mp4": "video/mp4"},
     }[asset.asset_type]
-    if path.suffix.lower() != expected[0]:
+    media_type = expected.get(path.suffix.lower())
+    if media_type is None:
         raise HTTPException(status_code=404, detail="媒体资产格式无效")
-    return FileResponse(path, media_type=expected[1])
+    return FileResponse(path, media_type=media_type)

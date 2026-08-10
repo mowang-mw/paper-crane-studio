@@ -96,11 +96,35 @@ class ExportRead(ApiModel):
     poster_url: str
 
 
+class VisualSelectionRead(BaseModel):
+    source_image_asset_ids: dict[str, str] = Field(default_factory=dict)
+    source_video_job_id: str | None = None
+
+
+class VisualSelectionUpdate(VisualSelectionRead):
+    @field_validator("source_image_asset_ids")
+    @classmethod
+    def validate_source_image_asset_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 5:
+            raise ValueError("最多只能为 5 个镜头选择当前关键帧")
+        normalized: dict[str, str] = {}
+        for shot_id, asset_id in value.items():
+            shot_id = shot_id.strip()
+            asset_id = asset_id.strip()
+            if not shot_id or not asset_id or len(shot_id) > 120 or len(asset_id) > 36:
+                raise ValueError("source_image_asset_ids 包含无效镜头或资产 ID")
+            normalized[shot_id] = asset_id
+        return normalized
+
+
 class ProjectDetail(BaseModel):
     project: ProjectRead
     shots: list[ShotRead]
     recent_jobs: list[JobRead]
+    video_jobs: list[JobRead] = Field(default_factory=list)
     latest_export: ExportRead | None
+    image_assets: list["ImageAssetRead"] = Field(default_factory=list)
+    visual_selection: VisualSelectionRead = Field(default_factory=VisualSelectionRead)
 
 
 class JobQueued(BaseModel):
@@ -131,24 +155,124 @@ class RealImageRenderRequest(MediaPolishOptions):
 
 class RealAudioRenderRequest(MediaPolishOptions):
     source_image_job_id: str = Field(min_length=1, max_length=36)
+    source_video_job_id: str | None = Field(default=None, min_length=1, max_length=36)
+    source_image_asset_ids: dict[str, str] = Field(default_factory=dict)
     audio_provider: Literal["qwen3-tts-0.6b-customvoice"] = (
         "qwen3-tts-0.6b-customvoice"
     )
     speaker: Literal["Serena", "Vivian"] = "Serena"
     language: Literal["Chinese"] = "Chinese"
 
+    @field_validator("source_image_asset_ids")
+    @classmethod
+    def validate_source_image_asset_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        return VisualSelectionUpdate.validate_source_image_asset_ids(value)
+
 
 class VideoRenderRequest(BaseModel):
-    source_image_job_id: str = Field(min_length=1, max_length=36)
+    source_image_job_id: str | None = Field(default=None, min_length=1, max_length=36)
+    source_image_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
+    source_image_asset_ids: dict[str, str] = Field(default_factory=dict)
+    target_shot_ids: list[str] | None = None
     video_provider: Literal["mock-video", "cloud-wan-2.7"] = "mock-video"
     duration_seconds: float = Field(default=2.0, gt=0, le=60)
     motion_preset: Literal["static", "gentle_zoom", "cinematic_pan"] = (
         "gentle_zoom"
     )
 
+    @field_validator("source_image_asset_ids")
+    @classmethod
+    def validate_source_image_asset_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 5:
+            raise ValueError("最多只能为 5 个镜头选择首帧资产")
+        normalized: dict[str, str] = {}
+        for shot_id, asset_id in value.items():
+            shot_id = shot_id.strip()
+            asset_id = asset_id.strip()
+            if not shot_id or not asset_id or len(shot_id) > 120 or len(asset_id) > 36:
+                raise ValueError("source_image_asset_ids 包含无效镜头或资产 ID")
+            normalized[shot_id] = asset_id
+        return normalized
+
+    @field_validator("target_shot_ids")
+    @classmethod
+    def validate_target_shot_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized = [shot_id.strip() for shot_id in value]
+        if not normalized or len(normalized) > 5:
+            raise ValueError("target_shot_ids 必须包含 1—5 个镜头")
+        if any(not shot_id or len(shot_id) > 120 for shot_id in normalized):
+            raise ValueError("target_shot_ids 包含无效镜头 ID")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("target_shot_ids 不能重复")
+        return normalized
+
 
 class MediaRerenderRequest(MediaPolishOptions):
     source_audio_job_id: str = Field(min_length=1, max_length=36)
+    source_video_job_id: str | None = Field(default=None, min_length=1, max_length=36)
+    source_image_asset_ids: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("source_image_asset_ids")
+    @classmethod
+    def validate_source_image_asset_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 5:
+            raise ValueError("最多只能为 5 个镜头选择 Final Media 图片资产")
+        normalized: dict[str, str] = {}
+        for shot_id, asset_id in value.items():
+            shot_id = shot_id.strip()
+            asset_id = asset_id.strip()
+            if not shot_id or not asset_id or len(shot_id) > 120 or len(asset_id) > 36:
+                raise ValueError("source_image_asset_ids 包含无效镜头或资产 ID")
+            normalized[shot_id] = asset_id
+        return normalized
+
+
+class BestMediaVisualSelection(BaseModel):
+    shot_id: str
+    selected_type: Literal["VIDEO_SHOT", "IMAGE", "LEGACY_IMAGE"]
+    asset_id: str | None = None
+    source_job_id: str | None = None
+    provider: str
+    provider_hint: str | None = None
+    source_type: str
+    is_mock: bool
+    priority_class: str
+    selection_reason: str
+    source_image_asset_id: str | None = None
+
+
+class BestMediaAudioSelection(BaseModel):
+    job_id: str
+    provider: str
+    source_type: str
+    is_mock: bool
+    source_script_job_id: str | None = None
+    source_image_job_id: str | None = None
+    speaker: str | None = None
+    reason: str
+
+
+class BestMediaPlan(BaseModel):
+    mode: Literal["BEST_AVAILABLE", "IMAGE_ONLY", "VIDEO_PREFERRED"]
+    status: Literal["READY", "AMBIGUOUS", "BLOCKED"]
+    priority: list[str]
+    shots: list[BestMediaVisualSelection]
+    audio: BestMediaAudioSelection | None = None
+    problems: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    available_image_shot_count: int = 0
+    available_video_shot_count: int = 0
+    freshness: Literal["NO_EXPORT", "CURRENT", "OUTDATED"] = "NO_EXPORT"
+    freshness_reason: str = "当前还没有成片。"
+
+
+class SmartMediaRenderRequest(MediaPolishOptions):
+    preferred_audio_job_id: str | None = Field(default=None, min_length=1, max_length=36)
+    composition_mode: Literal["BEST_AVAILABLE", "IMAGE_ONLY", "VIDEO_PREFERRED"] = (
+        "BEST_AVAILABLE"
+    )
 
 
 class BackgroundAudioRead(BaseModel):
@@ -165,6 +289,36 @@ class BackgroundAudioRead(BaseModel):
     sample_rate: int | None = None
     channels: int | None = None
     rights_notice: str
+
+
+class ExternalImagePromptBundle(BaseModel):
+    shot_id: str
+    shot_title: str
+    adapter: Literal["external-natural-language-v1"]
+    prompt: str
+    source_fields: dict[str, Any]
+    lineage: dict[str, Any]
+
+
+class ImageAssetRead(BaseModel):
+    asset_id: str
+    project_id: str
+    shot_id: str | None
+    database_shot_id: str | None
+    asset_type: Literal["KEYFRAME_IMAGE"]
+    provider_id: str
+    source_type: str
+    generation_mode: str | None = None
+    external_source_type: str | None = None
+    provider_hint: str | None = None
+    original_filename: str | None = None
+    sha256: str
+    width: int | None = None
+    height: int | None = None
+    size_bytes: int | None = None
+    imported_at: str | None = None
+    exported_prompt: dict[str, Any] | None = None
+    image_url: str
 
 
 class ProviderStatusRead(BaseModel):

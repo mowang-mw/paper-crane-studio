@@ -3,12 +3,17 @@ import type {
   AudioProviderStatus,
   AudioSpeaker,
   BackgroundAudioAsset,
+  BestMediaPlan,
+  CompositionMode,
   DesiredShotCount,
+  ExternalImagePromptBundle,
+  ExternalImageSourceType,
   ExportRecord,
   GenerationJob,
   HealthStatus,
   ImageProviderId,
   ImageProviderStatus,
+  ImageAssetRecord,
   MediaPolishOptions,
   Project,
   ProjectDetail,
@@ -18,6 +23,7 @@ import type {
   Shot,
   VideoProviderId,
   VideoProviderStatus,
+  VisualSelection,
 } from "./types";
 
 const configuredBase = import.meta.env.VITE_API_BASE_URL?.trim();
@@ -300,7 +306,10 @@ export async function getProject(projectId: string): Promise<ProjectDetail> {
     project?: Project;
     shots?: Shot[];
     recent_jobs?: GenerationJob[];
+    video_jobs?: GenerationJob[];
     jobs?: GenerationJob[];
+    image_assets?: ImageAssetRecord[];
+    visual_selection?: VisualSelection;
     latest_export?: ExportRecord | null;
     export?: ExportRecord | null;
   } & Project;
@@ -309,6 +318,12 @@ export async function getProject(projectId: string): Promise<ProjectDetail> {
     project,
     shots: payload.shots ?? [],
     recent_jobs: payload.recent_jobs ?? payload.jobs ?? [],
+    video_jobs: payload.video_jobs ?? [],
+    image_assets: payload.image_assets ?? [],
+    visual_selection: payload.visual_selection ?? {
+      source_image_asset_ids: {},
+      source_video_job_id: null,
+    },
     latest_export: payload.latest_export ?? payload.export ?? null,
   };
 }
@@ -363,12 +378,18 @@ export async function renderRealAudio(
   sourceImageJobId: string,
   speaker: AudioSpeaker,
   mediaOptions: MediaPolishOptions,
+  sourceVideoJobId: string | null = null,
+  sourceImageAssetIds: Record<string, string> = {},
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-audio`, {
       method: "POST",
       body: JSON.stringify({
         source_image_job_id: sourceImageJobId,
+        ...(sourceVideoJobId ? { source_video_job_id: sourceVideoJobId } : {}),
+        ...(Object.keys(sourceImageAssetIds).length > 0
+          ? { source_image_asset_ids: sourceImageAssetIds }
+          : {}),
         audio_provider: "qwen3-tts-0.6b-customvoice",
         speaker,
         language: "Chinese",
@@ -380,17 +401,40 @@ export async function renderRealAudio(
   );
 }
 
+export async function updateVisualSelection(
+  projectId: string,
+  sourceImageAssetIds: Record<string, string>,
+  sourceVideoJobId: string | null,
+): Promise<VisualSelection> {
+  return request<VisualSelection>(
+    `/projects/${encodeURIComponent(projectId)}/visual-selection`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        source_image_asset_ids: sourceImageAssetIds,
+        source_video_job_id: sourceVideoJobId,
+      }),
+    },
+  );
+}
+
 export async function renderVideo(
   projectId: string,
-  sourceImageJobId: string,
+  sourceImageJobId: string | null,
   motionPreset: MediaPolishOptions["motionPreset"],
   videoProvider: VideoProviderId,
+  sourceImageAssetIds: Record<string, string> = {},
+  targetShotIds?: string[],
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-video`, {
       method: "POST",
       body: JSON.stringify({
-        source_image_job_id: sourceImageJobId,
+        ...(sourceImageJobId ? { source_image_job_id: sourceImageJobId } : {}),
+        ...(Object.keys(sourceImageAssetIds).length > 0
+          ? { source_image_asset_ids: sourceImageAssetIds }
+          : {}),
+        ...(targetShotIds ? { target_shot_ids: targetShotIds } : {}),
         video_provider: videoProvider,
         duration_seconds: videoProvider === "cloud-wan-2.7" ? 5 : 2,
         motion_preset: motionPreset,
@@ -399,21 +443,90 @@ export async function renderVideo(
   );
 }
 
+export async function getExternalImagePrompt(
+  projectId: string,
+  shotId: string,
+): Promise<ExternalImagePromptBundle> {
+  return request<ExternalImagePromptBundle>(
+    `/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/external-image-prompt`,
+  );
+}
+
+export async function uploadExternalImage(
+  projectId: string,
+  shotId: string,
+  file: File,
+  externalSourceType: ExternalImageSourceType,
+  providerHint?: string,
+): Promise<ImageAssetRecord> {
+  const query = new URLSearchParams({
+    filename: file.name,
+    external_source_type: externalSourceType,
+  });
+  if (externalSourceType === "AI_GENERATED" && providerHint?.trim()) {
+    query.set("provider_hint", providerHint.trim());
+  }
+  return request<ImageAssetRecord>(
+    `/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/external-images?${query.toString()}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    },
+  );
+}
+
 export async function rerenderMediaOnly(
   projectId: string,
   sourceAudioJobId: string,
   mediaOptions: MediaPolishOptions,
+  sourceVideoJobId: string | null = null,
+  sourceImageAssetIds: Record<string, string> = {},
 ): Promise<GenerationJob> {
   return unwrapJob(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/media-rerender`, {
       method: "POST",
       body: JSON.stringify({
         source_audio_job_id: sourceAudioJobId,
+        ...(sourceVideoJobId ? { source_video_job_id: sourceVideoJobId } : {}),
+        ...(Object.keys(sourceImageAssetIds).length > 0
+          ? { source_image_asset_ids: sourceImageAssetIds }
+          : {}),
         motion_preset: mediaOptions.motionPreset,
         background_audio_enabled: mediaOptions.backgroundAudioEnabled,
         background_volume: mediaOptions.backgroundVolume,
       }),
     }),
+  );
+}
+
+export async function getCompositionPlan(
+  projectId: string,
+  mode: CompositionMode,
+): Promise<BestMediaPlan> {
+  return request<BestMediaPlan>(
+    `/projects/${encodeURIComponent(projectId)}/best-media-plan?mode=${encodeURIComponent(mode)}`,
+  );
+}
+
+export async function smartRenderBestMedia(
+  projectId: string,
+  compositionMode: CompositionMode,
+  mediaOptions: MediaPolishOptions,
+): Promise<GenerationJob> {
+  return unwrapJob(
+    await request<unknown>(
+      `/projects/${encodeURIComponent(projectId)}/smart-media-render`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          composition_mode: compositionMode,
+          motion_preset: mediaOptions.motionPreset,
+          background_audio_enabled: mediaOptions.backgroundAudioEnabled,
+          background_volume: mediaOptions.backgroundVolume,
+        }),
+      },
+    ),
   );
 }
 

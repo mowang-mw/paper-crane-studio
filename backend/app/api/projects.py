@@ -7,19 +7,22 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .. import crud
 from ..config import Settings
 from ..database import get_session
-from ..models import Export, JobStatus
+from ..models import Export, GenerationJob, JobStatus, Project
 from ..media.background_audio import background_job_snapshot
 from ..media.ffmpeg import MediaToolError
 from ..providers.registry import check_cloud_wan_video, check_llamacpp
 from ..schemas import (
     ExportRead,
+    BestMediaPlan,
+    ExternalImagePromptBundle,
+    ImageAssetRead,
     JobQueued,
     JobRead,
     GenerationRequest,
@@ -31,9 +34,13 @@ from ..schemas import (
     ProjectDetail,
     ProjectRead,
     ShotRead,
+    SmartMediaRenderRequest,
+    VisualSelectionRead,
+    VisualSelectionUpdate,
 )
 from ..services.image_jobs import (
     REAL_IMAGE_JOB_TYPE,
+    REAL_IMAGE_PROVIDER_ID,
     gpu_handoff_error_payload,
     gpu_handoff_status,
     script_from_source_job,
@@ -52,8 +59,27 @@ from ..services.media_rerender import (
     media_rerender_error_payload,
 )
 from ..services.video_jobs import VIDEO_JOB_TYPE, VIDEO_PROVIDER_IDS
+from ..services.external_images import (
+    ExternalImageError,
+    build_external_image_prompt_bundle,
+    database_shot_for_script_shot,
+    selected_script_shot,
+    serialize_image_asset,
+    validate_image_asset_file,
+)
+from ..services.final_media_visuals import (
+    FinalMediaVisualError,
+    validate_video_asset_file,
+)
+from ..services.visual_selection import read_visual_selection, write_visual_selection
+from ..services.best_available_media import (
+    BEST_AVAILABLE,
+    IMAGE_ONLY,
+    VIDEO_PREFERRED,
+    resolve_best_available_media,
+)
+from ..script_schema import ScriptV1
 from .job_serialization import job_read_with_media_urls
-from ..services.image_jobs import REAL_IMAGE_JOB_TYPE, REAL_IMAGE_PROVIDER_ID
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -115,6 +141,126 @@ def _rerender_source_error(code: str, summary: str) -> HTTPException:
         status_code=409,
         detail=media_rerender_error_payload(code, summary),
     )
+
+
+def _validate_selected_image_assets(
+    *,
+    session: Session,
+    settings: Settings,
+    project: Project,
+    script: ScriptV1,
+    asset_ids: dict[str, str],
+) -> dict[str, str]:
+    database_shots = crud.list_shots(session, project.id)
+    selected = dict(asset_ids)
+    for script_shot_id, asset_id in selected.items():
+        try:
+            script_shot = selected_script_shot(script, script_shot_id)
+            database_shot = database_shot_for_script_shot(database_shots, script_shot)
+        except ExternalImageError as exc:
+            raise _rerender_source_error("SOURCE_IMAGE_MISSING", str(exc)) from exc
+        asset = crud.get_asset(session, asset_id)
+        if asset is None or asset.project_id != project.id:
+            raise _rerender_source_error(
+                "SOURCE_JOB_PROJECT_MISMATCH", "显式图片资产不存在或不属于当前项目。"
+            )
+        if asset.shot_id != database_shot.id or asset.asset_type != "KEYFRAME_IMAGE":
+            raise _rerender_source_error(
+                "SOURCE_IMAGE_MISSING", "显式图片资产不属于所选 Script 镜头。"
+            )
+        try:
+            validate_image_asset_file(
+                data_dir=settings.data_dir,
+                project_dir=settings.project_dir(project.id),
+                asset=asset,
+            )
+        except ExternalImageError as exc:
+            raise _rerender_source_error(
+                "SOURCE_IMAGE_MISSING", f"显式图片资产不可用：{exc}"
+            ) from exc
+    return selected
+
+
+def _validate_selected_video_job(
+    *,
+    session: Session,
+    settings: Settings,
+    project: Project,
+    script: ScriptV1,
+    job_id: str | None,
+) -> tuple[GenerationJob | None, dict[str, str]]:
+    if job_id is None:
+        return None, {}
+    source_video_job = crud.get_job(session, job_id)
+    if source_video_job is None:
+        raise _rerender_source_error(
+            "SOURCE_VIDEO_JOB_NOT_FOUND", "显式来源 Video Job 不存在。"
+        )
+    if source_video_job.project_id != project.id:
+        raise _rerender_source_error(
+            "SOURCE_JOB_PROJECT_MISMATCH", "来源 Video Job 不属于当前项目。"
+        )
+    if (
+        source_video_job.job_type != VIDEO_JOB_TYPE
+        or source_video_job.provider_id not in VIDEO_PROVIDER_IDS
+        or source_video_job.status != JobStatus.SUCCEEDED
+    ):
+        raise _rerender_source_error(
+            "SOURCE_VIDEO_JOB_NOT_FOUND", "来源 Job 不是成功的 Video Job。"
+        )
+    video_shots = (source_video_job.result_json or {}).get("video_shots")
+    if not isinstance(video_shots, list) or not video_shots:
+        raise _rerender_source_error(
+            "SOURCE_VIDEO_MISSING", "来源 Video Job 没有可复用的 VIDEO_SHOT。"
+        )
+    asset_ids: dict[str, str] = {}
+    for raw in video_shots:
+        if not isinstance(raw, dict) or raw.get("status") not in {"SUCCEEDED", "REUSED"}:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", "来源 Video Job 包含无效镜头结果。"
+            )
+        shot_id = str(raw.get("shot_id") or "")
+        asset_id = str(raw.get("video_asset_id") or "")
+        try:
+            selected_script_shot(script, shot_id)
+        except ExternalImageError as exc:
+            raise _rerender_source_error("SOURCE_VIDEO_MISSING", str(exc)) from exc
+        if shot_id in asset_ids or not asset_id:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", "来源 Video Job 的镜头绑定重复或缺失。"
+            )
+        asset = crud.get_asset(session, asset_id)
+        metadata = asset.metadata_json if asset is not None else {}
+        if (
+            asset is None
+            or asset.project_id != project.id
+            or asset.asset_type != "VIDEO_SHOT"
+            or not isinstance(metadata, dict)
+            or metadata.get("job_id") != source_video_job.id
+            or metadata.get("shot_id") != shot_id
+            or asset.provider_id != source_video_job.provider_id
+            or raw.get("provider_id") != asset.provider_id
+            or raw.get("source_type") != asset.source_type
+        ):
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", "VIDEO_SHOT 的 Job、Project 或 Shot 绑定无效。"
+            )
+        if raw.get("video_sha256") not in {None, asset.sha256}:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", "VIDEO_SHOT 结果与资产 SHA256 不一致。"
+            )
+        try:
+            validate_video_asset_file(
+                data_dir=settings.data_dir,
+                project_dir=settings.project_dir(project.id),
+                asset=asset,
+            )
+        except FinalMediaVisualError as exc:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", f"VIDEO_SHOT 不可用：{exc}"
+            ) from exc
+        asset_ids[shot_id] = asset.id
+    return source_video_job, asset_ids
 
 
 def _project_directory_for_delete(settings: Settings, project_id: str) -> Path:
@@ -229,15 +375,320 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> Pro
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     latest = crud.latest_export(session, project.id)
+    database_shots = crud.list_shots(session, project.id)
+    visual_selection: dict[str, object] = {
+        "source_image_asset_ids": {},
+        "source_video_job_id": None,
+    }
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+        visual_selection = read_visual_selection(
+            script=script,
+            database_shots=database_shots,
+        )
+    except (ValueError, ExternalImageError):
+        # Projects without a valid ScriptV1 retain the legacy empty selection.
+        pass
     return ProjectDetail(
         project=ProjectRead.model_validate(project),
-        shots=[ShotRead.model_validate(item) for item in crud.list_shots(session, project.id)],
+        shots=[ShotRead.model_validate(item) for item in database_shots],
         recent_jobs=[
             job_read_with_media_urls(session, item)
             for item in crud.recent_jobs(session, project.id)
         ],
+        video_jobs=[
+            job_read_with_media_urls(session, item)
+            for item in crud.list_jobs(session, project.id)
+            if item.job_type == VIDEO_JOB_TYPE
+            and item.provider_id in VIDEO_PROVIDER_IDS
+        ],
         latest_export=_export_read(latest) if latest is not None else None,
+        image_assets=[
+            ImageAssetRead.model_validate(serialize_image_asset(item))
+            for item in crud.list_image_assets(session, project.id)
+        ],
+        visual_selection=VisualSelectionRead.model_validate(visual_selection),
     )
+
+
+@router.put("/{project_id}/visual-selection", response_model=VisualSelectionRead)
+def update_project_visual_selection(
+    project_id: str,
+    payload: VisualSelectionUpdate,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> VisualSelectionRead:
+    """Persist the user's explicit per-project visual choices without guessing latest jobs."""
+
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+    except ValueError as exc:
+        raise _rerender_source_error(
+            "SOURCE_SCRIPT_NOT_FOUND", "项目当前 ScriptV1 无法通过校验。"
+        ) from exc
+    settings: Settings = request.app.state.settings
+    selected_image_asset_ids = _validate_selected_image_assets(
+        session=session,
+        settings=settings,
+        project=project,
+        script=script,
+        asset_ids=payload.source_image_asset_ids,
+    )
+    source_video_job, _ = _validate_selected_video_job(
+        session=session,
+        settings=settings,
+        project=project,
+        script=script,
+        job_id=payload.source_video_job_id,
+    )
+    persisted = write_visual_selection(
+        script=script,
+        database_shots=crud.list_shots(session, project.id),
+        source_image_asset_ids=selected_image_asset_ids,
+        source_video_job_id=(
+            source_video_job.id if source_video_job is not None else None
+        ),
+    )
+    session.commit()
+    return VisualSelectionRead.model_validate(persisted)
+
+
+def _best_media_plan(
+    *,
+    session: Session,
+    project: Project,
+    preferred_audio_job_id: str | None = None,
+    mode: str = BEST_AVAILABLE,
+    settings: Settings | None = None,
+) -> BestMediaPlan:
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="项目当前 ScriptV1 无法通过校验。") from exc
+    database_shots = crud.list_shots(session, project.id)
+    persisted = read_visual_selection(script=script, database_shots=database_shots)
+    assets = crud.list_assets(session, project.id)
+    if settings is not None:
+        usable_assets = []
+        for asset in assets:
+            try:
+                if asset.asset_type == "VIDEO_SHOT":
+                    validate_video_asset_file(
+                        data_dir=settings.data_dir,
+                        project_dir=settings.project_dir(project.id),
+                        asset=asset,
+                    )
+                elif asset.asset_type == "KEYFRAME_IMAGE":
+                    validate_image_asset_file(
+                        data_dir=settings.data_dir,
+                        project_dir=settings.project_dir(project.id),
+                        asset=asset,
+                    )
+            except (ExternalImageError, FinalMediaVisualError):
+                continue
+            usable_assets.append(asset)
+        assets = usable_assets
+    plan = resolve_best_available_media(
+        script=script,
+        database_shots=database_shots,
+        assets=assets,
+        jobs=crud.list_jobs(session, project.id),
+        explicit_image_asset_ids=dict(persisted["source_image_asset_ids"]),
+        explicit_video_job_id=(
+            str(persisted["source_video_job_id"])
+            if persisted["source_video_job_id"]
+            else None
+        ),
+        preferred_audio_job_id=preferred_audio_job_id,
+        mode=mode,
+    )
+    validated = BestMediaPlan.model_validate(plan)
+    latest = crud.latest_export(session, project.id)
+    if latest is None:
+        return validated
+    export_job = crud.get_job(session, latest.job_id)
+    frozen_plan = None
+    if export_job is not None:
+        request_snapshot = export_job.request_json if isinstance(export_job.request_json, dict) else {}
+        result_snapshot = export_job.result_json if isinstance(export_job.result_json, dict) else {}
+        frozen_plan = request_snapshot.get("selection_plan") or result_snapshot.get("selection_plan")
+
+    def fingerprint(value: object) -> dict[str, object] | None:
+        if not isinstance(value, dict):
+            return None
+        raw_shots = value.get("shots")
+        if not isinstance(raw_shots, list):
+            return None
+        normalized_shots = []
+        for item in raw_shots:
+            if not isinstance(item, dict):
+                return None
+            normalized_shots.append(
+                {
+                    "shot_id": item.get("shot_id"),
+                    "selected_type": item.get("selected_type"),
+                    "asset_id": item.get("asset_id"),
+                    "source_job_id": item.get("source_job_id"),
+                    "source_type": item.get("source_type"),
+                    "is_mock": item.get("is_mock"),
+                }
+            )
+        raw_audio = value.get("audio")
+        audio_fingerprint = None
+        if isinstance(raw_audio, dict):
+            audio_fingerprint = {
+                "job_id": raw_audio.get("job_id"),
+                "source_type": raw_audio.get("source_type"),
+                "is_mock": raw_audio.get("is_mock"),
+            }
+        return {
+            "mode": value.get("mode"),
+            "shots": sorted(normalized_shots, key=lambda item: str(item.get("shot_id") or "")),
+            "audio": audio_fingerprint,
+        }
+
+    current_payload = validated.model_dump(mode="json")
+    if validated.status == "READY" and fingerprint(frozen_plan) == fingerprint(current_payload):
+        validated.freshness = "CURRENT"
+        validated.freshness_reason = "当前成片的冻结来源快照与此合成计划一致。"
+    else:
+        validated.freshness = "OUTDATED"
+        validated.freshness_reason = "已有成片，但当前模式的素材计划已变化，需要重新合成。"
+    return validated
+
+
+@router.get("/{project_id}/best-media-plan", response_model=BestMediaPlan)
+def get_best_media_plan(
+    project_id: str,
+    request: Request,
+    preferred_audio_job_id: str | None = Query(default=None, max_length=36),
+    mode: str = Query(default=BEST_AVAILABLE),
+    session: Session = Depends(get_session),
+) -> BestMediaPlan:
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    if mode not in {BEST_AVAILABLE, IMAGE_ONLY, VIDEO_PREFERRED}:
+        raise HTTPException(status_code=422, detail="不支持的成片模式。")
+    return _best_media_plan(
+        session=session,
+        project=project,
+        preferred_audio_job_id=preferred_audio_job_id,
+        mode=mode,
+        settings=request.app.state.settings,
+    )
+
+
+@router.post(
+    "/{project_id}/smart-media-render",
+    response_model=JobQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def smart_render_best_media(
+    project_id: str,
+    payload: SmartMediaRenderRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> JobQueued:
+    """Resolve once, freeze exact IDs, then delegate to the existing M8-A3 path."""
+
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    plan = _best_media_plan(
+        session=session,
+        project=project,
+        preferred_audio_job_id=payload.preferred_audio_job_id,
+        mode=payload.composition_mode,
+        settings=request.app.state.settings,
+    )
+    if plan.status != "READY":
+        raise HTTPException(status_code=409, detail=plan.model_dump(mode="json"))
+    if plan.audio is None:
+        raise HTTPException(status_code=409, detail=plan.model_dump(mode="json"))
+    if plan.audio.is_mock:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MOCK_AUDIO_MEDIA_RERENDER_UNSUPPORTED",
+                "summary": "已选出 Mock Audio，但现有 M8-A3 合成入口只接受带 TimingPlan 的旁白资产。",
+                "selection_plan": plan.model_dump(mode="json"),
+            },
+        )
+    selected_images = {
+        item.shot_id: str(item.asset_id)
+        for item in plan.shots
+        if item.selected_type == "IMAGE" and item.asset_id
+    }
+    selected_videos = {
+        item.shot_id: str(item.asset_id)
+        for item in plan.shots
+        if item.selected_type == "VIDEO_SHOT" and item.asset_id
+    }
+    video_job_ids = {
+        str(item.source_job_id)
+        for item in plan.shots
+        if item.selected_type == "VIDEO_SHOT" and item.source_job_id
+    }
+    if len(video_job_ids) > 1:
+        raise HTTPException(status_code=409, detail=plan.model_dump(mode="json"))
+    source_video_job_id = next(iter(video_job_ids), None)
+    queued = rerender_project_media_only(
+        project_id=project_id,
+        payload=MediaRerenderRequest(
+            source_audio_job_id=plan.audio.job_id,
+            source_video_job_id=source_video_job_id,
+            source_image_asset_ids=selected_images,
+            motion_preset=payload.motion_preset,
+            background_audio_enabled=payload.background_audio_enabled,
+            background_volume=payload.background_volume,
+        ),
+        request=request,
+        session=session,
+    )
+    job = crud.get_job(session, queued.job_id)
+    if job is None:
+        raise HTTPException(status_code=500, detail="智能成片 Job 创建后无法读取。")
+    frozen = dict(job.request_json or {})
+    frozen.update(
+        {
+            "selection_mode": plan.mode,
+            "selection_plan": plan.model_dump(mode="json"),
+            "source_image_asset_ids": selected_images,
+            "source_video_asset_ids": selected_videos,
+            "resolver_runs_expected_in_worker": 0,
+        }
+    )
+    job.request_json = frozen
+    session.commit()
+    return queued
+
+
+@router.get(
+    "/{project_id}/shots/{shot_id}/external-image-prompt",
+    response_model=ExternalImagePromptBundle,
+)
+def get_external_image_prompt(
+    project_id: str,
+    shot_id: str,
+    session: Session = Depends(get_session),
+) -> ExternalImagePromptBundle:
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+        payload = build_external_image_prompt_bundle(
+            project_story=project.story,
+            script=script,
+            shot_id=shot_id,
+        )
+    except (ValueError, ExternalImageError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ExternalImagePromptBundle.model_validate(payload)
 
 
 @router.post(
@@ -452,14 +903,96 @@ def render_project_video(
         raise HTTPException(status_code=404, detail="项目不存在。")
     if crud.project_has_active_jobs(session, project.id):
         raise HTTPException(status_code=409, detail="当前项目仍有任务正在运行。")
-    source_job = crud.get_job(session, payload.source_image_job_id)
-    if source_job is None or source_job.project_id != project.id:
-        raise HTTPException(status_code=409, detail="来源图片 Job 不属于当前项目。")
-    if source_job.status != JobStatus.SUCCEEDED:
-        raise HTTPException(status_code=409, detail="来源图片 Job 尚未成功。")
-    source_images = (source_job.result_json or {}).get("image_shots")
-    if not isinstance(source_images, list) or not source_images:
-        raise HTTPException(status_code=409, detail="来源 Job 没有可复用的关键帧资产。")
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="当前项目缺少合法 ScriptV1。") from exc
+    database_shots = crud.list_shots(session, project.id)
+    script_shot_ids = [item.id for item in script.shots]
+    target_shot_ids = payload.target_shot_ids or script_shot_ids
+    unknown_target_shot_ids = set(target_shot_ids).difference(script_shot_ids)
+    if unknown_target_shot_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=f"目标镜头不属于当前 ScriptV1：{sorted(unknown_target_shot_ids)}",
+        )
+    source_job = None
+    source_images: list[object] = []
+    if payload.source_image_job_id is not None:
+        source_job = crud.get_job(session, payload.source_image_job_id)
+        if source_job is None or source_job.project_id != project.id:
+            raise HTTPException(status_code=409, detail="来源图片 Job 不属于当前项目。")
+        if source_job.status != JobStatus.SUCCEEDED:
+            raise HTTPException(status_code=409, detail="来源图片 Job 尚未成功。")
+        raw_source_images = (source_job.result_json or {}).get("image_shots")
+        if not isinstance(raw_source_images, list) or not raw_source_images:
+            raise HTTPException(status_code=409, detail="来源 Job 没有可复用的关键帧资产。")
+        source_images = raw_source_images
+
+    selected_asset_ids = dict(payload.source_image_asset_ids)
+    if payload.source_image_asset_id is not None:
+        singular = crud.get_asset(session, payload.source_image_asset_id)
+        if singular is None or singular.project_id != project.id:
+            raise HTTPException(status_code=409, detail="指定图片资产不存在或不属于当前项目。")
+        database_shot = next(
+            (item for item in database_shots if item.id == singular.shot_id), None
+        )
+        if database_shot is None:
+            raise HTTPException(status_code=409, detail="指定图片资产没有合法镜头绑定。")
+        parameters = (
+            database_shot.parameters_json
+            if isinstance(database_shot.parameters_json, dict)
+            else {}
+        )
+        singular_shot_id = str(
+            (singular.metadata_json or {}).get("shot_id")
+            or parameters.get("provider_shot_id")
+            or ""
+        )
+        if not singular_shot_id:
+            raise HTTPException(status_code=409, detail="指定图片资产缺少 Script 镜头追溯。")
+        existing = selected_asset_ids.get(singular_shot_id)
+        if existing is not None and existing != singular.id:
+            raise HTTPException(status_code=409, detail="同一镜头指定了冲突的图片资产。")
+        selected_asset_ids[singular_shot_id] = singular.id
+
+    for script_shot_id, asset_id in selected_asset_ids.items():
+        try:
+            script_shot = selected_script_shot(script, script_shot_id)
+            database_shot = database_shot_for_script_shot(database_shots, script_shot)
+        except ExternalImageError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        asset = crud.get_asset(session, asset_id)
+        if asset is None:
+            raise HTTPException(status_code=409, detail=f"图片资产不存在：{asset_id}")
+        if asset.project_id != project.id:
+            raise HTTPException(status_code=409, detail="不能选择其他项目的图片资产。")
+        if asset.shot_id != database_shot.id:
+            raise HTTPException(status_code=409, detail="图片资产不属于所选镜头。")
+        if asset.asset_type != "KEYFRAME_IMAGE":
+            raise HTTPException(status_code=409, detail="所选资产不是合法关键帧图片。")
+        try:
+            validate_image_asset_file(
+                data_dir=request.app.state.settings.data_dir,
+                project_dir=request.app.state.settings.project_dir(project.id),
+                asset=asset,
+            )
+        except ExternalImageError as exc:
+            raise HTTPException(status_code=409, detail=f"图片资产不可用：{exc}") from exc
+
+    default_shot_ids = {
+        str(item.get("shot_id"))
+        for item in source_images
+        if isinstance(item, dict)
+        and item.get("shot_id")
+        and item.get("status") in {"SUCCEEDED", "REUSED"}
+    }
+    required_shot_ids = set(target_shot_ids)
+    if not required_shot_ids.issubset(default_shot_ids.union(selected_asset_ids)):
+        raise HTTPException(
+            status_code=409,
+            detail="每个目标镜头都必须有显式图片资产或成功 Image Job 关键帧。",
+        )
     if payload.video_provider not in VIDEO_PROVIDER_IDS:
         raise HTTPException(status_code=422, detail="不支持的 VideoProvider。")
     if payload.video_provider == "cloud-wan-2.7":
@@ -481,6 +1014,17 @@ def render_project_video(
                     "retryable": False,
                 },
             )
+        if payload.target_shot_ids is not None:
+            missing_explicit_assets = required_shot_ids.difference(selected_asset_ids)
+            if missing_explicit_assets:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "WAN_SOURCE_IMAGE_NOT_SELECTED",
+                        "summary": "Wan 付费单镜头任务必须使用当前显式选择的关键帧资产。",
+                        "shot_ids": sorted(missing_explicit_assets),
+                    },
+                )
 
     job = crud.create_job(
         session,
@@ -489,8 +1033,11 @@ def render_project_video(
         job_type=VIDEO_JOB_TYPE,
         request_json={
             "project_id": project.id,
-            "parent_job_id": source_job.id,
-            "source_image_job_id": source_job.id,
+            "parent_job_id": source_job.id if source_job is not None else None,
+            "source_image_job_id": source_job.id if source_job is not None else None,
+            "source_image_asset_id": payload.source_image_asset_id,
+            "source_image_asset_ids": selected_asset_ids,
+            "target_shot_ids": target_shot_ids,
             "video_provider": payload.video_provider,
             "video_model_id": (
                 "wan2.7-i2v-2026-04-25"
@@ -504,8 +1051,8 @@ def render_project_video(
                 "duration_seconds": payload.duration_seconds,
                 "motion_preset": payload.motion_preset,
             },
-            "final_media_consumes_video": False,
-            "fallback_media_path": "KEYFRAME_FFMPEG_MOTION",
+            "final_media_consumes_video": True,
+            "fallback_media_path": "KEYFRAME_FFMPEG_MOTION_FOR_MISSING_VIDEO_SHOTS",
         },
     )
     session.commit()
@@ -608,6 +1155,42 @@ def render_project_with_real_audio(
             detail="来源真实图像 Job 已不是项目当前 ScriptV1，拒绝生成旁白。",
         )
 
+    database_shots = crud.list_shots(session, project.id)
+    persisted_selection = read_visual_selection(
+        script=script,
+        database_shots=database_shots,
+    )
+    selected_image_asset_ids = _validate_selected_image_assets(
+        session=session,
+        settings=settings,
+        project=project,
+        script=script,
+        asset_ids=(
+            payload.source_image_asset_ids
+            or persisted_selection["source_image_asset_ids"]
+        ),
+    )
+    requested_video_job_id = (
+        payload.source_video_job_id
+        if payload.source_video_job_id is not None
+        else persisted_selection["source_video_job_id"]
+    )
+    source_video_job, source_video_asset_ids = _validate_selected_video_job(
+        session=session,
+        settings=settings,
+        project=project,
+        script=script,
+        job_id=(str(requested_video_job_id) if requested_video_job_id else None),
+    )
+    write_visual_selection(
+        script=script,
+        database_shots=database_shots,
+        source_image_asset_ids=selected_image_asset_ids,
+        source_video_job_id=(
+            source_video_job.id if source_video_job is not None else None
+        ),
+    )
+
     source_script_job_id = str(
         source_result.get("source_script_job_id")
         or (source_image_job.request_json or {}).get("source_script_job_id")
@@ -658,12 +1241,22 @@ def render_project_with_real_audio(
         "parent_job_id": source_image_job.id,
         "source_script_job_id": source_script_job_id,
         "source_image_job_id": source_image_job.id,
+        "source_image_asset_ids": selected_image_asset_ids,
+        "source_video_job_id": (
+            source_video_job.id if source_video_job is not None else None
+        ),
+        "source_video_asset_ids": source_video_asset_ids,
         "script_provider": "reused",
         "source_script_provider": source_script_provider,
         "script_provider_calls_expected": 0,
         "image_provider": "reused",
         "source_image_provider": REAL_IMAGE_PROVIDER_ID,
         "image_provider_calls_expected": 0,
+        "video_provider": "reused" if source_video_job is not None else None,
+        "source_video_provider": (
+            source_video_job.provider_id if source_video_job is not None else None
+        ),
+        "video_provider_calls_expected": 0,
         "source_image_model_id": source_result.get("image_model_id"),
         "audio_provider": payload.audio_provider,
         "speaker": payload.speaker,
@@ -780,7 +1373,113 @@ def rerender_project_media_only(
             "SOURCE_IMAGE_JOB_NOT_FOUND", "来源 Job 不是成功的真实 Animagine 图片 Job。"
         )
 
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+    except ValueError as exc:
+        raise _rerender_source_error(
+            "SOURCE_SCRIPT_NOT_FOUND", "项目当前 ScriptV1 无法通过校验。"
+        ) from exc
     settings: Settings = request.app.state.settings
+    database_shots = crud.list_shots(session, project.id)
+    selected_image_asset_ids = dict(payload.source_image_asset_ids)
+    for script_shot_id, asset_id in selected_image_asset_ids.items():
+        try:
+            script_shot = selected_script_shot(script, script_shot_id)
+            database_shot = database_shot_for_script_shot(database_shots, script_shot)
+        except ExternalImageError as exc:
+            raise _rerender_source_error("SOURCE_IMAGE_MISSING", str(exc)) from exc
+        asset = crud.get_asset(session, asset_id)
+        if asset is None or asset.project_id != project.id:
+            raise _rerender_source_error(
+                "SOURCE_JOB_PROJECT_MISMATCH", "显式图片资产不存在或不属于当前项目。"
+            )
+        if asset.shot_id != database_shot.id or asset.asset_type != "KEYFRAME_IMAGE":
+            raise _rerender_source_error(
+                "SOURCE_IMAGE_MISSING", "显式图片资产不属于所选 Script 镜头。"
+            )
+        try:
+            validate_image_asset_file(
+                data_dir=settings.data_dir,
+                project_dir=settings.project_dir(project.id),
+                asset=asset,
+            )
+        except ExternalImageError as exc:
+            raise _rerender_source_error(
+                "SOURCE_IMAGE_MISSING", f"显式图片资产不可用：{exc}"
+            ) from exc
+
+    source_video_job = None
+    source_video_asset_ids: dict[str, str] = {}
+    if payload.source_video_job_id is not None:
+        source_video_job = crud.get_job(session, payload.source_video_job_id)
+        if source_video_job is None:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_JOB_NOT_FOUND", "显式来源 Video Job 不存在。"
+            )
+        if source_video_job.project_id != project.id:
+            raise _rerender_source_error(
+                "SOURCE_JOB_PROJECT_MISMATCH", "来源 Video Job 不属于当前项目。"
+            )
+        if (
+            source_video_job.job_type != VIDEO_JOB_TYPE
+            or source_video_job.provider_id not in VIDEO_PROVIDER_IDS
+            or source_video_job.status != JobStatus.SUCCEEDED
+        ):
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_JOB_NOT_FOUND", "来源 Job 不是成功的 Video Job。"
+            )
+        video_shots = (source_video_job.result_json or {}).get("video_shots")
+        if not isinstance(video_shots, list) or not video_shots:
+            raise _rerender_source_error(
+                "SOURCE_VIDEO_MISSING", "来源 Video Job 没有可复用的 VIDEO_SHOT。"
+            )
+        for raw in video_shots:
+            if not isinstance(raw, dict) or raw.get("status") not in {"SUCCEEDED", "REUSED"}:
+                raise _rerender_source_error(
+                    "SOURCE_VIDEO_MISSING", "来源 Video Job 包含无效镜头结果。"
+                )
+            shot_id = str(raw.get("shot_id") or "")
+            asset_id = str(raw.get("video_asset_id") or "")
+            try:
+                selected_script_shot(script, shot_id)
+            except ExternalImageError as exc:
+                raise _rerender_source_error("SOURCE_VIDEO_MISSING", str(exc)) from exc
+            if shot_id in source_video_asset_ids or not asset_id:
+                raise _rerender_source_error(
+                    "SOURCE_VIDEO_MISSING", "来源 Video Job 的镜头绑定重复或缺失。"
+                )
+            asset = crud.get_asset(session, asset_id)
+            metadata = asset.metadata_json if asset is not None else {}
+            if (
+                asset is None
+                or asset.project_id != project.id
+                or asset.asset_type != "VIDEO_SHOT"
+                or not isinstance(metadata, dict)
+                or metadata.get("job_id") != source_video_job.id
+                or metadata.get("shot_id") != shot_id
+                or asset.provider_id != source_video_job.provider_id
+                or raw.get("provider_id") != asset.provider_id
+                or raw.get("source_type") != asset.source_type
+            ):
+                raise _rerender_source_error(
+                    "SOURCE_VIDEO_MISSING", "VIDEO_SHOT 的 Job、Project 或 Shot 绑定无效。"
+                )
+            if raw.get("video_sha256") not in {None, asset.sha256}:
+                raise _rerender_source_error(
+                    "SOURCE_VIDEO_MISSING", "VIDEO_SHOT 结果与资产 SHA256 不一致。"
+                )
+            try:
+                validate_video_asset_file(
+                    data_dir=settings.data_dir,
+                    project_dir=settings.project_dir(project.id),
+                    asset=asset,
+                )
+            except FinalMediaVisualError as exc:
+                raise _rerender_source_error(
+                    "SOURCE_VIDEO_MISSING", f"VIDEO_SHOT 不可用：{exc}"
+                ) from exc
+            source_video_asset_ids[shot_id] = asset.id
+
     media_snapshot = _media_polish_snapshot(settings, project.id, payload)
     background = media_snapshot.get("background_audio")
     job = crud.create_job(
@@ -794,6 +1493,11 @@ def rerender_project_media_only(
             "source_script_job_id": source_script_job.id,
             "source_image_job_id": source_image_job.id,
             "source_audio_job_id": source_audio_job.id,
+            "source_video_job_id": (
+                source_video_job.id if source_video_job is not None else None
+            ),
+            "source_video_asset_ids": source_video_asset_ids,
+            "source_image_asset_ids": selected_image_asset_ids,
             "script_provider": "reused",
             "image_provider": "reused",
             "audio_provider": "reused",
@@ -802,9 +1506,14 @@ def rerender_project_media_only(
             ),
             "source_image_provider": REAL_IMAGE_PROVIDER_ID,
             "source_audio_provider": REAL_AUDIO_PROVIDER_ID,
+            "video_provider": "reused" if source_video_job is not None else None,
+            "source_video_provider": (
+                source_video_job.provider_id if source_video_job is not None else None
+            ),
             "script_provider_calls_expected": 0,
             "image_provider_calls_expected": 0,
             "audio_provider_calls_expected": 0,
+            "video_provider_calls_expected": 0,
             "media_only": True,
             "background_audio_id": (
                 background.get("asset_id")

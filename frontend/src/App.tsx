@@ -17,8 +17,10 @@ import {
   deleteProject,
   exportUrls,
   generateProject,
+  getExternalImagePrompt,
   getHealth,
   getBackgroundAudio,
+  getCompositionPlan,
   getJob,
   getProject,
   getProviders,
@@ -30,14 +32,21 @@ import {
   renderVideo,
   rerenderMediaOnly,
   retryJob,
+  smartRenderBestMedia,
   uploadBackgroundAudio,
+  uploadExternalImage,
+  updateVisualSelection,
 } from "./api";
 import type {
   AudioProviderStatus,
   AudioSpeaker,
   BackgroundAudioAsset,
+  BestMediaPlan,
+  CompositionMode,
   DesiredShotCount,
   DurationNormalization,
+  ExternalImagePromptBundle,
+  ExternalImageSourceType,
   GeneratedAudioShot,
   GeneratedImageShot,
   GeneratedVideoShot,
@@ -45,6 +54,7 @@ import type {
   GenerationErrorDetail,
   GenerationJob,
   HealthStatus,
+  ImageAssetRecord,
   JobStatus,
   MediaTimingPlan,
   MotionPreset,
@@ -70,7 +80,12 @@ const PROJECTS_PER_PAGE = 8;
 const SELECTED_PROJECT_STORAGE_KEY = "paper-crane:selected-project";
 
 type SectionName = "create" | "project" | "shots" | "result";
-type Notice = { kind: "info" | "success"; message: string; action?: SectionName };
+type Notice = {
+  kind: "info" | "success";
+  message: string;
+  action?: SectionName | "composition";
+  actionLabel?: string;
+};
 type PresentedShot = {
   id?: string;
   shot_id?: string;
@@ -78,6 +93,8 @@ type PresentedShot = {
   shot_index?: number;
   sequence_no?: number;
   title: string;
+  scene_id?: string;
+  character_ids?: string[];
   visual_description: string;
   narration: string;
   duration_seconds: number;
@@ -179,6 +196,14 @@ function isRealAudioJob(job: GenerationJob | null | undefined): boolean {
 
 function isVideoJob(job: GenerationJob | null | undefined): boolean {
   return job?.job_type === "GENERATE_VIDEO";
+}
+
+function jobHasFinalMedia(job: GenerationJob | null | undefined): boolean {
+  return Boolean(
+    job?.result_json?.export_id ||
+    job?.result_json?.video_url ||
+    job?.result_json?.download_url,
+  );
 }
 
 function jobVideoShots(job: GenerationJob | null | undefined): GeneratedVideoShot[] {
@@ -462,6 +487,9 @@ function shotCountLabel(value: DesiredShotCount | undefined): string {
 }
 
 function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): string {
+  if (isVideoJob(job)) {
+    return "动态镜头已准备完成，当前最终成片尚未包含这些新素材。";
+  }
   if (isRealAudioJob(job)) {
     const completed = jobAudioCompletedCount(job);
     const total = jobAudioTotalCount(job, fallbackActual ?? 0);
@@ -825,6 +853,18 @@ function shotNumber(shot: PresentedShot, fallback: number): number {
 
 function audioAssetUrl(value: unknown): string | null {
   return typeof value === "string" ? imageAssetUrl(value) : null;
+}
+
+function imageAssetLabel(asset: ImageAssetRecord): string {
+  if (asset.source_type === "EXTERNAL_IMPORT") {
+    if (asset.external_source_type === "AI_GENERATED") {
+      return `External AI · ${asset.provider_hint || "其他服务"}`;
+    }
+    if (asset.external_source_type === "HUMAN_CREATED") return "人工制作 · Human-in-the-loop";
+    return "其他外部素材 · Human-in-the-loop";
+  }
+  if (asset.provider_id === REAL_IMAGE_PROVIDER_ID) return "Animagine XL 4.0 · Local AI";
+  return `${asset.provider_id} · ${asset.source_type}`;
 }
 
 function ShotImage({ src, sequence, title }: { src: string; sequence: number; title: string }) {
@@ -1358,19 +1398,34 @@ export default function App() {
   const [audioRequestError, setAudioRequestError] =
     useState<GenerationErrorDetail | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [externalPrompts, setExternalPrompts] = useState<
+    Record<string, ExternalImagePromptBundle>
+  >({});
+  const [selectedVideoImageAssets, setSelectedVideoImageAssets] = useState<
+    Record<string, string>
+  >({});
+  const [selectedFinalVideoJobId, setSelectedFinalVideoJobId] = useState("");
+  const [targetVideoShotIds, setTargetVideoShotIds] = useState<string[]>([]);
+  const [imageCompositionPlan, setImageCompositionPlan] = useState<BestMediaPlan | null>(null);
+  const [videoCompositionPlan, setVideoCompositionPlan] = useState<BestMediaPlan | null>(null);
+  const [externalSourceTypes, setExternalSourceTypes] = useState<
+    Record<string, ExternalImageSourceType>
+  >({});
+  const [externalProviderHints, setExternalProviderHints] = useState<Record<string, string>>({});
   const [deleteCandidate, setDeleteCandidate] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const createSectionRef = useRef<HTMLElement>(null);
   const projectSectionRef = useRef<HTMLElement>(null);
   const shotsSectionRef = useRef<HTMLElement>(null);
+  const compositionSectionRef = useRef<HTMLElement>(null);
   const resultSectionRef = useRef<HTMLElement>(null);
   const projectTitleRef = useRef<HTMLHeadingElement>(null);
   const resultTitleRef = useRef<HTMLHeadingElement>(null);
   const creationInFlightRef = useRef(false);
   const deletionInFlightRef = useRef(false);
   const providerSelectionTouchedRef = useRef(false);
-  const pendingNavigationRef = useRef<"project" | "result" | null>(null);
+  const pendingNavigationRef = useRef<"project" | "composition" | "result" | null>(null);
   const handledSucceededJobsRef = useRef(new Set<string>());
   const projectSignalsRef = useRef<Record<string, ProjectSignal>>({});
   const mediaPolishOptions = {
@@ -1397,6 +1452,14 @@ export default function App() {
           ? resultTitleRef.current ?? target
           : target;
     focusTarget.focus({ preventScroll: true });
+  }, []);
+
+  const scrollToComposition = useCallback(() => {
+    const target = compositionSectionRef.current;
+    if (!target) return;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+    target.focus({ preventScroll: true });
   }, []);
 
   const loadProjectSignals = useCallback(async (items: Project[]) => {
@@ -1467,6 +1530,36 @@ export default function App() {
   const refreshDetail = useCallback(async (projectId: string) => {
     const value = await getProject(projectId);
     setDetail(value);
+    setSelectedVideoImageAssets(value.visual_selection.source_image_asset_ids ?? {});
+    setSelectedFinalVideoJobId(value.visual_selection.source_video_job_id ?? "");
+    const [imagePlan, videoPlan] = await Promise.all([
+      getCompositionPlan(projectId, "IMAGE_ONLY").catch(() => null),
+      getCompositionPlan(projectId, "VIDEO_PREFERRED").catch(() => null),
+    ]);
+    setImageCompositionPlan(imagePlan);
+    setVideoCompositionPlan(videoPlan);
+    const promptShots = value.project.script_json?.shots ?? [];
+    const validShotIds = promptShots.map((shot) => shot.id);
+    setTargetVideoShotIds((current) => {
+      const retained = current.filter((shotId) => validShotIds.includes(shotId));
+      return retained.length > 0 ? retained : validShotIds;
+    });
+    const promptResults = await Promise.all(
+      promptShots.map(async (shot) => {
+        try {
+          return await getExternalImagePrompt(projectId, shot.id);
+        } catch {
+          return null;
+        }
+      }),
+    );
+    setExternalPrompts(
+      Object.fromEntries(
+        promptResults
+          .filter((item): item is ExternalImagePromptBundle => item !== null)
+          .map((item) => [item.shot_id, item]),
+      ),
+    );
     const signal = summarizeProjectDetail(value);
     projectSignalsRef.current = { ...projectSignalsRef.current, [projectId]: signal };
     setProjectSignals(projectSignalsRef.current);
@@ -1501,9 +1594,21 @@ export default function App() {
   useEffect(() => {
     if (!selectedId) {
       setDetail(null);
+      setExternalPrompts({});
+      setSelectedVideoImageAssets({});
+      setSelectedFinalVideoJobId("");
+      setTargetVideoShotIds([]);
+      setImageCompositionPlan(null);
+      setVideoCompositionPlan(null);
       return;
     }
     setDetail(null);
+    setExternalPrompts({});
+    setSelectedVideoImageAssets({});
+    setSelectedFinalVideoJobId("");
+    setTargetVideoShotIds([]);
+    setImageCompositionPlan(null);
+    setVideoCompositionPlan(null);
     setActiveJob(null);
     setError("");
     setGenerationRequestError(null);
@@ -1553,23 +1658,36 @@ export default function App() {
       getJob(activeJob.id)
         .then(async (job) => {
           if (cancelled) return;
-          if (
+          const newlySucceeded =
             job.status === "SUCCEEDED" &&
             activeJob.status !== "SUCCEEDED" &&
-            !handledSucceededJobsRef.current.has(job.id)
-          ) {
-            handledSucceededJobsRef.current.add(job.id);
-            pendingNavigationRef.current = "result";
-            setNotice({
-              kind: "success",
-              message: generationSuccessSummary(job),
-              action: "result",
-            });
-          }
+            !handledSucceededJobsRef.current.has(job.id);
           setActiveJob(job);
           if (job.status === "SUCCEEDED" || job.status === "FAILED") {
             window.clearInterval(timer);
             await Promise.all([refreshDetail(job.project_id), refreshProjects()]);
+            if (newlySucceeded) {
+              handledSucceededJobsRef.current.add(job.id);
+              if (isVideoJob(job)) {
+                pendingNavigationRef.current = "composition";
+                setNotice({
+                  kind: "success",
+                  message: "动态镜头已准备完成并设为当前版本；当前最终成片尚未包含这些新素材。",
+                  action: "composition",
+                  actionLabel: "前往成片合成",
+                });
+              } else if (jobHasFinalMedia(job)) {
+                pendingNavigationRef.current = "result";
+                setNotice({
+                  kind: "success",
+                  message: generationSuccessSummary(job),
+                  action: "result",
+                  actionLabel: "查看成片",
+                });
+              } else {
+                setNotice({ kind: "success", message: generationSuccessSummary(job) });
+              }
+            }
           }
         })
         .catch((cause: unknown) => {
@@ -1593,6 +1711,16 @@ export default function App() {
       scrollToSection("project");
     }
   }, [detail?.project.id, scrollToSection, selectedId]);
+
+  useEffect(() => {
+    if (
+      pendingNavigationRef.current !== "composition" ||
+      !detail?.project.id ||
+      detail.project.id !== selectedId
+    ) return;
+    pendingNavigationRef.current = null;
+    scrollToComposition();
+  }, [detail?.project.id, notice?.action, scrollToComposition, selectedId, videoCompositionPlan]);
 
   useEffect(() => {
     if (pendingNavigationRef.current !== "result" || !detail?.latest_export) return;
@@ -1820,6 +1948,8 @@ export default function App() {
         sourceImageJob.id,
         audioSpeaker,
         mediaPolishOptions,
+        successfulVideoJob?.id ?? null,
+        selectedVideoImageAssets,
       );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
@@ -1841,21 +1971,122 @@ export default function App() {
   };
 
   const startVideoGeneration = async () => {
-    if (!selectedId || !sourceImageJob || videoMode === "keyframe_motion") return;
+    const targetShotIds = targetVideoShotIds.filter((shotId) =>
+      scriptShots.some((shot) => (shot.shot_id ?? shot.id) === shotId),
+    );
+    if (
+      !selectedId ||
+      targetShotIds.length === 0 ||
+      (!sourceImageJob && !hasTargetVideoSource) ||
+      (videoMode === "cloud-wan-2.7" && !hasExplicitTargetVideoSource) ||
+      videoMode === "keyframe_motion"
+    ) return;
     setBusy("video");
     setError("");
     setNotice(null);
     try {
       const job = await renderVideo(
         selectedId,
-        sourceImageJob.id,
+        sourceImageJob?.id ?? null,
         motionPreset,
         videoMode,
+        selectedVideoImageAssets,
+        targetShotIds,
       );
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
       setError(`动态视频任务提交失败：${readableError(cause)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const copyExternalPrompt = async (shotId: string) => {
+    const bundle = externalPrompts[shotId];
+    if (!bundle) return;
+    try {
+      await navigator.clipboard.writeText(bundle.prompt);
+      setNotice({
+        kind: "success",
+        message: "已复制，可在 ChatGPT Images 等外部服务中生成后导回。",
+      });
+    } catch (cause) {
+      setError(`复制外部生成提示词失败：${readableError(cause)}`);
+    }
+  };
+
+  const importExternalKeyframe = async (
+    shotId: string,
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!selectedId || !file) return;
+    const sourceType = externalSourceTypes[shotId] ?? "AI_GENERATED";
+    const providerHint = externalProviderHints[shotId] ?? "ChatGPT Images";
+    setBusy(`external-image-${shotId}`);
+    setError("");
+    try {
+      await uploadExternalImage(
+        selectedId,
+        shotId,
+        file,
+        sourceType,
+        providerHint,
+      );
+      await refreshDetail(selectedId);
+      setNotice({
+        kind: "success",
+        message: "外部关键帧已导入并设为该镜头的视频首帧。",
+      });
+    } catch (cause) {
+      setError(`外部关键帧导入失败：${readableError(cause)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const persistImageSelection = async (shotId: string, assetId: string) => {
+    if (!selectedId) return;
+    const next = { ...selectedVideoImageAssets };
+    if (assetId) next[shotId] = assetId;
+    else delete next[shotId];
+    setBusy(`visual-selection-${shotId}`);
+    setError("");
+    try {
+      const persisted = await updateVisualSelection(
+        selectedId,
+        next,
+        selectedFinalVideoJobId || null,
+      );
+      setSelectedVideoImageAssets(persisted.source_image_asset_ids);
+      setSelectedFinalVideoJobId(persisted.source_video_job_id ?? "");
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      setError(`关键帧选择保存失败：${readableError(cause)}`);
+      await refreshDetail(selectedId);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const persistVideoSelection = async (videoJobId: string) => {
+    if (!selectedId) return;
+    setBusy("visual-selection-video");
+    setError("");
+    try {
+      const persisted = await updateVisualSelection(
+        selectedId,
+        selectedVideoImageAssets,
+        videoJobId || null,
+      );
+      setSelectedVideoImageAssets(persisted.source_image_asset_ids);
+      setSelectedFinalVideoJobId(persisted.source_video_job_id ?? "");
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      setError(`动态视频来源保存失败：${readableError(cause)}`);
+      await refreshDetail(selectedId);
     } finally {
       setBusy(null);
     }
@@ -1874,8 +2105,9 @@ export default function App() {
         selectedId,
         successfulRealAudioJob.id,
         mediaPolishOptions,
+        successfulVideoJob?.id ?? null,
+        selectedVideoImageAssets,
       );
-      pendingNavigationRef.current = "result";
       setActiveJob({ ...job, project_id: job.project_id || selectedId });
       await refreshDetail(selectedId);
     } catch (cause) {
@@ -1890,6 +2122,25 @@ export default function App() {
       } else {
         setError(readableError(cause));
       }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startSmartMediaRender = async (
+    compositionMode: CompositionMode,
+    plan: BestMediaPlan | null,
+  ) => {
+    if (!selectedId || plan?.status !== "READY") return;
+    setBusy(`smart-media-render-${compositionMode}`);
+    setError("");
+    setNotice(null);
+    try {
+      const job = await smartRenderBestMedia(selectedId, compositionMode, mediaPolishOptions);
+      setActiveJob({ ...job, project_id: job.project_id || selectedId });
+      await refreshDetail(selectedId);
+    } catch (cause) {
+      setError(`成片合成提交失败：${readableError(cause)}`);
     } finally {
       setBusy(null);
     }
@@ -2008,6 +2259,13 @@ export default function App() {
             generation_parameters: parameters ?? undefined,
           };
         });
+  const imageAssets = detail?.image_assets ?? [];
+  const effectiveTargetVideoShotIds = targetVideoShotIds.filter((targetShotId) =>
+    scriptShots.some((shot) => (shot.shot_id ?? shot.id) === targetShotId),
+  );
+  const hasExplicitTargetVideoSource =
+    effectiveTargetVideoShotIds.length > 0 &&
+    effectiveTargetVideoShotIds.every((shotId) => Boolean(selectedVideoImageAssets[shotId]));
   const exportJob = detail?.latest_export
     ? detail.recent_jobs.find((job) => job.id === detail.latest_export?.job_id) ?? null
     : null;
@@ -2042,6 +2300,7 @@ export default function App() {
       (job) => job.status === "SUCCEEDED" && isRealImageJob(job),
     ) ??
     null;
+  const hasTargetVideoSource = Boolean(sourceImageJob) || hasExplicitTargetVideoSource;
   const sourceImageProviderUsed = jobImageProvider(sourceImageJob);
   const imageProviderUsed =
     textValue(exportJob?.result_json?.image_provider) ??
@@ -2070,11 +2329,28 @@ export default function App() {
   const imageGenerationInProgress =
     isRealImageJob(activeJob) &&
     (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
+  const successfulVideoJobs =
+    detail?.video_jobs.filter(
+      (job) => isVideoJob(job) && job.status === "SUCCEEDED" && jobVideoShots(job).length > 0,
+    ) ?? [];
+  const successfulVideoJob =
+    successfulVideoJobs.find((job) => job.id === selectedFinalVideoJobId) ?? null;
   const videoDisplayJob =
     (isVideoJob(latestVisibleJob) ? latestVisibleJob : null) ??
-    detail?.recent_jobs.find((job) => isVideoJob(job)) ??
+    successfulVideoJob ??
     null;
   const generatedVideoShots = jobVideoShots(videoDisplayJob);
+  const finalMediaVideoShotIds = new Set(
+    jobVideoShots(successfulVideoJob).map((shot) => shot.shot_id),
+  );
+  const finalMediaVideoShotCount = scriptShots.filter((shot) => {
+    const shotId = shot.shot_id ?? shot.id;
+    return Boolean(shotId && finalMediaVideoShotIds.has(shotId));
+  }).length;
+  const finalMediaImageShotCount = Math.max(
+    0,
+    scriptShots.length - finalMediaVideoShotCount,
+  );
   const videoGenerationInProgress =
     isVideoJob(activeJob) &&
     (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
@@ -2134,6 +2410,16 @@ export default function App() {
     shots: Boolean(scriptShots.length),
     result: Boolean(media),
   };
+  const compositionAudio = imageCompositionPlan?.audio ?? videoCompositionPlan?.audio ?? null;
+  const currentCompositionMode =
+    imageCompositionPlan?.freshness === "CURRENT"
+      ? "关键帧版"
+      : videoCompositionPlan?.freshness === "CURRENT"
+        ? "动态镜头版"
+        : null;
+  const dynamicPlanNeedsRecompose =
+    (videoCompositionPlan?.available_video_shot_count ?? 0) > 0 &&
+    videoCompositionPlan?.freshness !== "CURRENT";
   const filteredProjects = useMemo(() => {
     const query = projectSearch.trim().toLocaleLowerCase();
     return projects
@@ -2267,9 +2553,16 @@ export default function App() {
         {notice && (
           <div className={`inline-notice notice-${notice.kind}`} aria-live="polite">
             <span>{notice.message}</span>
-            {notice.action && availableStages[notice.action] && (
-              <button className="notice-action" type="button" onClick={() => scrollToSection(notice.action!)}>
-                查看成片
+            {notice.action && (notice.action === "composition" || availableStages[notice.action]) && (
+              <button
+                className="notice-action"
+                type="button"
+                onClick={() => {
+                  if (notice.action === "composition") scrollToComposition();
+                  else if (notice.action) scrollToSection(notice.action);
+                }}
+              >
+                {notice.actionLabel ?? "查看成片"}
               </button>
             )}
           </div>
@@ -2982,13 +3275,57 @@ export default function App() {
                   <span>
                     Source type：{videoMode === "cloud-wan-2.7" ? "REAL_CLOUD_MODEL" : videoMode === "mock-video" ? "MOCK" : "FFMPEG_KEYFRAME_MOTION"}
                   </span>
-                  <span>最终成片：M8-A2 暂不消费 VideoAsset</span>
+                  <span>最终成片：生成后需在“成片合成”中明确选择动态镜头版</span>
                   {selectedVideoProviderDescriptor?.detail && (
                     <span className="image-provider-detail">{selectedVideoProviderDescriptor.detail}</span>
                   )}
                 </div>
-                {videoMode !== "keyframe_motion" && !sourceImageJob && (
-                  <p className="provider-warning">请先完成一个带有逐镜头关键帧的图片 Job。</p>
+                {videoMode !== "keyframe_motion" && (
+                  <fieldset
+                    className="video-target-selector"
+                    disabled={busy !== null || generationInProgress}
+                  >
+                    <legend>本次生成镜头</legend>
+                    {scriptShots.map((shot, index) => {
+                      const shotId = shot.shot_id ?? shot.id;
+                      if (!shotId) return null;
+                      return (
+                        <label key={shotId}>
+                          <input
+                            type="checkbox"
+                            checked={targetVideoShotIds.includes(shotId)}
+                            onChange={(event) => {
+                              setTargetVideoShotIds((current) =>
+                                event.target.checked
+                                  ? [...new Set([...current, shotId])]
+                                  : current.filter((item) => item !== shotId),
+                              );
+                            }}
+                          />
+                          <span>
+                            镜头 {index + 1}
+                            <small>
+                              {selectedVideoImageAssets[shotId]
+                                ? "当前显式关键帧"
+                                : sourceImageJob
+                                  ? "Image Job 关键帧"
+                                  : "缺少首帧"}
+                            </small>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </fieldset>
+                )}
+                {videoMode !== "keyframe_motion" && !hasTargetVideoSource && (
+                  <p className="provider-warning">
+                    请至少选择一个有关键帧来源的目标镜头。
+                  </p>
+                )}
+                {videoMode === "cloud-wan-2.7" && !hasExplicitTargetVideoSource && (
+                  <p className="provider-warning" role="status">
+                    付费 Wan 任务只接受目标镜头当前显式选择的关键帧，不会回退旧 Image Job。
+                  </p>
                 )}
                 {videoMode === "cloud-wan-2.7" && cloudVideoProviderDescriptor?.configured !== true && (
                   <p className="provider-warning" role="status">
@@ -3010,7 +3347,9 @@ export default function App() {
                     onClick={() => void startVideoGeneration()}
                     disabled={
                       videoMode === "keyframe_motion" ||
-                      !sourceImageJob ||
+                      effectiveTargetVideoShotIds.length === 0 ||
+                      !hasTargetVideoSource ||
+                      (videoMode === "cloud-wan-2.7" && !hasExplicitTargetVideoSource) ||
                       busy !== null ||
                       generationInProgress ||
                       selectedVideoProviderDescriptor?.available !== true
@@ -3273,7 +3612,7 @@ export default function App() {
               </div>
               <p id="media-rerender-note" className="media-rerender-note">
                 {successfulRealAudioJob
-                  ? "复用已有图片和旁白，不重新运行任何模型。"
+                  ? `复用已有素材，不重新运行任何模型。视觉来源：${finalMediaImageShotCount} 个关键帧，${finalMediaVideoShotCount} 个动态视频镜头。`
                   : "需要一个成功且素材完整的真实旁白 Job，才可仅重新合成成片。"}
               </p>
               {audioRequestError && (
@@ -3297,6 +3636,18 @@ export default function App() {
                       (sourceShotId && image.shot_id === sourceShotId) ||
                       numberValue(image.shot_index) === sequence,
                   );
+                  const availableImageAssets = imageAssets.filter(
+                    (asset) => asset.shot_id === sourceShotId,
+                  );
+                  const selectedImageAsset = availableImageAssets.find(
+                    (asset) => asset.asset_id === selectedVideoImageAssets[sourceShotId ?? ""],
+                  );
+                  const externalPrompt = sourceShotId
+                    ? externalPrompts[sourceShotId]
+                    : undefined;
+                  const externalSourceType = sourceShotId
+                    ? externalSourceTypes[sourceShotId] ?? "AI_GENERATED"
+                    : "AI_GENERATED";
                   const generatedAudio = generatedAudioShots.find(
                     (audio) =>
                       (sourceShotId && audio.shot_id === sourceShotId) ||
@@ -3328,12 +3679,26 @@ export default function App() {
                     (generatedAudio?.status === "SUCCEEDED" ||
                       generatedAudio?.status === "REUSED") &&
                     Boolean(textValue(generatedAudio?.audio_sha256));
-                  const thumbnailUrl = imageAssetUrl(textValue(generatedImage?.image_url) ?? undefined);
-                  const imageStatus =
-                    textValue(generatedImage?.status) ?? (thumbnailUrl ? "SUCCEEDED" : "PENDING");
+                  const thumbnailUrl = imageAssetUrl(
+                    selectedImageAsset?.image_url ??
+                      textValue(generatedImage?.image_url) ??
+                      undefined,
+                  );
+                  const imageStatus = selectedImageAsset
+                    ? "SUCCEEDED"
+                    : textValue(generatedImage?.status) ?? (thumbnailUrl ? "SUCCEEDED" : "PENDING");
                   const hasRealImage =
                     Boolean(thumbnailUrl) &&
-                    (generatedImage?.provider_id === REAL_IMAGE_PROVIDER_ID || isRealImageJob(imageDisplayJob));
+                    (Boolean(selectedImageAsset) ||
+                      generatedImage?.provider_id === REAL_IMAGE_PROVIDER_ID ||
+                      isRealImageJob(imageDisplayJob));
+                  const imageSourceLabel = selectedImageAsset
+                    ? imageAssetLabel(selectedImageAsset)
+                    : hasRealImage
+                      ? "Animagine XL 4.0"
+                      : isRealImageJob(imageDisplayJob)
+                        ? "等待真实图片"
+                        : "Mock 视觉";
                   const imageStatusLabel =
                     imageStatus === "RUNNING"
                       ? "正在生成"
@@ -3344,9 +3709,11 @@ export default function App() {
                         : imageStatus === "SUCCEEDED"
                           ? "已生成"
                           : "等待生成";
-                  const displayedImageStatus = isRealImageJob(imageDisplayJob)
-                    ? imageStatusLabel
-                    : "Mock 已准备";
+                  const displayedImageStatus = selectedImageAsset
+                    ? "外部素材已校验"
+                    : isRealImageJob(imageDisplayJob)
+                      ? imageStatusLabel
+                      : "Mock 已准备";
                   return (
                     <article
                       className={`shot-card ${hasRealImage ? "has-real-image" : ""} ${hasRealAudio ? "has-real-audio" : ""}`}
@@ -3360,14 +3727,20 @@ export default function App() {
                         )}
                         <span className="shot-number">{String(sequence).padStart(2, "0")}</span>
                         <small className={`shot-image-status status-${imageStatus.toLowerCase()}`}>
-                          {hasRealImage ? "真实模型" : isRealImageJob(imageDisplayJob) ? imageStatusLabel : "Mock 视觉"}
+                            {selectedImageAsset?.source_type === "EXTERNAL_IMPORT"
+                              ? "外部素材"
+                              : hasRealImage
+                                ? "真实模型"
+                                : isRealImageJob(imageDisplayJob)
+                                  ? imageStatusLabel
+                                  : "Mock 视觉"}
                         </small>
                       </div>
                       <div className="shot-copy">
                         <div className="shot-provider-row">
                           <p className="eyebrow">{shot.duration_seconds}s · 图像 {displayedImageStatus}</p>
                           <span className={`visual-source-badge ${hasRealImage ? "is-real" : "is-mock"}`}>
-                            {hasRealImage ? "Animagine XL 4.0" : isRealImageJob(imageDisplayJob) ? "等待真实图片" : "Mock 视觉"}
+                            {imageSourceLabel}
                           </span>
                         </div>
                         <h3>{shot.title}</h3>
@@ -3389,6 +3762,116 @@ export default function App() {
                             sequence={sequence}
                             missingReason={generatedAudio?.audio_url_error?.summary}
                           />
+                        )}
+                        {sourceShotId && (
+                          <section className="external-image-bridge" aria-label={`镜头 ${sequence} 外部关键帧`}>
+                            <details className="visual-planning-inspector">
+                              <summary>查看视觉规划</summary>
+                              <div className="planning-layer">
+                                <strong>① 原始故事</strong>
+                                <p>{detail?.project.story}</p>
+                              </div>
+                              <div className="planning-layer">
+                                <strong>② 当前结构化镜头</strong>
+                                <dl>
+                                  <div><dt>标题</dt><dd>{shot.title}</dd></div>
+                                  <div><dt>角色</dt><dd>{scriptCharacters.filter((item) => !shot.character_ids || shot.character_ids.includes(item.id)).map((item) => item.name).join("、") || "未提供"}</dd></div>
+                                  <div><dt>场景</dt><dd>{scriptScenes.find((item) => item.id === shot.scene_id)?.name ?? "见视觉描述"}</dd></div>
+                                  <div><dt>旁白 / 时长</dt><dd>{shot.narration} · {shot.duration_seconds}s</dd></div>
+                                  <div><dt>Visual</dt><dd>{shot.visual_description}</dd></div>
+                                  <div><dt>Camera</dt><dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd></div>
+                                </dl>
+                              </div>
+                              <div className="planning-layer">
+                                <strong>③ 外部生成提示词</strong>
+                                {externalPrompt ? (
+                                  <>
+                                    <small>{externalPrompt.adapter} · selected Shot {externalPrompt.shot_id}</small>
+                                    <pre>{externalPrompt.prompt}</pre>
+                                    <button
+                                      className="button button-ghost button-small"
+                                      type="button"
+                                      onClick={() => void copyExternalPrompt(sourceShotId)}
+                                    >
+                                      复制外部生成提示词
+                                    </button>
+                                  </>
+                                ) : (
+                                  <p>当前镜头尚无可导出的结构化提示词。</p>
+                                )}
+                              </div>
+                            </details>
+
+                            <div className="external-image-controls">
+                              <label>
+                                素材来源
+                                <select
+                                  value={externalSourceType}
+                                  onChange={(event) =>
+                                    setExternalSourceTypes((current) => ({
+                                      ...current,
+                                      [sourceShotId]: event.target.value as ExternalImageSourceType,
+                                    }))
+                                  }
+                                >
+                                  <option value="AI_GENERATED">外部 AI 生成</option>
+                                  <option value="HUMAN_CREATED">人工制作</option>
+                                  <option value="OTHER">其他素材</option>
+                                </select>
+                              </label>
+                              {externalSourceType === "AI_GENERATED" && (
+                                <label>
+                                  服务 / 模型来源（仅作来源提示）
+                                  <input
+                                    value={externalProviderHints[sourceShotId] ?? "ChatGPT Images"}
+                                    onChange={(event) =>
+                                      setExternalProviderHints((current) => ({
+                                        ...current,
+                                        [sourceShotId]: event.target.value,
+                                      }))
+                                    }
+                                    placeholder="ChatGPT Images 或其他"
+                                  />
+                                </label>
+                              )}
+                              <label className="button button-ghost external-image-upload">
+                                {busy === `external-image-${sourceShotId}`
+                                  ? "正在校验并导入…"
+                                  : "导入 / 替换关键帧"}
+                                <input
+                                  type="file"
+                                  accept="image/png,image/jpeg,.png,.jpg,.jpeg"
+                                  disabled={busy !== null || generationInProgress}
+                                  onChange={(event) => void importExternalKeyframe(sourceShotId, event)}
+                                />
+                              </label>
+                              <label>
+                                视频首帧
+                                <select
+                                  value={selectedVideoImageAssets[sourceShotId] ?? ""}
+                                  onChange={(event) =>
+                                    void persistImageSelection(sourceShotId, event.target.value)
+                                  }
+                                >
+                                  <option value="">
+                                    {sourceImageJob
+                                      ? "Image Job 默认关键帧（向后兼容）"
+                                      : "请选择一个关键帧资产"}
+                                  </option>
+                                  {availableImageAssets.map((asset) => (
+                                    <option key={asset.asset_id} value={asset.asset_id}>
+                                      {imageAssetLabel(asset)} · {asset.width ?? "?"}×{asset.height ?? "?"}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <small>
+                                {selectedImageAsset
+                                  ? `当前选中：${imageAssetLabel(selectedImageAsset)} · ${selectedImageAsset.sha256.slice(0, 12)}…`
+                                  : "当前使用来源 Image Job 的关键帧；选择资产后将显式传给 VideoProvider。"}
+                              </small>
+                            </div>
+                          </section>
                         )}
                         <details className="technical-details shot-technical-details">
                           <summary>技术详情</summary>
@@ -3439,7 +3922,11 @@ export default function App() {
                 </>
               ) : media ? (
                 <>
-                  <p>镜头已准备完成，最终成片已生成。</p>
+                  <p>
+                    {currentCompositionMode
+                      ? `镜头已准备完成，当前${currentCompositionMode}成片已是最新。`
+                      : "已有成片，但素材已更新，需要重新合成。"}
+                  </p>
                   <button className="button button-primary" type="button" onClick={() => scrollToSection("result")}>
                     前往播放成片 ↓
                   </button>
@@ -3451,6 +3938,192 @@ export default function App() {
           </section>
         )}
 
+        {detail && scriptShots.length > 0 && (
+          <section
+            className="section composition-section"
+            id="composition-section"
+            ref={compositionSectionRef}
+            tabIndex={-1}
+            aria-labelledby="composition-title"
+          >
+            <div className="section-heading compact">
+              <span className="section-number">04</span>
+              <div>
+                <p className="eyebrow">成片合成</p>
+                <h2 id="composition-title">明确选择这一版成片使用什么视觉素材</h2>
+              </div>
+            </div>
+            <div className="composition-summary-grid">
+              <div><small>当前关键帧</small><strong>{imageCompositionPlan?.available_image_shot_count ?? 0} 个镜头</strong></div>
+              <div><small>当前动态镜头</small><strong>{videoCompositionPlan?.available_video_shot_count ?? 0} 个镜头</strong></div>
+              <div>
+                <small>当前 Audio 来源</small>
+                <strong>
+                  {compositionAudio
+                    ? `${compositionAudio.is_mock ? "MOCK" : "REAL"} · ${compositionAudio.provider}${compositionAudio.speaker ? ` · ${compositionAudio.speaker}` : ""}`
+                    : "尚无兼容 Audio Job"}
+                </strong>
+              </div>
+              <div>
+                <small>当前成片状态</small>
+                <strong className={currentCompositionMode ? "is-current" : "is-outdated"}>
+                  {!detail.latest_export
+                    ? "尚未生成"
+                    : currentCompositionMode
+                      ? `CURRENT · ${currentCompositionMode}`
+                      : "OUTDATED · 需要重新合成"}
+                </strong>
+              </div>
+            </div>
+            {successfulVideoJobs.length > 0 && (
+              <section className="video-version-panel" aria-labelledby="video-version-title">
+                <div className="video-version-heading">
+                  <div>
+                    <p className="eyebrow">动态视频版本</p>
+                    <h3 id="video-version-title">当前动态视频版本</h3>
+                  </div>
+                  <span>历史版本保留，仅显式选择决定当前版本</span>
+                </div>
+                <div className="video-version-list">
+                  {successfulVideoJobs.map((job) => {
+                    const shots = jobVideoShots(job);
+                    const hasStaleLineage = shots.some((shot) => {
+                      const currentImageId = selectedVideoImageAssets[shot.shot_id];
+                      return Boolean(
+                        currentImageId &&
+                        shot.source_image_asset_id &&
+                        currentImageId !== shot.source_image_asset_id,
+                      );
+                    });
+                    const isBasedOnCurrent =
+                      shots.length > 0 &&
+                      shots.every(
+                        (shot) =>
+                          Boolean(selectedVideoImageAssets[shot.shot_id]) &&
+                          selectedVideoImageAssets[shot.shot_id] === shot.source_image_asset_id,
+                      );
+                    const isCurrent = selectedFinalVideoJobId === job.id;
+                    const isReal = job.result_json?.video_source_type === "REAL_CLOUD_MODEL";
+                    return (
+                      <article className={`video-version-item ${isCurrent ? "is-current" : ""}`} key={job.id}>
+                        <div>
+                          <strong>{isReal ? "Wan 2.7 Cloud" : "Mock Video"}</strong>
+                          <span>{isReal ? "REAL" : "MOCK"} · Job {job.id.slice(0, 8)}</span>
+                          <span>
+                            {hasStaleLineage
+                              ? "基于旧关键帧"
+                              : isBasedOnCurrent
+                                ? "基于当前关键帧"
+                                : "关键帧关系待确认"}
+                            {job.created_at ? ` · ${formatCheckedAt(job.created_at)}` : ""}
+                          </span>
+                        </div>
+                        <div className="video-version-actions">
+                          <span className={`video-version-state ${hasStaleLineage ? "is-stale" : "is-ready"}`}>
+                            {hasStaleLineage ? "STALE" : "READY"}
+                          </span>
+                          <button
+                            className="button button-ghost"
+                            type="button"
+                            aria-pressed={isCurrent}
+                            disabled={isCurrent || busy !== null || generationInProgress}
+                            onClick={() => void persistVideoSelection(job.id)}
+                          >
+                            {isCurrent ? "当前版本" : "设为当前"}
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                {selectedFinalVideoJobId && (
+                  <button
+                    className="button button-ghost video-version-clear"
+                    type="button"
+                    disabled={busy !== null || generationInProgress}
+                    onClick={() => void persistVideoSelection("")}
+                  >
+                    清除当前动态版本
+                  </button>
+                )}
+              </section>
+            )}
+            <div className="composition-plan-grid">
+              {[
+                {
+                  mode: "IMAGE_ONLY" as const,
+                  title: "关键帧成片计划",
+                  description: "完全忽略所有 VIDEO_SHOT，使用当前关键帧与 FFmpeg 镜头运动。",
+                  button: "使用关键帧合成成片",
+                  plan: imageCompositionPlan,
+                },
+                {
+                  mode: "VIDEO_PREFERRED" as const,
+                  title: "动态镜头成片计划",
+                  description: "优先使用已有动态镜头；缺少视频的镜头继续使用关键帧。",
+                  button: "使用动态镜头合成成片",
+                  plan: videoCompositionPlan,
+                },
+              ].map((item) => {
+                const problem = item.plan?.problems[0];
+                const warning = item.plan?.warnings[0];
+                return (
+                  <article className="composition-plan" key={item.mode}>
+                    <header>
+                      <div>
+                        <h3>{item.title}</h3>
+                        <p>{item.description}</p>
+                      </div>
+                      <span className={`composition-state is-${item.plan?.status.toLowerCase() ?? "loading"}`}>
+                        {item.plan?.status ?? "读取中"}
+                      </span>
+                    </header>
+                    <ul>
+                      {item.plan?.shots.map((shot, index) => (
+                        <li key={shot.shot_id}>
+                          镜头{index + 1} · {shot.selected_type === "VIDEO_SHOT" ? `${shot.is_mock ? "MOCK" : "REAL"} · Video` : `Image · ${shot.provider_hint ?? shot.provider}`}
+                        </li>
+                      ))}
+                      {item.plan?.audio && (
+                        <li>
+                          音频 · {item.plan.audio.is_mock ? "MOCK" : "REAL"} · {item.plan.audio.provider}{item.plan.audio.speaker ? ` · ${item.plan.audio.speaker}` : ""}
+                        </li>
+                      )}
+                    </ul>
+                    {problem && (
+                      <p className="provider-warning">{String(problem.message ?? "当前计划无法唯一确定。")}</p>
+                    )}
+                    {warning && (
+                      <p className="composition-warning">{String(warning.message ?? "素材来源存在需要确认的警告。")}</p>
+                    )}
+                    {detail.latest_export && (
+                      <p className={`composition-freshness is-${item.plan?.freshness.toLowerCase() ?? "outdated"}`}>
+                        {item.plan?.freshness_reason ?? "无法确认当前成片来源快照。"}
+                      </p>
+                    )}
+                    <button
+                      className="button button-primary"
+                      type="button"
+                      onClick={() => void startSmartMediaRender(item.mode, item.plan)}
+                      disabled={
+                        busy !== null ||
+                        generationInProgress ||
+                        item.plan?.status !== "READY" ||
+                        (backgroundAudioEnabled && !backgroundAudio)
+                      }
+                    >
+                      {busy === `smart-media-render-${item.mode}` ? "正在冻结来源快照…" : item.button}
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+            <p className="composition-note">
+              高级来源设置仍保留在上方，用于指定特定关键帧或 Video Job；两个主按钮不会调用 VideoProvider。
+            </p>
+          </section>
+        )}
+
         {detail?.latest_export && media && (
           <section
             className="section result-section is-ready"
@@ -3459,7 +4132,7 @@ export default function App() {
             tabIndex={-1}
           >
             <div className="section-heading light compact">
-              <span className="section-number">04</span>
+              <span className="section-number">05</span>
               <div>
                 <p className="eyebrow">播放与下载</p>
                 <h2 ref={resultTitleRef} tabIndex={-1}>
@@ -3471,6 +4144,16 @@ export default function App() {
                 </h2>
               </div>
             </div>
+            {!currentCompositionMode && (
+              <p className="previous-export-notice">
+                已有成片，但当前素材来源快照已经变化；下方旧成片仍可播放和下载，需要重新合成后才会标记为最新。
+              </p>
+            )}
+            {currentCompositionMode === "关键帧版" && dynamicPlanNeedsRecompose && (
+              <p className="previous-export-notice">
+                当前关键帧版成片仍然有效，但已有动态镜头尚未合入；如需视频增强版，请使用“使用动态镜头合成成片”。
+              </p>
+            )}
             {imageGenerationInProgress && !exportIsRealImage && (
               <p className="previous-export-notice">
                 下方仍是上一版 Mock 视觉成片；新的真实动漫画面尚未完成，不会提前标记为真实模型输出。

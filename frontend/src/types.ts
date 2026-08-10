@@ -150,6 +150,10 @@ export interface GenerationRequestSnapshot {
   reuse_script_from_job_id?: string;
   image_provider?: ImageProviderId;
   source_image_job_id?: string;
+  source_image_asset_id?: string;
+  source_image_asset_ids?: Record<string, string>;
+  source_video_job_id?: string;
+  source_video_asset_ids?: Record<string, string>;
   source_audio_job_id?: string;
   parent_job_id?: string;
   audio_provider?: AudioProviderId;
@@ -265,6 +269,7 @@ export interface GeneratedImageShot {
   model_id?: string;
   image_url?: string;
   image_path?: string;
+  image_asset_id?: string;
   width?: number;
   height?: number;
   seed?: number;
@@ -313,6 +318,9 @@ export interface GeneratedVideoShot {
   video_path?: string;
   video_url?: string;
   video_asset_id?: string;
+  source_image_asset_id?: string;
+  source_image_provider_id?: string;
+  source_image_source_type?: string;
   duration_seconds?: number;
   width?: number;
   height?: number;
@@ -398,6 +406,8 @@ export interface GenerationResult {
   source_script_job_id?: string;
   source_image_job_id?: string;
   source_audio_job_id?: string;
+  source_video_job_id?: string;
+  source_video_asset_ids?: Record<string, string>;
   parent_job_id?: string;
   audio_provider?: string;
   audio_model_id?: string;
@@ -452,6 +462,38 @@ export interface Project {
   updated_at?: string;
 }
 
+export type ExternalImageSourceType = "AI_GENERATED" | "HUMAN_CREATED" | "OTHER";
+
+export interface ExternalImagePromptBundle {
+  shot_id: string;
+  shot_title: string;
+  adapter: "external-natural-language-v1";
+  prompt: string;
+  source_fields: Record<string, unknown>;
+  lineage: Record<string, unknown>;
+}
+
+export interface ImageAssetRecord {
+  asset_id: string;
+  project_id: string;
+  shot_id: string | null;
+  database_shot_id: string | null;
+  asset_type: "KEYFRAME_IMAGE";
+  provider_id: string;
+  source_type: string;
+  generation_mode?: string | null;
+  external_source_type?: ExternalImageSourceType | string | null;
+  provider_hint?: string | null;
+  original_filename?: string | null;
+  sha256: string;
+  width?: number | null;
+  height?: number | null;
+  size_bytes?: number | null;
+  imported_at?: string | null;
+  exported_prompt?: ExternalImagePromptBundle | null;
+  image_url: string;
+}
+
 export interface Shot {
   id: string;
   project_id: string;
@@ -496,9 +538,58 @@ export interface ExportRecord {
   created_at?: string;
 }
 
+export interface VisualSelection {
+  source_image_asset_ids: Record<string, string>;
+  source_video_job_id: string | null;
+}
+
+export interface BestMediaVisualSelection {
+  shot_id: string;
+  selected_type: "VIDEO_SHOT" | "IMAGE" | "LEGACY_IMAGE";
+  asset_id: string | null;
+  source_job_id: string | null;
+  provider: string;
+  provider_hint: string | null;
+  source_type: string;
+  is_mock: boolean;
+  priority_class: string;
+  selection_reason: string;
+  source_image_asset_id: string | null;
+}
+
+export interface BestMediaAudioSelection {
+  job_id: string;
+  provider: string;
+  source_type: string;
+  is_mock: boolean;
+  source_script_job_id: string | null;
+  source_image_job_id: string | null;
+  speaker: string | null;
+  reason: string;
+}
+
+export interface BestMediaPlan {
+  mode: CompositionMode | "BEST_AVAILABLE";
+  status: "READY" | "AMBIGUOUS" | "BLOCKED";
+  priority: string[];
+  shots: BestMediaVisualSelection[];
+  audio: BestMediaAudioSelection | null;
+  problems: Array<Record<string, unknown>>;
+  warnings: Array<Record<string, unknown>>;
+  available_image_shot_count: number;
+  available_video_shot_count: number;
+  freshness: "NO_EXPORT" | "CURRENT" | "OUTDATED";
+  freshness_reason: string;
+}
+
+export type CompositionMode = "IMAGE_ONLY" | "VIDEO_PREFERRED";
+
 export interface ProjectDetail {
   project: Project;
   shots: Shot[];
   recent_jobs: GenerationJob[];
+  video_jobs: GenerationJob[];
   latest_export: ExportRecord | null;
+  image_assets: ImageAssetRecord[];
+  visual_selection: VisualSelection;
 }

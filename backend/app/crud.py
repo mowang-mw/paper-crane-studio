@@ -113,6 +113,16 @@ def recent_jobs(session: Session, project_id: str, *, limit: int = 10) -> list[G
     )
 
 
+def list_jobs(session: Session, project_id: str) -> list[GenerationJob]:
+    """Return every project job for deterministic source resolution, without a latest pick."""
+
+    return list(
+        session.scalars(
+            select(GenerationJob).where(GenerationJob.project_id == project_id)
+        ).all()
+    )
+
+
 def claim_next_queued_job(session: Session) -> GenerationJob | None:
     """领取最早 QUEUED 任务；M2 明确只支持一个 Worker。"""
 
@@ -279,6 +289,25 @@ def get_export(session: Session, export_id: str) -> Export | None:
 
 def get_asset(session: Session, asset_id: str) -> Asset | None:
     return session.get(Asset, asset_id)
+
+
+def list_image_assets(session: Session, project_id: str) -> list[Asset]:
+    return list(
+        session.scalars(
+            select(Asset)
+            .where(
+                Asset.project_id == project_id,
+                Asset.asset_type == "KEYFRAME_IMAGE",
+            )
+            .order_by(Asset.created_at.asc())
+        ).all()
+    )
+
+
+def list_assets(session: Session, project_id: str) -> list[Asset]:
+    return list(
+        session.scalars(select(Asset).where(Asset.project_id == project_id)).all()
+    )
 
 
 def latest_export(session: Session, project_id: str) -> Export | None:

@@ -384,10 +384,16 @@ def test_media_only_rerender_reuses_sources_without_provider_calls(
     assert completed["result_json"]["script_provider_calls"] == 0
     assert completed["result_json"]["image_provider_calls"] == 0
     assert completed["result_json"]["audio_provider_calls"] == 0
+    assert completed["result_json"]["video_provider_calls"] == 0
     assert captured["motion_preset"] == "cinematic_pan"
     assert captured["background_audio"]["volume"] == 0.18
     assert all(Path(item["image_path"]).is_absolute() for item in captured["keyframes"])
     assert all(Path(item["audio_path"]).is_absolute() for item in captured["audio_assets"])
+    assert all(
+        item["selection_reason"] == "LEGACY_IMAGE_JOB_FALLBACK"
+        and item["visual_source_type"] == "IMAGE"
+        for item in captured["visual_sources"]
+    )
     manifest_path = (
         Path(settings.data_dir) / completed["result_json"]["manifest_path"]
     ).resolve()
