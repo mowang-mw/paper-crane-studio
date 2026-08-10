@@ -658,6 +658,9 @@ def _normalize_project_shots(
 
 
 _REAL_IMAGE_SOURCE_TYPE = "REAL_LOCAL_MODEL"
+_EXTERNAL_IMAGE_PROVIDER_ID = "external-import"
+_EXTERNAL_IMAGE_SOURCE_TYPE = "EXTERNAL_IMPORT"
+_EXTERNAL_IMAGE_GENERATION_MODE = "HUMAN_IN_THE_LOOP"
 _REAL_AUDIO_SOURCE_TYPE = "REAL_LOCAL_TTS"
 _AUDIO_LEAD_IN_SECONDS = 0.20
 _AUDIO_LEAD_OUT_SECONDS = 0.35
@@ -682,44 +685,96 @@ def _validate_real_keyframes(
     shots: list[dict[str, Any]],
     keyframes: list[dict[str, Any]],
     command_log: list[str],
+    required_shot_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """校验真实图片与追溯字段；真实入口不允许缺图或混入 Mock。"""
+    """按实际图片来源校验关键帧；VIDEO_SHOT 的首帧仅保留为血缘。"""
 
-    if len(keyframes) != len(shots):
+    expected_ids = [str(shot["shot_id"]) for shot in shots]
+    required_ids = (
+        set(expected_ids) if required_shot_ids is None else set(required_shot_ids)
+    )
+    if not required_ids <= set(expected_ids):
+        raise MediaToolError("真实图片入口要求了 ScriptV1 之外的镜头")
+    if required_ids == set(expected_ids) and len(keyframes) != len(shots):
         raise MediaToolError(
             "真实图片镜头数必须与剧本镜头数一致："
             f"剧本 {len(shots)}，图片 {len(keyframes)}"
         )
-
-    expected_ids = [str(shot["shot_id"]) for shot in shots]
     by_shot: dict[str, dict[str, Any]] = {}
-    provider_ids: set[str] = set()
-    model_ids: set[str] = set()
+    observed_ids: set[str] = set()
+    local_provider_ids: set[str] = set()
+    local_model_ids: set[str] = set()
     for position, original in enumerate(keyframes, start=1):
         if not isinstance(original, dict):
             raise MediaToolError(f"第 {position} 个真实关键帧结果必须是对象")
         keyframe = dict(original)
         shot_id = _required_keyframe_text(keyframe, "shot_id", shot_id=f"#{position}")
-        if shot_id in by_shot:
+        if shot_id in observed_ids:
             raise MediaToolError(f"真实关键帧 shot_id 重复：{shot_id}")
         if shot_id not in expected_ids:
             raise MediaToolError(f"真实关键帧引用未知镜头：{shot_id}")
+        observed_ids.add(shot_id)
+        if shot_id not in required_ids:
+            continue
 
         provider_id = _required_keyframe_text(
             keyframe, "provider_id", shot_id=shot_id
         )
         if provider_id.lower() == "mock":
             raise MediaToolError(f"真实图片入口禁止使用 Mock 关键帧：{shot_id}")
-        model_id = _required_keyframe_text(keyframe, "model_id", shot_id=shot_id)
-        source_type = str(keyframe.get("source_type", _REAL_IMAGE_SOURCE_TYPE)).strip()
-        if source_type != _REAL_IMAGE_SOURCE_TYPE:
+        source_type = str(
+            keyframe.get("source_type", _REAL_IMAGE_SOURCE_TYPE)
+        ).strip()
+        if not source_type:
             raise MediaToolError(
-                f"真实关键帧 {shot_id} source_type 必须为 {_REAL_IMAGE_SOURCE_TYPE}"
+                f"真实关键帧 {shot_id} 缺少非空字段 source_type"
             )
-
-        seed = keyframe.get("seed")
-        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-            raise MediaToolError(f"真实关键帧 {shot_id} seed 必须是非负整数")
+        is_local_model = source_type == _REAL_IMAGE_SOURCE_TYPE
+        is_external_import = source_type == _EXTERNAL_IMAGE_SOURCE_TYPE
+        if not is_local_model and not is_external_import:
+            raise MediaToolError(
+                f"真实关键帧 {shot_id} source_type 不受支持：{source_type}"
+            )
+        model_id: str | None = None
+        seed: int | None = None
+        if is_local_model:
+            model_id = _required_keyframe_text(
+                keyframe, "model_id", shot_id=shot_id
+            )
+            seed = keyframe.get("seed")
+            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                raise MediaToolError(f"真实关键帧 {shot_id} seed 必须是非负整数")
+            local_provider_ids.add(provider_id)
+            local_model_ids.add(model_id)
+        else:
+            if provider_id != _EXTERNAL_IMAGE_PROVIDER_ID:
+                raise MediaToolError(
+                    f"外部关键帧 {shot_id} provider_id 必须为 "
+                    f"{_EXTERNAL_IMAGE_PROVIDER_ID}"
+                )
+            generation_mode = _required_keyframe_text(
+                keyframe, "generation_mode", shot_id=shot_id
+            )
+            if generation_mode != _EXTERNAL_IMAGE_GENERATION_MODE:
+                raise MediaToolError(f"外部关键帧 {shot_id} 导入模式追溯无效")
+            external_source_type = _required_keyframe_text(
+                keyframe, "external_source_type", shot_id=shot_id
+            )
+            if external_source_type not in {
+                "AI_GENERATED",
+                "HUMAN_CREATED",
+                "OTHER",
+            }:
+                raise MediaToolError(f"外部关键帧 {shot_id} 来源类型追溯无效")
+            for field in ("original_filename", "imported_at"):
+                _required_keyframe_text(keyframe, field, shot_id=shot_id)
+            provider_hint = keyframe.get("provider_hint")
+            if provider_hint is not None and (
+                not isinstance(provider_hint, str) or not provider_hint.strip()
+            ):
+                raise MediaToolError(
+                    f"外部关键帧 {shot_id} provider_hint 追溯无效"
+                )
         width = keyframe.get("width")
         height = keyframe.get("height")
         if (
@@ -736,8 +791,9 @@ def _validate_real_keyframes(
         image_path = Path(image_value).expanduser().resolve()
         if not image_path.is_file() or image_path.stat().st_size <= 0:
             raise MediaToolError(f"真实关键帧不存在或为空：{image_path}")
-        if image_path.suffix.lower() != ".png":
-            raise MediaToolError(f"真实关键帧必须是 PNG：{image_path}")
+        allowed_suffixes = {".png"} if is_local_model else {".png", ".jpg", ".jpeg"}
+        if image_path.suffix.lower() not in allowed_suffixes:
+            raise MediaToolError(f"真实关键帧格式不受支持：{image_path}")
         expected_sha256 = _required_keyframe_text(
             keyframe, "image_sha256", shot_id=shot_id
         ).lower()
@@ -757,8 +813,9 @@ def _validate_real_keyframes(
             if isinstance(streams, list)
             else []
         )
-        if len(videos) != 1 or videos[0].get("codec_name") != "png":
-            raise MediaToolError(f"真实关键帧 {shot_id} 不是可识别的单流 PNG")
+        expected_codec = "png" if image_path.suffix.lower() == ".png" else "mjpeg"
+        if len(videos) != 1 or videos[0].get("codec_name") != expected_codec:
+            raise MediaToolError(f"真实关键帧 {shot_id} 不是可识别的单流图片")
         actual_size = (videos[0].get("width"), videos[0].get("height"))
         if actual_size != (width, height):
             raise MediaToolError(
@@ -789,15 +846,16 @@ def _validate_real_keyframes(
             {
                 "shot_id": shot_id,
                 "provider_id": provider_id,
-                "model_id": model_id,
                 "source_type": source_type,
-                "seed": seed,
                 "width": width,
                 "height": height,
                 "image_path": str(image_path),
                 "image_sha256": actual_sha256,
             }
         )
+        if is_local_model:
+            keyframe["model_id"] = model_id
+            keyframe["seed"] = seed
         warnings = keyframe.get("warnings", [])
         if not isinstance(warnings, list) or not all(
             isinstance(item, str) for item in warnings
@@ -805,16 +863,18 @@ def _validate_real_keyframes(
             raise MediaToolError(f"真实关键帧 {shot_id} warnings 必须是字符串数组")
         keyframe["warnings"] = list(warnings)
         by_shot[shot_id] = keyframe
-        provider_ids.add(provider_id)
-        model_ids.add(model_id)
 
-    missing = [shot_id for shot_id in expected_ids if shot_id not in by_shot]
+    missing = [
+        shot_id
+        for shot_id in expected_ids
+        if shot_id in required_ids and shot_id not in by_shot
+    ]
     if missing:
         raise MediaToolError(f"真实图片入口缺少镜头关键帧：{missing}")
-    if len(provider_ids) != 1 or len(model_ids) != 1:
+    if len(local_provider_ids) > 1 or len(local_model_ids) > 1:
         raise MediaToolError(
             "同一真实图片导出不得混用多个 ImageProvider 或模型："
-            f"providers={sorted(provider_ids)}, models={sorted(model_ids)}"
+            f"providers={sorted(local_provider_ids)}, models={sorted(local_model_ids)}"
         )
     return by_shot
 
@@ -2333,17 +2393,17 @@ def render_real_audio_project_short(
         raise MediaToolError(f"timing_plan_path 不存在：{resolved_timing_plan_path}")
     if not 3 <= len(shots) <= 5:
         raise MediaToolError(f"真实旁白短片必须包含 3—5 个镜头，实际 {len(shots)}")
-    if not keyframes:
+    if not keyframes and visual_sources is None:
         raise MediaToolError("真实旁白短片缺少复用的真实 PNG")
 
     normalized_keyframes = [
         _trace_mapping(item, label=f"第 {index} 个真实关键帧")
         for index, item in enumerate(keyframes, start=1)
     ]
-    image_provider_id = _required_trace_text(
-        normalized_keyframes[0],
-        "provider_id",
-        label="第 1 个真实关键帧",
+    image_provider_id = (
+        str(normalized_keyframes[0].get("provider_id") or "selected-visuals")
+        if normalized_keyframes
+        else "selected-visuals"
     )
     normalized_shots = _normalize_project_shots(
         shots,
@@ -2364,22 +2424,64 @@ def render_real_audio_project_short(
         raise MediaToolError("output_filename 必须是当前目录下的 .mp4 文件名")
 
     command_log: list[str] = []
-    keyframes_by_shot = _validate_real_keyframes(
-        tools=tools,
-        shots=normalized_shots,
-        keyframes=normalized_keyframes,
-        command_log=command_log,
-    )
-    visual_sources_by_shot = _normalize_final_visual_sources(
-        tools=tools,
-        shots=normalized_shots,
-        keyframes_by_shot=keyframes_by_shot,
-        visual_sources=visual_sources,
-        command_log=command_log,
-    )
-    actual_image_provider_id = next(iter(keyframes_by_shot.values()))["provider_id"]
-    if actual_image_provider_id.lower() == "mock":
+    if visual_sources is None:
+        keyframes_by_shot = _validate_real_keyframes(
+            tools=tools,
+            shots=normalized_shots,
+            keyframes=normalized_keyframes,
+            command_log=command_log,
+        )
+        visual_sources_by_shot = _normalize_final_visual_sources(
+            tools=tools,
+            shots=normalized_shots,
+            keyframes_by_shot=keyframes_by_shot,
+            visual_sources=None,
+            command_log=command_log,
+        )
+    else:
+        # 先确定最终逐镜头视觉源。VIDEO_SHOT 的 source image 只属于血缘，
+        # 不得再被套用本地 ImageProvider 的 model_id/seed 合同。
+        visual_sources_by_shot = _normalize_final_visual_sources(
+            tools=tools,
+            shots=normalized_shots,
+            keyframes_by_shot={},
+            visual_sources=visual_sources,
+            command_log=command_log,
+        )
+        image_shot_ids = {
+            shot_id
+            for shot_id, source in visual_sources_by_shot.items()
+            if source["visual_source_type"] == "IMAGE"
+        }
+        keyframes_by_shot = _validate_real_keyframes(
+            tools=tools,
+            shots=normalized_shots,
+            keyframes=normalized_keyframes,
+            command_log=command_log,
+            required_shot_ids=image_shot_ids,
+        )
+    actual_image_provider_ids = {
+        str(source["source_provider"])
+        for source in visual_sources_by_shot.values()
+        if source["visual_source_type"] == "IMAGE"
+    }
+    actual_image_source_types = {
+        str(source["source_type"])
+        for source in visual_sources_by_shot.values()
+        if source["visual_source_type"] == "IMAGE"
+    }
+    if any(value.lower() == "mock" for value in actual_image_provider_ids):
         raise MediaToolError("真实旁白短片禁止复用 Mock 图片")
+    actual_image_provider_id = (
+        next(iter(actual_image_provider_ids))
+        if len(actual_image_provider_ids) == 1
+        else None
+    )
+    actual_image_source_type = (
+        next(iter(actual_image_source_types))
+        if len(actual_image_source_types) == 1
+        else ("MIXED_SELECTED_IMAGE_ASSETS" if actual_image_source_types else None)
+    )
     for shot in normalized_shots:
         source = visual_sources_by_shot[str(shot["shot_id"])]
         shot["provider_id"] = source["source_provider"]
@@ -2680,6 +2782,9 @@ def render_real_audio_project_short(
                 "source_provider": visual_source["source_provider"],
                 "source_type": visual_source["source_type"],
                 "source_video_job_id": visual_source.get("source_video_job_id"),
+                "source_image_asset_id": visual_source.get(
+                    "source_image_asset_id"
+                ),
                 "source_video_duration_seconds": visual_source.get(
                     "source_duration_seconds"
                 ),
@@ -2737,7 +2842,12 @@ def render_real_audio_project_short(
     configured_image_provider = provider_trace.get("image_provider")
     if (
         configured_image_provider is not None
-        and str(configured_image_provider) != actual_image_provider_id
+        and actual_image_provider_id is not None
+        and str(configured_image_provider) not in {
+            actual_image_provider_id,
+            "reused",
+            "selected-assets",
+        }
     ):
         raise MediaToolError(
             "generation_context.providers.image_provider 与复用关键帧 Provider 不一致"
@@ -2753,7 +2863,8 @@ def render_real_audio_project_short(
     provider_trace.update(
         {
             "image_provider": actual_image_provider_id,
-            "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+            "image_providers": sorted(actual_image_provider_ids),
+            "image_source_type": actual_image_source_type,
             "audio_provider": provider_id,
             "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
             "video_source_type": media_video_source_type,
@@ -2841,7 +2952,8 @@ def render_real_audio_project_short(
             "source_type": media_video_source_type,
             "script_provider": script_provider,
             "image_provider": actual_image_provider_id,
-            "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+            "image_providers": sorted(actual_image_provider_ids),
+            "image_source_type": actual_image_source_type,
             "audio_provider": provider_id,
             "audio_source_type": _REAL_AUDIO_SOURCE_TYPE,
             "video_source_type": media_video_source_type,

@@ -1,8 +1,9 @@
-"""Deterministically select existing media by provenance, never by recency."""
+"""Deterministically select existing media by provenance and stable recency."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 from ..models import Asset, GenerationJob, JobStatus, Shot as DatabaseShot
@@ -66,7 +67,11 @@ def _pick_same_class(
     return None, []
 
 
-def _audio_candidates(jobs: list[GenerationJob], shot_ids: set[str]) -> list[dict[str, Any]]:
+def _audio_candidates(
+    jobs: list[GenerationJob],
+    shot_ids: set[str],
+    compatible_script_job_ids: set[str],
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for job in jobs:
         if job.status != JobStatus.SUCCEEDED:
@@ -74,15 +79,42 @@ def _audio_candidates(jobs: list[GenerationJob], shot_ids: set[str]) -> list[dic
         result = job.result_json if isinstance(job.result_json, dict) else {}
         if job.job_type == REAL_AUDIO_JOB_TYPE:
             raw = result.get("audio_shots")
+            audio_by_shot = {
+                str(item.get("shot_id")): item
+                for item in raw
+                if isinstance(item, dict) and item.get("shot_id")
+            } if isinstance(raw, list) else {}
+            timing = result.get("timing_plan")
+            timing_shots = timing.get("shots") if isinstance(timing, dict) else None
             complete_audio = (
-                isinstance(raw, list)
-                and {str(item.get("shot_id")) for item in raw if isinstance(item, dict)}
-                == shot_ids
-                and isinstance(result.get("timing_plan"), dict)
+                set(audio_by_shot) == shot_ids
+                and all(
+                    item.get("status") in {"SUCCEEDED", "REUSED"}
+                    and isinstance(item.get("audio_path"), str)
+                    and bool(item["audio_path"])
+                    and isinstance(item.get("audio_sha256"), str)
+                    and len(item["audio_sha256"]) == 64
+                    and isinstance(item.get("duration_seconds"), (int, float))
+                    and float(item["duration_seconds"]) > 0
+                    for item in audio_by_shot.values()
+                )
+                and isinstance(timing_shots, list)
+                and {
+                    str(item.get("shot_id"))
+                    for item in timing_shots
+                    if isinstance(item, dict)
+                } == shot_ids
             )
+            source_script_job_id = result.get("source_script_job_id") or (
+                job.request_json.get("source_script_job_id")
+                if isinstance(job.request_json, dict)
+                else None
+            )
+            has_compatible_script = str(source_script_job_id) in compatible_script_job_ids
             if (
                 result.get("mock_audio_fallback") is False
                 and complete_audio
+                and has_compatible_script
             ):
                 candidates.append(
                     {
@@ -90,13 +122,17 @@ def _audio_candidates(jobs: list[GenerationJob], shot_ids: set[str]) -> list[dic
                         "provider": job.provider_id,
                         "source_type": str(result.get("audio_source_type") or "REAL_LOCAL_MODEL"),
                         "is_mock": False,
-                        "source_script_job_id": result.get("source_script_job_id"),
+                        "source_script_job_id": source_script_job_id,
                         "source_image_job_id": result.get("source_image_job_id"),
                         "speaker": result.get("speaker"),
-                        "reason": "NON_MOCK Audio Job preferred over available Mock audio",
+                        "reason": "默认使用最新成功且兼容当前剧本的真实旁白",
                     }
                 )
-            elif result.get("mock_audio_fallback") is True and complete_audio:
+            elif (
+                result.get("mock_audio_fallback") is True
+                and complete_audio
+                and has_compatible_script
+            ):
                 candidates.append(
                     {
                         "job_id": job.id,
@@ -105,52 +141,47 @@ def _audio_candidates(jobs: list[GenerationJob], shot_ids: set[str]) -> list[dic
                             result.get("audio_source_type") or "DETERMINISTIC_FALLBACK"
                         ),
                         "is_mock": True,
-                        "source_script_job_id": result.get("source_script_job_id"),
+                        "source_script_job_id": source_script_job_id,
                         "source_image_job_id": result.get("source_image_job_id"),
                         "speaker": result.get("speaker"),
-                        "reason": "Only existing Mock Audio Job is available",
+                        "reason": "默认使用最新成功且兼容当前剧本的 Mock 旁白",
                     }
                 )
-            continue
-        source_type = str(result.get("source_type") or "")
-        if (
-            source_type.upper() in MOCK_SOURCE_TYPES
-            and str(result.get("audio_provider") or "").lower() == "mock"
-        ):
-            candidates.append(
-                {
-                    "job_id": job.id,
-                    "provider": "mock",
-                    "source_type": source_type,
-                    "is_mock": True,
-                    "source_script_job_id": job.id,
-                    "source_image_job_id": None,
-                    "speaker": None,
-                    "reason": "Only existing Mock Audio Job is available",
-                }
-            )
     return candidates
 
 
 def _resolve_audio(
-    jobs: list[GenerationJob], shot_ids: set[str], preferred_audio_job_id: str | None
+    jobs: list[GenerationJob],
+    shot_ids: set[str],
+    preferred_audio_job_id: str | None,
+    compatible_script_job_ids: set[str],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    candidates = _audio_candidates(jobs, shot_ids)
+    candidates = _audio_candidates(jobs, shot_ids, compatible_script_job_ids)
+    if preferred_audio_job_id:
+        explicit = [
+            item for item in candidates if item["job_id"] == preferred_audio_job_id
+        ]
+        if explicit:
+            return explicit[0], None
+
+    def recency(job: GenerationJob) -> tuple[float, str]:
+        value = job.finished_at or job.created_at
+        if not isinstance(value, datetime):
+            return float("-inf"), job.id
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.timestamp(), job.id
+
     for is_mock in (False, True):
         same_class = [item for item in candidates if item["is_mock"] is is_mock]
-        selected, ambiguous = _pick_same_class(
-            same_class,
-            explicit_id=preferred_audio_job_id,
-            explicit_field="job_id",
-        )
-        if selected is not None:
-            return selected, None
-        if ambiguous:
-            return None, {
-                "code": "AMBIGUOUS_AUDIO",
-                "message": "存在多个同等级 Audio Job，请在高级来源设置中选择。",
-                "candidates": ambiguous,
-            }
+        if same_class:
+            by_id = {item["job_id"]: item for item in same_class}
+            ordered = sorted(
+                (job for job in jobs if job.id in by_id),
+                key=recency,
+                reverse=True,
+            )
+            return by_id[ordered[0].id], None
     return None, {
         "code": "NO_AUDIO_JOB",
         "message": "当前没有可用于成片的 Audio Job，请先生成配音。",
@@ -164,6 +195,7 @@ def resolve_best_available_media(
     database_shots: Iterable[DatabaseShot],
     assets: Iterable[Asset],
     jobs: Iterable[GenerationJob],
+    compatible_script_job_ids: set[str],
     explicit_image_asset_ids: dict[str, str],
     explicit_video_job_id: str | None,
     preferred_audio_job_id: str | None = None,
@@ -177,7 +209,9 @@ def resolve_best_available_media(
     job_list = list(jobs)
     asset_list = list(assets)
     shot_ids = {shot.id for shot in script.shots}
-    audio, audio_problem = _resolve_audio(job_list, shot_ids, preferred_audio_job_id)
+    audio, audio_problem = _resolve_audio(
+        job_list, shot_ids, preferred_audio_job_id, compatible_script_job_ids
+    )
     preferred_legacy_job_id = (
         str(audio.get("source_image_job_id") or "") if audio is not None else ""
     )

@@ -466,6 +466,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--coral); box-shad
 .visual-planning-inspector { border: 1px solid var(--line); border-radius: 6px; background: #f7f9fb; }
 .visual-planning-inspector > summary { padding: 11px 13px; cursor: pointer; color: #344052; font-size: 11px; font-weight: 800; }
 .visual-planning-inspector[open] > summary { border-bottom: 1px solid var(--line); }
+.planning-override { display: grid; gap: 10px; }
+.planning-override label { display: grid; gap: 5px; color: #344052; font-size: 12px; font-weight: 700; }
+.planning-override textarea { width: 100%; resize: vertical; min-height: 76px; }
+.planning-override-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .planning-layer { padding: 12px 13px; }
 .planning-layer + .planning-layer { border-top: 1px dashed #d8dee8; }
 .planning-layer > strong, .planning-layer > small { display: block; }

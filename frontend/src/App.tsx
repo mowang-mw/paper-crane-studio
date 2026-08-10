@@ -30,12 +30,12 @@ import {
   renderRealAudio,
   renderRealImages,
   renderVideo,
-  rerenderMediaOnly,
   retryJob,
   smartRenderBestMedia,
   uploadBackgroundAudio,
   uploadExternalImage,
   updateVisualSelection,
+  updateShotPlanning,
 } from "./api";
 import type {
   AudioProviderStatus,
@@ -245,8 +245,7 @@ function jobSourceImageId(job: GenerationJob | null | undefined): string | null 
   if (!job) return null;
   return (
     textValue(job.result_json?.source_image_job_id) ??
-    textValue(job.request_json?.source_image_job_id) ??
-    textValue(job.request_json?.parent_job_id)
+    textValue(job.request_json?.source_image_job_id)
   );
 }
 
@@ -489,6 +488,9 @@ function shotCountLabel(value: DesiredShotCount | undefined): string {
 }
 
 function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): string {
+  if (job.job_type === "MEDIA_RERENDER") {
+    return "短片已生成。";
+  }
   if (isVideoJob(job)) {
     return "动态镜头已准备完成，当前最终成片尚未包含这些新素材。";
   }
@@ -497,14 +499,9 @@ function generationSuccessSummary(job: GenerationJob, fallbackActual?: number): 
     const total = jobAudioTotalCount(job, fallbackActual ?? 0);
     const speaker = jobAudioSpeaker(job) ?? "未报告音色";
     const elapsed = jobAudioGenerationSeconds(job);
-    const extension = jobAudioExtensionSeconds(job);
     const countText = total > 0 ? `${completed}/${total} 段` : `${completed} 段`;
     const elapsedText = elapsed === null ? "" : `，TTS 共 ${elapsed.toFixed(1)} 秒`;
-    const extensionText =
-      extension !== null && extension > 0.0005
-        ? `；为完整播放旁白，成片透明延长 ${extension.toFixed(2)} 秒`
-        : "";
-    return `真实 AI 旁白已完成 ${countText}（${speaker}）${elapsedText}${extensionText}，并已合成为可播放短片。`;
+    return `AI 旁白生成完成：${countText}（${speaker}）${elapsedText}。`;
   }
   if (isRealImageJob(job)) {
     const completed = jobImageCompletedCount(job);
@@ -1049,7 +1046,10 @@ function JobPanel({
             <div><dt>音色</dt><dd>{audioSpeaker ?? "未报告"}</dd></div>
             <div><dt>语言</dt><dd>{audioLanguage ?? "未报告"}</dd></div>
             <div><dt>TTS 总耗时</dt><dd>{audioElapsed === null ? "生成后报告" : `${audioElapsed.toFixed(1)} 秒`}</dd></div>
-            <div><dt>源图像 Job</dt><dd title={jobSourceImageId(job) ?? undefined}>{jobSourceImageId(job)?.slice(0, 8) ?? "未报告"}</dd></div>
+            <div><dt>源 Script Job</dt><dd title={jobSourceScriptId(job) ?? undefined}>{jobSourceScriptId(job)?.slice(0, 8) ?? "未报告"}</dd></div>
+            {jobSourceImageId(job) && (
+              <div><dt>兼容的源图像 Job</dt><dd title={jobSourceImageId(job) ?? undefined}>{jobSourceImageId(job)?.slice(0, 8)}</dd></div>
+            )}
             <div><dt>并发</dt><dd>1（同次加载、顺序生成）</dd></div>
           </>
         ) : imageJob ? (
@@ -1154,9 +1154,11 @@ function JobPanel({
       {job.status === "SUCCEEDED" && (
         <div className="success-box">
           <p>{generationSuccessSummary(job, actualShotCount)}</p>
-          <button className="button button-success" type="button" onClick={onViewResult}>
-            查看成片
-          </button>
+          {job.job_type === "MEDIA_RERENDER" && jobHasFinalMedia(job) && (
+            <button className="button button-success" type="button" onClick={onViewResult}>
+              查看成片
+            </button>
+          )}
         </div>
       )}
     </section>
@@ -1401,6 +1403,9 @@ export default function App() {
   const [externalPrompts, setExternalPrompts] = useState<
     Record<string, ExternalImagePromptBundle>
   >({});
+  const [shotPlanningDrafts, setShotPlanningDrafts] = useState<
+    Record<string, { keyframe: string; motion: string }>
+  >({});
   const [selectedVideoImageAssets, setSelectedVideoImageAssets] = useState<
     Record<string, string>
   >({});
@@ -1560,6 +1565,19 @@ export default function App() {
           .map((item) => [item.shot_id, item]),
       ),
     );
+    setShotPlanningDrafts(
+      Object.fromEntries(
+        promptResults
+          .filter((item): item is ExternalImagePromptBundle => item !== null)
+          .map((item) => [
+            item.shot_id,
+            {
+              keyframe: String(item.source_fields.visual_description ?? ""),
+              motion: String(item.source_fields.motion_description ?? ""),
+            },
+          ]),
+      ),
+    );
     const signal = summarizeProjectDetail(value);
     projectSignalsRef.current = { ...projectSignalsRef.current, [projectId]: signal };
     setProjectSignals(projectSignalsRef.current);
@@ -1676,7 +1694,7 @@ export default function App() {
                   action: "composition",
                   actionLabel: "前往成片合成",
                 });
-              } else if (jobHasFinalMedia(job)) {
+              } else if (job.job_type === "MEDIA_RERENDER" && jobHasFinalMedia(job)) {
                 pendingNavigationRef.current = "result";
                 setNotice({
                   kind: "success",
@@ -1935,7 +1953,7 @@ export default function App() {
   };
 
   const startRealAudioGeneration = async () => {
-    if (!selectedId || !sourceImageJob) return;
+    if (!selectedId || !scriptJob) return;
     setBusy("real-audio");
     setError("");
     setGenerationRequestError(null);
@@ -1945,7 +1963,8 @@ export default function App() {
     try {
       const job = await renderRealAudio(
         selectedId,
-        sourceImageJob.id,
+        scriptJob.id,
+        null,
         audioSpeaker,
         mediaPolishOptions,
         successfulVideoJob?.id ?? null,
@@ -2013,6 +2032,29 @@ export default function App() {
       });
     } catch (cause) {
       setError(`复制外部生成提示词失败：${readableError(cause)}`);
+    }
+  };
+
+  const saveShotPlanning = async (shotId: string, reset = false) => {
+    if (!selectedId) return;
+    const draft = shotPlanningDrafts[shotId];
+    if (!draft && !reset) return;
+    setBusy(`shot-planning-${shotId}`);
+    setError("");
+    try {
+      await updateShotPlanning(selectedId, shotId, {
+        keyframe_description: reset ? null : draft.keyframe,
+        motion_description: reset ? null : draft.motion,
+      });
+      await refreshDetail(selectedId);
+      setNotice({
+        kind: "success",
+        message: reset ? "已恢复原始 LLM 镜头规划。" : "制作层镜头规划已保存，后续任务将冻结有效值。",
+      });
+    } catch (cause) {
+      setError(`镜头规划保存失败：${readableError(cause)}`);
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -2100,41 +2142,6 @@ export default function App() {
     } catch (cause) {
       setError(`动态视频来源保存失败：${readableError(cause)}`);
       await refreshDetail(selectedId);
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const startMediaOnlyRerender = async () => {
-    if (!selectedId || !successfulRealAudioJob) return;
-    setBusy("media-rerender");
-    setError("");
-    setGenerationRequestError(null);
-    setImageRequestError(null);
-    setAudioRequestError(null);
-    setNotice(null);
-    try {
-      const job = await rerenderMediaOnly(
-        selectedId,
-        successfulRealAudioJob.id,
-        mediaPolishOptions,
-        successfulVideoJob?.id ?? null,
-        selectedVideoImageAssets,
-      );
-      setActiveJob({ ...job, project_id: job.project_id || selectedId });
-      await refreshDetail(selectedId);
-    } catch (cause) {
-      if (cause instanceof ApiError) {
-        const structured = generationErrorValue(cause.detail);
-        if (structured) {
-          setAudioRequestError(structured);
-          setError("");
-        } else {
-          setError(cause.message);
-        }
-      } else {
-        setError(readableError(cause));
-      }
     } finally {
       setBusy(null);
     }
@@ -2288,6 +2295,7 @@ export default function App() {
     ? detail?.recent_jobs.find((job) => job.id === referencedScriptJobId) ?? null
     : null;
   const scriptJob =
+    detail?.matching_script_job ??
     (referencedScriptJob?.status === "SUCCEEDED" ? referencedScriptJob : null) ??
     detail?.recent_jobs.find(
       (job) =>
@@ -2353,17 +2361,6 @@ export default function App() {
     latestJob: isVideoJob(latestVisibleJob) ? latestVisibleJob : null,
   });
   const generatedVideoShots = jobVideoShots(videoDisplayJob);
-  const finalMediaVideoShotIds = new Set(
-    jobVideoShots(successfulVideoJob).map((shot) => shot.shot_id),
-  );
-  const finalMediaVideoShotCount = scriptShots.filter((shot) => {
-    const shotId = shot.shot_id ?? shot.id;
-    return Boolean(shotId && finalMediaVideoShotIds.has(shotId));
-  }).length;
-  const finalMediaImageShotCount = Math.max(
-    0,
-    scriptShots.length - finalMediaVideoShotCount,
-  );
   const videoGenerationInProgress =
     isVideoJob(activeJob) &&
     (activeJob?.status === "QUEUED" || activeJob?.status === "RUNNING");
@@ -2372,14 +2369,6 @@ export default function App() {
     (isRealAudioJob(exportJob) ? exportJob : null) ??
     detail?.recent_jobs.find((job) => isRealAudioJob(job)) ??
     null;
-  const successfulRealAudioJob =
-    detail?.recent_jobs.find(
-      (job) =>
-        job.job_type === "GENERATE_REAL_AUDIO_VIDEO" &&
-        job.status === "SUCCEEDED" &&
-        job.result_json?.mock_audio_fallback === false &&
-        jobAudioShots(job).length === scriptShots.length,
-    ) ?? null;
   const generatedAudioShots = jobAudioShots(audioDisplayJob);
   const audioGenerationInProgress =
     isRealAudioJob(activeJob) &&
@@ -2520,7 +2509,7 @@ export default function App() {
             </a>
             <div className={`health-pill ${healthError ? "is-offline" : ""}`}>
               <span className="health-dot" />
-              {healthError ? "后端未连接" : `${textValue(health?.stage) ?? "M6"} · ${displayHealth(health)}`}
+              {healthError ? "后端未连接" : displayHealth(health)}
             </div>
           </div>
         </nav>
@@ -3411,8 +3400,8 @@ export default function App() {
             <section className="real-audio-control" aria-labelledby="real-audio-title">
               <div className="real-image-heading">
                 <div>
-                  <p className="eyebrow">M5-B · AUDIO PROVIDER</p>
-                  <h3 id="real-audio-title">为当前真实动漫画面生成 AI 旁白</h3>
+                  <p className="eyebrow">AUDIO PROVIDER</p>
+                  <h3 id="real-audio-title">使用当前剧本生成 AI 旁白</h3>
                 </div>
                 <span className={`audio-source-badge ${exportIsRealAudio ? "is-real" : "is-mock"}`}>
                   当前成片：{exportIsRealAudio ? "真实 AI 旁白" : "Mock 音频"}
@@ -3562,14 +3551,17 @@ export default function App() {
                 </span>
               </div>
               <dl className="real-image-facts">
-                <div><dt>真实画面来源</dt><dd>{sourceImageJob ? `Job ${sourceImageJob.id.slice(0, 8)}` : "没有可复用的成功 M4-B Job"}</dd></div>
+                <div><dt>视觉追溯</dt><dd>{sourceImageJob ? `兼容旧链路 Job ${sourceImageJob.id.slice(0, 8)}` : "由后续 Composition 选择决定"}</dd></div>
                 <div><dt>本次音色</dt><dd>{audioSpeaker}</dd></div>
                 <div><dt>旁白进度</dt><dd>{audioDisplayJob ? `${jobAudioCompletedCount(audioDisplayJob)}/${jobAudioTotalCount(audioDisplayJob, scriptShots.length)}` : `0/${scriptShots.length}`}</dd></div>
                 <div><dt>延长镜头</dt><dd>{audioDisplayJob ? `${audioExtendedShotCount} 个` : "生成后报告"}</dd></div>
                 <div><dt>TTS 总耗时</dt><dd>{jobAudioGenerationSeconds(audioDisplayJob)?.toFixed(1) ?? "生成后报告"}{jobAudioGenerationSeconds(audioDisplayJob) !== null ? " 秒" : ""}</dd></div>
               </dl>
-              {!sourceImageJob && (
-                <p className="provider-warning">请先完成一个真实 Animagine 画面 Job；真实旁白入口不会重新生成剧本或图片。</p>
+              {!scriptJob && (
+                <p className="provider-warning">请先完成并保留一个与当前 ScriptV1 对应的成功剧本 Job。</p>
+              )}
+              {scriptJob && scriptShots.some((shot) => !shot.narration?.trim()) && (
+                <p className="provider-warning">当前剧本存在空旁白镜头，无法提交真实 TTS。</p>
               )}
               {!realAudioProviderConfigured && (
                 <p className="provider-warning">真实 Audio Provider 尚未配置完整，请检查独立 Qwen3-TTS 环境与固定模型文件。</p>
@@ -3582,7 +3574,8 @@ export default function App() {
                   disabled={
                     busy !== null ||
                     generationInProgress ||
-                    !sourceImageJob ||
+                    !scriptJob ||
+                    scriptShots.some((shot) => !shot.narration?.trim()) ||
                     gpuHandoffRequired ||
                     (backgroundAudioEnabled && !backgroundAudio) ||
                     !realAudioProviderConfigured
@@ -3594,25 +3587,16 @@ export default function App() {
                       ? `正在生成旁白 ${jobAudioCompletedCount(activeJob)}/${jobAudioTotalCount(activeJob, scriptShots.length)}`
                       : gpuHandoffRequired
                         ? "请先释放 GPU"
-                        : "为当前真实动漫画面生成AI旁白"}
+                        : "生成 AI 旁白"}
                 </button>
                 <button
                   className="button button-ghost"
                   type="button"
-                  onClick={() => void startMediaOnlyRerender()}
-                  disabled={
-                    busy !== null ||
-                    generationInProgress ||
-                    !successfulRealAudioJob ||
-                    (backgroundAudioEnabled && !backgroundAudio)
-                  }
+                  onClick={scrollToComposition}
+                  disabled={busy !== null || generationInProgress}
                   aria-describedby="media-rerender-note"
                 >
-                  {busy === "media-rerender"
-                    ? "正在提交媒体合成任务…"
-                    : activeJob?.job_type === "MEDIA_RERENDER" && generationInProgress
-                      ? `正在合成成片 ${activeJob.progress}%`
-                      : "仅重新合成成片"}
+                  前往成片合成
                 </button>
                 <button
                   className="button button-ghost"
@@ -3624,9 +3608,7 @@ export default function App() {
                 </button>
               </div>
               <p id="media-rerender-note" className="media-rerender-note">
-                {successfulRealAudioJob
-                  ? `复用已有素材，不重新运行任何模型。视觉来源：${finalMediaImageShotCount} 个关键帧，${finalMediaVideoShotCount} 个动态视频镜头。`
-                  : "需要一个成功且素材完整的真实旁白 Job，才可仅重新合成成片。"}
+                请在下方成片合成区域选择 IMAGE_ONLY 或 VIDEO_PREFERRED 后提交；这里不会创建任务。
               </p>
               {audioRequestError && (
                 <FailureCard
@@ -3657,6 +3639,9 @@ export default function App() {
                   );
                   const externalPrompt = sourceShotId
                     ? externalPrompts[sourceShotId]
+                    : undefined;
+                  const planningDraft = sourceShotId
+                    ? shotPlanningDrafts[sourceShotId]
                     : undefined;
                   const externalSourceType = sourceShotId
                     ? externalSourceTypes[sourceShotId] ?? "AI_GENERATED"
@@ -3795,8 +3780,53 @@ export default function App() {
                                   <div><dt>Camera</dt><dd>{shot.camera ?? shot.camera_motion ?? "未提供"}</dd></div>
                                 </dl>
                               </div>
+                              {planningDraft && (
+                                <div className="planning-layer planning-override">
+                                  <strong>③ 制作层校正（不覆盖原始 ScriptV1）</strong>
+                                  <label>
+                                    静态首帧描述
+                                    <textarea
+                                      rows={4}
+                                      value={planningDraft.keyframe}
+                                      onChange={(event) => setShotPlanningDrafts((current) => ({
+                                        ...current,
+                                        [sourceShotId]: { ...planningDraft, keyframe: event.target.value },
+                                      }))}
+                                    />
+                                  </label>
+                                  <label>
+                                    后续运动描述
+                                    <textarea
+                                      rows={4}
+                                      value={planningDraft.motion}
+                                      onChange={(event) => setShotPlanningDrafts((current) => ({
+                                        ...current,
+                                        [sourceShotId]: { ...planningDraft, motion: event.target.value },
+                                      }))}
+                                    />
+                                  </label>
+                                  <div className="planning-override-actions">
+                                    <button
+                                      className="button button-primary button-small"
+                                      type="button"
+                                      disabled={busy !== null}
+                                      onClick={() => void saveShotPlanning(sourceShotId)}
+                                    >
+                                      {busy === `shot-planning-${sourceShotId}` ? "保存中…" : "保存制作校正"}
+                                    </button>
+                                    <button
+                                      className="button button-ghost button-small"
+                                      type="button"
+                                      disabled={busy !== null}
+                                      onClick={() => void saveShotPlanning(sourceShotId, true)}
+                                    >
+                                      恢复原始规划
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
                               <div className="planning-layer">
-                                <strong>③ 外部生成提示词</strong>
+                                <strong>④ 外部生成提示词</strong>
                                 {externalPrompt ? (
                                   <>
                                     <small>{externalPrompt.adapter} · selected Shot {externalPrompt.shot_id}</small>
@@ -3963,7 +3993,7 @@ export default function App() {
               <span className="section-number">04</span>
               <div>
                 <p className="eyebrow">成片合成</p>
-                <h2 id="composition-title">明确选择这一版成片使用什么视觉素材</h2>
+                <h2 id="composition-title">选择本次成片的视觉来源</h2>
               </div>
             </div>
             <div className="composition-summary-grid">
@@ -3976,6 +4006,9 @@ export default function App() {
                     ? `${compositionAudio.is_mock ? "MOCK" : "REAL"} · ${compositionAudio.provider}${compositionAudio.speaker ? ` · ${compositionAudio.speaker}` : ""}`
                     : "尚无兼容 Audio Job"}
                 </strong>
+                {compositionAudio && (
+                  <small>Job {compositionAudio.job_id.slice(0, 8)} · 默认使用最新成功旁白</small>
+                )}
               </div>
               <div>
                 <small>当前成片状态</small>
@@ -4280,7 +4313,9 @@ export default function App() {
                 : "正在生成短片"}
               {` · ${Math.max(0, Math.min(100, Math.round(latestVisibleJob.progress)))}%`}
             </span>
-          ) : latestVisibleJob.status === "SUCCEEDED" && media ? (
+          ) : latestVisibleJob.status === "SUCCEEDED" && isRealAudioJob(latestVisibleJob) && !jobHasFinalMedia(latestVisibleJob) ? (
+            <span>旁白已生成</span>
+          ) : latestVisibleJob.status === "SUCCEEDED" && latestVisibleJob.job_type === "MEDIA_RERENDER" && jobHasFinalMedia(latestVisibleJob) && media ? (
             <>
               <span>短片已生成</span>
               <button type="button" onClick={() => scrollToSection("result")}>查看成片</button>
@@ -4295,7 +4330,7 @@ export default function App() {
       )}
 
       <footer>
-        <span>纸鹤工坊 · M5-B 真实动漫旁白纵向链路</span>
+        <span>纸鹤工坊 · 本地 AI 动漫制作工作台</span>
         <span>Mock 始终可辨识；Qwen、ComfyUI 与 Qwen3-TTS 在 8GB 显存下分阶段运行</span>
       </footer>
     </div>

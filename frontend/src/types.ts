@@ -473,6 +473,17 @@ export interface ExternalImagePromptBundle {
   lineage: Record<string, unknown>;
 }
 
+export interface ShotPlanning {
+  shot_id: string;
+  title: string;
+  keyframe_description: string;
+  motion_description: string;
+  narration: string;
+  planning_source: "LLM" | "LLM_WITH_HUMAN_OVERRIDE";
+  override: Record<string, string>;
+  original: Record<string, string>;
+}
+
 export interface ImageAssetRecord {
   asset_id: string;
   project_id: string;
@@ -588,6 +599,7 @@ export interface ProjectDetail {
   project: Project;
   shots: Shot[];
   recent_jobs: GenerationJob[];
+  matching_script_job: GenerationJob | null;
   video_jobs: GenerationJob[];
   latest_export: ExportRecord | null;
   image_assets: ImageAssetRecord[];

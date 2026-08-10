@@ -344,6 +344,17 @@ class CloudWanVideoProvider(VideoProvider):
 
     @staticmethod
     def _motion_prompt(request: VideoGenerationRequest) -> str:
+        if request.motion_prompt and request.motion_prompt.strip():
+            return "\n".join(
+                [
+                    request.motion_prompt.strip(),
+                    (
+                        "Create subtle character and environmental movement with cinematic natural "
+                        "motion. Preserve character appearance, key objects, spatial relationships "
+                        "and the original composition. Avoid sudden scene changes."
+                    ),
+                ]
+            )
         parts = [
             request.shot.visual_description.strip(),
             request.prompt.strip(),

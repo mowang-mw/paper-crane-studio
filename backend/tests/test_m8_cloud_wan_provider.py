@@ -98,6 +98,19 @@ def _request(tmp_path: Path) -> VideoGenerationRequest:
     )
 
 
+def test_explicit_motion_prompt_does_not_repeat_keyframe_process_text(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    effective_motion = "车门缓缓打开，少女保持原地，不向前移动。"
+    prompt = CloudWanVideoProvider._motion_prompt(
+        replace(request, motion_prompt=effective_motion)
+    )
+    assert effective_motion in prompt
+    assert request.shot.visual_description not in prompt
+    assert request.prompt not in prompt
+
+
 def _provider(
     handler: Callable[[httpx.Request], httpx.Response],
     *,

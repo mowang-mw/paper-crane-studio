@@ -4,10 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from backend.app import crud
-from backend.app.media import render_real_audio_project_short, resolve_media_tools, verify_media
+from backend.app.media import (
+    MediaToolError,
+    render_real_audio_project_short,
+    resolve_media_tools,
+    verify_media,
+)
 from backend.app.media.ffmpeg import run_command, sha256_file
 from backend.app.models import JobStatus
+from backend.app.providers.cloud_wan import (
+    CLOUD_WAN_PROVIDER_ID,
+    CLOUD_WAN_SOURCE_TYPE,
+)
 from backend.app.services.video_jobs import VIDEO_JOB_TYPE
 from backend.app.worker import Worker
 from backend.tests.test_m5_real_audio_media import AUDIO_PROVIDER_ID, _fixtures
@@ -90,6 +101,9 @@ def _seed_video_job(
     shot_ids: list[str],
     *,
     with_audio: bool = False,
+    provider_id: str = "mock-video",
+    source_type: str = "MOCK",
+    source_image_asset_ids: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     data_root = Path(settings.data_dir).resolve()
     with database.session() as session:
@@ -98,7 +112,7 @@ def _seed_video_job(
         job = crud.create_job(
             session,
             project=project,
-            provider_id="mock-video",
+            provider_id=provider_id,
             job_type=VIDEO_JOB_TYPE,
         )
         session.flush()
@@ -116,19 +130,25 @@ def _seed_video_job(
                 session,
                 project_id=project_id,
                 asset_type="VIDEO_SHOT",
-                provider_id="mock-video",
-                source_type="MOCK",
+                provider_id=provider_id,
+                source_type=source_type,
                 file_path=video.relative_to(data_root).as_posix(),
                 sha256=sha256_file(video),
-                metadata_json={"job_id": job.id, "shot_id": shot_id},
+                metadata_json={
+                    "job_id": job.id,
+                    "shot_id": shot_id,
+                    "source_image_asset_id": (source_image_asset_ids or {}).get(
+                        shot_id
+                    ),
+                },
             )
             items.append(
                 {
                     "shot_id": shot_id,
                     "shot_index": index,
                     "status": "SUCCEEDED",
-                    "provider_id": "mock-video",
-                    "source_type": "MOCK",
+                    "provider_id": provider_id,
+                    "source_type": source_type,
                     "video_asset_id": asset.id,
                     "video_path": asset.file_path,
                     "video_sha256": asset.sha256,
@@ -138,7 +158,7 @@ def _seed_video_job(
         job.status = JobStatus.SUCCEEDED
         job.progress = 100
         job.result_json = {
-            "video_provider": "mock-video",
+            "video_provider": provider_id,
             "video_shots": items,
             "video_provider_calls": len(items),
         }
@@ -197,6 +217,27 @@ def _fake_renderer(settings, captured: dict[str, Any]):
     return renderer
 
 
+def _external_keyframes(keyframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(keyframes, start=1):
+        item = dict(raw)
+        item.pop("model_id", None)
+        item.pop("seed", None)
+        item.update(
+            {
+                "provider_id": "external-import",
+                "source_type": "EXTERNAL_IMPORT",
+                "generation_mode": "HUMAN_IN_THE_LOOP",
+                "external_source_type": "AI_GENERATED",
+                "provider_hint": "ChatGPT Images",
+                "original_filename": f"external-shot-{index}.png",
+                "imported_at": "2026-08-10T00:00:00+00:00",
+            }
+        )
+        normalized.append(item)
+    return normalized
+
+
 def test_complete_video_job_resolves_all_video_shots_without_provider_calls(
     client, database, settings
 ) -> None:
@@ -236,6 +277,105 @@ def test_complete_video_job_resolves_all_video_shots_without_provider_calls(
         "image_shot_count": 0,
         "explicit_image_shot_count": 0,
     }
+
+
+def test_external_images_to_cloud_video_preferred_renders_final_media_without_model_id(
+    client, database, settings, tmp_path: Path
+) -> None:
+    """覆盖 Showcase：External Image 是视频血缘，而非本地模型关键帧。"""
+
+    from backend.tests.test_m6_media_blockers import _make_png
+
+    project = client.post(
+        "/api/projects",
+        json={
+            "title": "External to cloud video",
+            "story": "Three external frames become three cloud video shots.",
+        },
+    ).json()
+    _source_jobs(database, settings, project["id"])
+    _seed_database_shots(database, project["id"])
+    selected_images: dict[str, str] = {}
+    for shot_id, color in zip(
+        ("shot1", "shot2", "shot3"),
+        ("yellow", "orange", "purple"),
+        strict=True,
+    ):
+        source = tmp_path / f"{shot_id}.png"
+        _make_png(source, color)
+        imported = client.post(
+            f"/api/projects/{project['id']}/shots/{shot_id}/external-images",
+            params={
+                "filename": source.name,
+                "external_source_type": "AI_GENERATED",
+                "provider_hint": "ChatGPT Images",
+            },
+            content=source.read_bytes(),
+            headers={"content-type": "image/png"},
+        )
+        assert imported.status_code == 201, imported.text
+        assert "model_id" not in imported.json()
+        selected_images[shot_id] = imported.json()["asset_id"]
+
+    video_job_id, _video_assets = _seed_video_job(
+        database,
+        settings,
+        project["id"],
+        ["shot1", "shot2", "shot3"],
+        provider_id=CLOUD_WAN_PROVIDER_ID,
+        source_type=CLOUD_WAN_SOURCE_TYPE,
+        source_image_asset_ids=selected_images,
+    )
+    selection = client.put(
+        f"/api/projects/{project['id']}/visual-selection",
+        json={
+            "source_image_asset_ids": selected_images,
+            "source_video_job_id": video_job_id,
+        },
+    )
+    assert selection.status_code == 200, selection.text
+    plan = client.get(
+        f"/api/projects/{project['id']}/best-media-plan",
+        params={"mode": "VIDEO_PREFERRED"},
+    ).json()
+    assert plan["status"] == "READY", plan
+    assert all(item["selected_type"] == "VIDEO_SHOT" for item in plan["shots"])
+
+    queued = client.post(
+        f"/api/projects/{project['id']}/smart-media-render",
+        json={"composition_mode": "VIDEO_PREFERRED"},
+    )
+    assert queued.status_code == 202, queued.text
+    worker = Worker(
+        settings=settings,
+        database=database,
+        image_provider_factory=lambda _settings: (_ for _ in ()).throw(
+            AssertionError("Final Media must not call ImageProvider")
+        ),
+        audio_provider_factory=lambda _settings: (_ for _ in ()).throw(
+            AssertionError("Final Media must not call AudioProvider")
+        ),
+        video_provider_factory=lambda _settings: (_ for _ in ()).throw(
+            AssertionError("Final Media must not call VideoProvider")
+        ),
+    )
+    assert worker.run_once() is True
+    completed = client.get(f"/api/jobs/{queued.json()['job_id']}").json()
+    assert completed["status"] == "SUCCEEDED", completed
+    result = completed["result_json"]
+    project_detail = client.get(f"/api/projects/{project['id']}").json()
+    assert client.get(project_detail["latest_export"]["video_url"]).status_code == 200
+    manifest = client.get(result["manifest_url"]).json()
+    assert manifest["selection_mode"] == "VIDEO_PREFERRED"
+    assert manifest["image_provider"] is None
+    assert manifest["visual_source_summary"]["video_shot_count"] == 3
+    for shot in manifest["shots"]:
+        visual = shot["visual_source"]
+        assert shot["visual_source_type"] == "VIDEO_SHOT"
+        assert shot["source_provider"] == CLOUD_WAN_PROVIDER_ID
+        assert shot["source_type"] == CLOUD_WAN_SOURCE_TYPE
+        assert shot["source_image_asset_id"] == selected_images[shot["shot_id"]]
+        assert visual["source_image_asset_id"] == selected_images[shot["shot_id"]]
 
 
 def test_partial_video_uses_selected_external_then_legacy_image_fallback(
@@ -610,6 +750,8 @@ def test_renderer_freezes_short_video_trims_long_video_and_strips_source_audio(
     tmp_path: Path,
 ) -> None:
     shots, keyframes, audio_assets, timing_plan = _fixtures(tmp_path)
+    keyframes = [dict(item) for item in keyframes]
+    keyframes[1] = _external_keyframes([keyframes[1]])[0]
     short_video = tmp_path / "visuals" / "short.mp4"
     long_video = tmp_path / "visuals" / "long.mp4"
     _make_video(short_video, duration=1.0, color="red", with_audio=True)
@@ -669,7 +811,7 @@ def test_renderer_freezes_short_video_trims_long_video_and_strips_source_audio(
             "media_only": True,
             "providers": {
                 "script_provider": "reused",
-                "image_provider": "comfyui-animagine-xl-4",
+                "image_provider": "selected-assets",
                 "audio_provider": AUDIO_PROVIDER_ID,
             },
             "provider_calls": {"script": 0, "image": 0, "audio": 0, "video": 0},
@@ -706,6 +848,86 @@ def test_renderer_freezes_short_video_trims_long_video_and_strips_source_audio(
     assert all("-map 0:v:0 -map 1:a:0" in command for command in video_commands)
 
 
+def test_image_only_external_assets_render_without_model_id(tmp_path: Path) -> None:
+    shots, keyframes, audio_assets, timing_plan = _fixtures(tmp_path)
+    external_keyframes = _external_keyframes([dict(item) for item in keyframes])
+    rendered = render_real_audio_project_short(
+        root=tmp_path,
+        project_id="m8-external-image-only",
+        project_title="External image-only Final Media",
+        shots=shots,
+        keyframes=external_keyframes,
+        audio_assets=audio_assets,
+        timing_plan=timing_plan,
+        output_dir=tmp_path / "external-image-only-export",
+        output_filename="final.mp4",
+        width=1280,
+        height=720,
+        fps=24,
+        provider_id=AUDIO_PROVIDER_ID,
+        generation_context={
+            "media_only": True,
+            "providers": {
+                "script_provider": "reused",
+                "image_provider": "external-import",
+                "audio_provider": AUDIO_PROVIDER_ID,
+            },
+            "provider_calls": {"script": 0, "image": 0, "audio": 0, "video": 0},
+        },
+    )
+    assert Path(rendered["output_path"]).is_file()
+    manifest = rendered["manifest"]
+    assert manifest["image_provider"] == "external-import"
+    assert all(item["visual_source_type"] == "IMAGE" for item in manifest["shots"])
+    assert all(item["keyframe"].get("model_id") is None for item in manifest["shots"])
+
+
+def test_external_and_local_image_contracts_keep_required_integrity_fields(
+    tmp_path: Path,
+) -> None:
+    shots, keyframes, audio_assets, timing_plan = _fixtures(tmp_path)
+    common = {
+        "root": tmp_path,
+        "project_id": "m8-image-contracts",
+        "project_title": "Image provenance contracts",
+        "shots": shots,
+        "audio_assets": audio_assets,
+        "timing_plan": timing_plan,
+        "width": 1280,
+        "height": 720,
+        "fps": 24,
+        "provider_id": AUDIO_PROVIDER_ID,
+    }
+
+    local_missing_model = [dict(item) for item in keyframes]
+    local_missing_model[0].pop("model_id")
+    with pytest.raises(MediaToolError, match="model_id"):
+        render_real_audio_project_short(
+            **common,
+            keyframes=local_missing_model,
+            output_dir=tmp_path / "missing-local-model",
+        )
+
+    external = _external_keyframes([dict(item) for item in keyframes])
+    invalid_variants: list[tuple[str, list[dict[str, Any]], str]] = []
+    bad_sha = [dict(item) for item in external]
+    bad_sha[0]["image_sha256"] = "0" * 64
+    invalid_variants.append(("bad-sha", bad_sha, "SHA-256 不符"))
+    bad_dimensions = [dict(item) for item in external]
+    bad_dimensions[0]["width"] += 1
+    invalid_variants.append(("bad-dimensions", bad_dimensions, "尺寸不符"))
+    missing_file = [dict(item) for item in external]
+    missing_file[0]["image_path"] = str(tmp_path / "missing.png")
+    invalid_variants.append(("missing-file", missing_file, "不存在或为空"))
+    for name, invalid, message in invalid_variants:
+        with pytest.raises(MediaToolError, match=message):
+            render_real_audio_project_short(
+                **common,
+                keyframes=invalid,
+                output_dir=tmp_path / name,
+            )
+
+
 def test_frontend_composition_modes_do_not_treat_video_success_as_final_export() -> None:
     root = Path(__file__).resolve().parents[2]
     app_source = (root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
@@ -714,5 +936,8 @@ def test_frontend_composition_modes_do_not_treat_video_success_as_final_export()
     assert "使用动态镜头合成成片" in app_source
     assert 'pendingNavigationRef.current = "composition"' in app_source
     assert "动态镜头已准备完成，当前最终成片尚未包含这些新素材。" in app_source
-    assert "else if (jobHasFinalMedia(job))" in app_source
+    assert 'else if (job.job_type === "MEDIA_RERENDER" && jobHasFinalMedia(job))' in app_source
+    assert 'job.job_type === "MEDIA_RERENDER" && jobHasFinalMedia(job)' in app_source
+    assert "AI 旁白生成完成" in app_source
+    assert "真实 AI 旁白已完成" not in app_source
     assert "composition_mode: compositionMode" in api_source

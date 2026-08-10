@@ -345,3 +345,30 @@ def test_default_generation_request_keeps_m7_path_without_video_provider(
     assert job["job_type"] == "GENERATE_SHORT_VIDEO"
     assert "video_provider" not in job["request_json"]
     assert job["job_type"] != VIDEO_JOB_TYPE
+
+
+def test_video_job_freezes_effective_keyframe_and_motion_plan(
+    client: TestClient, database: Database, settings
+) -> None:
+    project_id, source_job_id = _seed_source_image_job(database, settings)
+    keyframe = "人物站定，列车停靠，车门仍关闭。"
+    motion = "车门打开，人物保持原地。"
+    updated = client.put(
+        f"/api/projects/{project_id}/shots/shot_02/planning",
+        json={"keyframe_description": keyframe, "motion_description": motion},
+    )
+    assert updated.status_code == 200, updated.text
+    queued = client.post(
+        f"/api/projects/{project_id}/render-video",
+        json={
+            "source_image_job_id": source_job_id,
+            "video_provider": "mock-video",
+            "target_shot_ids": ["shot_02"],
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    job = client.get(f"/api/jobs/{queued.json()['job_id']}").json()
+    frozen = job["request_json"]["effective_shot_plans"]["shot_02"]
+    assert frozen["keyframe_description"] == keyframe
+    assert frozen["motion_description"] == motion
+    assert frozen["planning_source"] == "LLM_WITH_HUMAN_OVERRIDE"

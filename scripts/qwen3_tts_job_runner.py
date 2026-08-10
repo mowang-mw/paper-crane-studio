@@ -123,6 +123,16 @@ def require_contained(path_value: str, output_dir: Path, label: str) -> Path:
     return candidate
 
 
+def optional_text(payload: dict[str, Any], key: str) -> str | None:
+    """Read optional provenance without making audio-only requests image-bound."""
+    value = payload.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Optional field must be a string or null: {key}")
+    return value
+
+
 def load_request(path: Path) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -219,7 +229,7 @@ def main() -> int:
         project_id = require_text(request, "project_id")
         job_id = require_text(request, "job_id")
         source_script_job_id = require_text(request, "source_script_job_id")
-        source_image_job_id = require_text(request, "source_image_job_id")
+        source_image_job_id = optional_text(request, "source_image_job_id")
         summary.update(
             {
                 "project_id": project_id,

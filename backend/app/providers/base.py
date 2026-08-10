@@ -230,7 +230,7 @@ class AudioGenerationRequest:
     project_id: str
     job_id: str
     source_script_job_id: str
-    source_image_job_id: str
+    source_image_job_id: str | None
     script: ScriptV1
     shot: Shot
     output_dir: Path
@@ -239,8 +239,10 @@ class AudioGenerationRequest:
     def __post_init__(self) -> None:
         if not self.project_id.strip() or not self.job_id.strip():
             raise ValueError("project_id 和 job_id 不得为空")
-        if not self.source_script_job_id.strip() or not self.source_image_job_id.strip():
-            raise ValueError("source_script_job_id 和 source_image_job_id 不得为空")
+        if not self.source_script_job_id.strip():
+            raise ValueError("source_script_job_id 不得为空")
+        if self.source_image_job_id is not None and not self.source_image_job_id.strip():
+            raise ValueError("source_image_job_id 提供时不得为空")
         if self.shot not in self.script.shots:
             raise ValueError("AudioGenerationRequest 的 shot 不属于给定 ScriptV1")
         if not self.shot.narration.strip():
@@ -288,6 +290,7 @@ class VideoGenerationRequest:
     motion_description: str
     output_dir: Path
     options: VideoGenerationOptions
+    motion_prompt: str | None = None
 
     def __post_init__(self) -> None:
         if not self.project_id.strip() or not self.job_id.strip():

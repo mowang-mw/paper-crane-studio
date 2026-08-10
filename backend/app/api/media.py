@@ -324,6 +324,7 @@ async def import_external_image(
             project_story=project.story,
             script=script,
             shot_id=shot_id,
+            database_shot=database_shot,
         )
     except (ValueError, ExternalImageError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

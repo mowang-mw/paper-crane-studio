@@ -16,7 +16,7 @@ from typing import Any
 
 from ..config import Settings
 from ..media.ffmpeg import sha256_file
-from ..models import GenerationJob, Project
+from ..models import GenerationJob, JobStatus, Project
 from ..script_schema import ScriptV1
 
 
@@ -305,6 +305,39 @@ def script_from_source_job(
         retryable=False,
         suggestions=["重新生成并成功保存一次结构化剧本后再生成真实动漫画面。"],
     )
+
+
+def matching_script_snapshot(
+    settings: Settings,
+    *,
+    project: Project,
+    source_job: GenerationJob,
+) -> tuple[ScriptV1, dict[str, Any]] | None:
+    """Return an immutable ScriptV1 match, ignoring production/runtime metadata."""
+
+    if (
+        source_job.project_id != project.id
+        or source_job.job_type != "GENERATE_SHORT_VIDEO"
+        or source_job.status != JobStatus.SUCCEEDED
+    ):
+        return None
+    try:
+        script, trace = script_from_source_job(
+            settings,
+            project=project,
+            source_job=source_job,
+        )
+    except (RealImageJobError, RuntimeError, ValueError):
+        return None
+    # Legacy compatibility jobs without an immutable embedded/trace snapshot
+    # cannot prove lineage and must not be selected as a match.
+    if trace.get("source") == "project.script_json_legacy_mock_compatibility":
+        return None
+    try:
+        current = ScriptV1.model_validate(project.script_json)
+    except ValueError:
+        return None
+    return (script, trace) if script.model_dump(mode="json") == current.model_dump(mode="json") else None
 
 
 def write_script_snapshot(

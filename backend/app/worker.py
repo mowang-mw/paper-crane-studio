@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import replace
 import json
 import signal
 import sys
@@ -84,6 +85,7 @@ from .services.media_rerender import (
 from .services.external_images import (
     ExternalImageError,
     database_shot_for_script_shot,
+    external_image_provenance,
     selected_script_shot,
     validate_image_asset_file,
 )
@@ -1033,6 +1035,9 @@ class Worker:
         }
         requests: list[VideoGenerationRequest] = []
         source_items: dict[str, dict[str, Any]] = {}
+        frozen_plans = request_snapshot.get("effective_shot_plans")
+        if not isinstance(frozen_plans, dict):
+            frozen_plans = {}
         for provider_shot in script_shots:
             item = images_by_id[provider_shot.provider_shot_id]
             stored_path = item.get("image_path")
@@ -1050,14 +1055,33 @@ class Worker:
                     retryable=False,
                 )
             source_items[provider_shot.provider_shot_id] = item
+            raw_plan = frozen_plans.get(provider_shot.provider_shot_id)
+            plan = raw_plan if isinstance(raw_plan, dict) else {}
+            effective_keyframe = str(
+                plan.get("keyframe_description")
+                or provider_shot.visual_description
+            )
+            effective_motion = str(
+                plan.get("motion_description") or provider_shot.camera
+            )
+            effective_provider_shot = replace(
+                provider_shot,
+                visual_description=effective_keyframe,
+                camera=effective_motion,
+            )
             requests.append(
                 VideoGenerationRequest(
                     project_id=project_id,
                     job_id=job_id,
-                    shot=provider_shot,
+                    shot=effective_provider_shot,
                     source_image_path=source_path,
-                    prompt=provider_shot.image_prompt or provider_shot.visual_description,
-                    motion_description=provider_shot.camera,
+                    prompt=provider_shot.image_prompt or effective_keyframe,
+                    motion_description=effective_motion,
+                    motion_prompt=(
+                        effective_motion
+                        if plan.get("planning_source") == "LLM_WITH_HUMAN_OVERRIDE"
+                        else None
+                    ),
                     output_dir=output_dir,
                     options=options,
                 )
@@ -1252,19 +1276,23 @@ class Worker:
             ) from exc
 
         source_script_job_id = str(request_snapshot.get("source_script_job_id") or "")
-        source_image_job_id = str(request_snapshot.get("source_image_job_id") or "")
+        source_image_job_id = (
+            str(request_snapshot["source_image_job_id"])
+            if request_snapshot.get("source_image_job_id")
+            else None
+        )
         source_audio_job_id = str(request_snapshot.get("source_audio_job_id") or "")
         with self.database.session() as session:
             source_script_job = crud.get_job(session, source_script_job_id)
-            source_image_job = crud.get_job(session, source_image_job_id)
+            source_image_job = (
+                crud.get_job(session, source_image_job_id)
+                if source_image_job_id is not None
+                else None
+            )
             source_audio_job = crud.get_job(session, source_audio_job_id)
             if source_script_job is None:
                 raise MediaRerenderJobError(
                     "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 不存在。"
-                )
-            if source_image_job is None:
-                raise MediaRerenderJobError(
-                    "SOURCE_IMAGE_JOB_NOT_FOUND", "来源真实图片 Job 不存在。"
                 )
             if source_audio_job is None:
                 raise MediaRerenderJobError(
@@ -1272,7 +1300,10 @@ class Worker:
                 )
             if any(
                 item.project_id != project_id
-                for item in (source_script_job, source_image_job, source_audio_job)
+                for item in (source_script_job, source_audio_job)
+            ) or (
+                source_image_job is not None
+                and source_image_job.project_id != project_id
             ):
                 raise MediaRerenderJobError(
                     "SOURCE_JOB_PROJECT_MISMATCH",
@@ -1282,7 +1313,7 @@ class Worker:
                 raise MediaRerenderJobError(
                     "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 尚未成功。"
                 )
-            if (
+            if source_image_job is not None and (
                 source_image_job.status != JobStatus.SUCCEEDED
                 or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
                 or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
@@ -1298,28 +1329,37 @@ class Worker:
                 raise MediaRerenderJobError(
                     "SOURCE_AUDIO_JOB_NOT_FOUND", "来源真实旁白 Job 无效或尚未成功。"
                 )
-            image_result = copy.deepcopy(source_image_job.result_json or {})
+            image_result = (
+                copy.deepcopy(source_image_job.result_json or {})
+                if source_image_job is not None
+                else {}
+            )
             audio_result = copy.deepcopy(source_audio_job.result_json or {})
 
         if (
             audio_result.get("source_script_job_id") != source_script_job_id
-            or audio_result.get("source_image_job_id") != source_image_job_id
+            or (audio_result.get("source_image_job_id") or None) != source_image_job_id
         ):
             raise MediaRerenderJobError(
                 "SOURCE_JOB_PROJECT_MISMATCH", "来源旁白 Job 的上游追溯与快照不一致。"
             )
         if (
-            image_result.get("mock_image_fallback") is not False
+            (
+                source_image_job is not None
+                and image_result.get("mock_image_fallback") is not False
+            )
             or audio_result.get("mock_audio_fallback") is not False
         ):
             raise MediaRerenderJobError(
                 "MEDIA_RENDER_FAILED", "来源 Job 含 Mock 回退，已拒绝媒体重合成。"
             )
 
-        raw_images = image_result.get("image_shots")
+        raw_images = image_result.get("image_shots") or []
         raw_audio = audio_result.get("audio_shots")
         timing_plan = audio_result.get("timing_plan")
-        if not isinstance(raw_images, list) or len(raw_images) != len(script.shots):
+        if not isinstance(raw_images, list) or (
+            source_image_job is not None and len(raw_images) != len(script.shots)
+        ):
             raise MediaRerenderJobError(
                 "SOURCE_IMAGE_MISSING", "来源 Job 缺少完整的逐镜头真实 PNG。"
             )
@@ -1336,6 +1376,7 @@ class Worker:
             project_id=project_id,
             script=script,
             source_images=raw_images,
+            request_snapshot=request_snapshot,
         )
         visual_sources = self._media_rerender_visual_sources(
             project_id=project_id,
@@ -1368,7 +1409,7 @@ class Worker:
             "image_provider": "reused",
             "audio_provider": "reused",
             "source_script_provider": request_snapshot.get("source_script_provider"),
-            "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+            "source_image_provider": request_snapshot.get("source_image_provider"),
             "source_audio_provider": REAL_AUDIO_PROVIDER_ID,
             "script_provider_calls": 0,
             "image_provider_calls": 0,
@@ -1416,8 +1457,12 @@ class Worker:
                 "source_script_provider": request_snapshot.get(
                     "source_script_provider"
                 ),
-                "image_provider": REAL_IMAGE_PROVIDER_ID,
-                "image_source_type": "REUSED_REAL_LOCAL_MODEL",
+                "image_provider": request_snapshot.get("source_image_provider"),
+                "image_source_type": (
+                    "REUSED_REAL_LOCAL_MODEL"
+                    if source_image_job_id
+                    else "REUSED_SELECTED_IMAGE_ASSETS"
+                ),
                 "audio_provider": REAL_AUDIO_PROVIDER_ID,
                 "audio_source_type": REAL_AUDIO_SOURCE_TYPE,
                 "video_source_type": "MEDIA_ONLY_RERENDER_FFMPEG",
@@ -1482,7 +1527,9 @@ class Worker:
                 request_snapshot.get("source_script_provider") or "reused"
             ),
             source_image_job_id=source_image_job_id,
-            source_image_provider=REAL_IMAGE_PROVIDER_ID,
+            source_image_provider=str(
+                request_snapshot.get("source_image_provider") or "selected-assets"
+            ),
             audio_generation_total_seconds=0.0,
             provider_report={
                 "model_load_count": 0,
@@ -1498,6 +1545,7 @@ class Worker:
         project_id: str,
         script: ScriptV1,
         source_images: list[Any],
+        request_snapshot: dict[str, Any],
     ) -> list[dict[str, Any]]:
         tools = resolve_media_tools()
         expected_ids = {shot.id for shot in script.shots}
@@ -1565,6 +1613,60 @@ class Worker:
                         self._stored_project_path(trace_value, project_id)
                     )
             by_id[shot_id] = item
+        raw_asset_ids = request_snapshot.get("source_image_asset_ids") or {}
+        if not isinstance(raw_asset_ids, dict):
+            raise MediaRerenderJobError(
+                "SOURCE_IMAGE_MISSING", "显式图片资产映射格式无效。"
+            )
+        with self.database.session() as session:
+            database_shots = crud.list_shots(session, project_id)
+            for raw_shot_id, raw_asset_id in raw_asset_ids.items():
+                shot_id = str(raw_shot_id)
+                try:
+                    script_shot = selected_script_shot(script, shot_id)
+                    database_shot = database_shot_for_script_shot(
+                        database_shots, script_shot
+                    )
+                except ExternalImageError as exc:
+                    raise MediaRerenderJobError(
+                        "SOURCE_IMAGE_MISSING", str(exc)
+                    ) from exc
+                asset = crud.get_asset(session, str(raw_asset_id))
+                if (
+                    asset is None
+                    or asset.project_id != project_id
+                    or asset.shot_id != database_shot.id
+                    or asset.asset_type != "KEYFRAME_IMAGE"
+                ):
+                    raise MediaRerenderJobError(
+                        "SOURCE_IMAGE_MISSING",
+                        "显式图片资产的 Project、Shot 或类型绑定无效。",
+                    )
+                try:
+                    path, probe = validate_image_asset_file(
+                        data_dir=self.settings.data_dir,
+                        project_dir=self.settings.project_dir(project_id),
+                        asset=asset,
+                    )
+                except ExternalImageError as exc:
+                    raise MediaRerenderJobError(
+                        "SOURCE_IMAGE_MISSING", f"显式图片资产不可用：{exc}"
+                    ) from exc
+                existing = by_id.get(shot_id, {})
+                by_id[shot_id] = {
+                    **existing,
+                    "shot_id": shot_id,
+                    "shot_index": script_shot.index,
+                    "status": "REUSED",
+                    "image_path": str(path),
+                    "image_sha256": asset.sha256,
+                    "image_asset_id": asset.id,
+                    "provider_id": asset.provider_id,
+                    "source_type": asset.source_type,
+                    "width": probe.get("width"),
+                    "height": probe.get("height"),
+                    **external_image_provenance(asset),
+                }
         if set(by_id) != expected_ids:
             raise MediaRerenderJobError(
                 "SOURCE_IMAGE_MISSING", "来源 PNG 镜头集合与 ScriptV1 不一致。"
@@ -1657,6 +1759,7 @@ class Worker:
                     "source_height": probe.get("height"),
                     "source_duration_seconds": None,
                     "source_has_audio": False,
+                    **external_image_provenance(asset),
                 }
 
             source_video_job_id = str(
@@ -1932,12 +2035,18 @@ class Worker:
             )
 
         source_script_job_id = str(request_snapshot.get("source_script_job_id") or "")
-        source_image_job_id = str(request_snapshot.get("source_image_job_id") or "")
+        source_image_job_id = (
+            str(request_snapshot["source_image_job_id"])
+            if request_snapshot.get("source_image_job_id")
+            else None
+        )
         source_script_provider = str(
             request_snapshot.get("source_script_provider") or "unknown"
         )
-        source_image_provider = str(
-            request_snapshot.get("source_image_provider") or ""
+        source_image_provider = (
+            str(request_snapshot["source_image_provider"])
+            if request_snapshot.get("source_image_provider")
+            else None
         )
         if source_payload.get("source_script_job_id") != source_script_job_id:
             raise RealAudioJobError(
@@ -1960,27 +2069,32 @@ class Worker:
                 summary="来源快照的 ImageProvider 与请求不一致。",
                 retryable=False,
             )
-        source_images = self._real_audio_source_images(
-            project_id=project_id,
-            script=script,
-            source_payload=source_payload,
+        source_images = (
+            self._real_audio_source_images(
+                project_id=project_id,
+                script=script,
+                source_payload=source_payload,
+            )
+            if source_image_job_id is not None
+            else []
         )
 
         with self.database.session() as session:
-            source_image_job = crud.get_job(session, source_image_job_id)
-            if (
-                source_image_job is None
-                or source_image_job.project_id != project_id
-                or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
-                or source_image_job.provider_id != source_image_provider
-                or source_image_job.status != JobStatus.SUCCEEDED
-            ):
-                raise RealAudioJobError(
-                    code="AUDIO_SOURCE_JOB_INVALID",
-                    stage="SOURCE_REUSE",
-                    summary="来源 M4-B 真实图像 Job 不存在、未成功或归属不匹配。",
-                    retryable=False,
-                )
+            if source_image_job_id is not None:
+                source_image_job = crud.get_job(session, source_image_job_id)
+                if (
+                    source_image_job is None
+                    or source_image_job.project_id != project_id
+                    or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+                    or source_image_job.provider_id != source_image_provider
+                    or source_image_job.status != JobStatus.SUCCEEDED
+                ):
+                    raise RealAudioJobError(
+                        code="AUDIO_SOURCE_JOB_INVALID",
+                        stage="SOURCE_REUSE",
+                        summary="来源真实图像 Job 不存在、未成功或归属不匹配。",
+                        retryable=False,
+                    )
             database_shots = crud.list_shots(session, project_id)
             if len(database_shots) != len(script.shots):
                 raise RealAudioJobError(
@@ -2073,7 +2187,7 @@ class Worker:
             "script_provider": "reused",
             "source_script_provider": source_script_provider,
             "script_provider_calls": 0,
-            "image_provider": "reused",
+            "image_provider": "reused" if source_image_job_id else None,
             "source_image_provider": source_image_provider,
             "image_provider_calls": 0,
             "audio_provider": REAL_AUDIO_PROVIDER_ID,
@@ -2230,7 +2344,7 @@ class Worker:
             current = dict(job.result_json or {})
             current.update(
                 {
-                    "stage": "MEDIA_RENDER",
+                    "stage": "MEDIA_RENDER" if source_image_job_id else "AUDIO_COMPLETE",
                     "audio_generation_total_seconds": (
                         audio_generation_total_seconds
                     ),
@@ -2266,6 +2380,22 @@ class Worker:
             job.result_json = current
             crud.set_job_progress(session, job, 65)
             session.commit()
+
+        if source_image_job_id is None:
+            self._finish_real_audio_only_job(
+                job_id=job_id,
+                project_id=project_id,
+                request_snapshot=request_snapshot,
+                generated_assets=generated_assets,
+                timing_plan=timing_plan,
+                timing_plan_path=timing_plan_path,
+                source_script_job_id=source_script_job_id,
+                source_script_provider=source_script_provider,
+                audio_generation_total_seconds=audio_generation_total_seconds,
+                provider_report=provider_report,
+                gpu_observation=gpu_observation,
+            )
+            return
 
         visual_sources = self._media_rerender_visual_sources(
             project_id=project_id,
@@ -2421,6 +2551,76 @@ class Worker:
             provider_report=provider_report,
             gpu_observation=gpu_observation,
         )
+
+    def _finish_real_audio_only_job(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        request_snapshot: dict[str, Any],
+        generated_assets: tuple[GeneratedAudioAsset, ...],
+        timing_plan: dict[str, Any],
+        timing_plan_path: Path,
+        source_script_job_id: str,
+        source_script_provider: str,
+        audio_generation_total_seconds: float,
+        provider_report: dict[str, Any],
+        gpu_observation: dict[str, Any],
+    ) -> None:
+        """Complete a real TTS Job without binding it to any visual provider."""
+
+        with self.database.session() as session:
+            job = crud.get_job(session, job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                raise RuntimeError(f"旁白完成时 Job 不再是 RUNNING：{job_id}")
+            current = dict(job.result_json or {})
+            current.update(
+                {
+                    "stage": "SUCCEEDED",
+                    "audio_only": True,
+                    "final_media_available": False,
+                    "source_script_job_id": source_script_job_id,
+                    "source_script_provider": source_script_provider,
+                    "source_image_job_id": None,
+                    "source_image_provider": None,
+                    "image_provider": None,
+                    "audio_provider": REAL_AUDIO_PROVIDER_ID,
+                    "audio_source_type": REAL_AUDIO_SOURCE_TYPE,
+                    "source_type": REAL_AUDIO_SOURCE_TYPE,
+                    "audio_model_id": generated_assets[0].model_id,
+                    "audio_model_revision": generated_assets[0].model_revision,
+                    "audio_model_sha256": generated_assets[0].model_sha256,
+                    "speaker": generated_assets[0].speaker,
+                    "language": generated_assets[0].language,
+                    "timing_plan": timing_plan,
+                    "timing_plan_path": self._relative_project_path(
+                        timing_plan_path, project_id
+                    ),
+                    "audio_generation_total_seconds": audio_generation_total_seconds,
+                    "audio_generated_count": sum(
+                        not item.reused for item in generated_assets
+                    ),
+                    "audio_reused_count": sum(item.reused for item in generated_assets),
+                    "model_load_count": provider_report.get("model_load_count"),
+                    "sequential_generation": provider_report.get(
+                        "sequential_generation", True
+                    ),
+                    "max_audio_concurrency": provider_report.get(
+                        "max_audio_concurrency", 1
+                    ),
+                    "gpu_memory_observed": gpu_observation,
+                    "provider_gpu_allocator_observed": provider_report.get(
+                        "gpu_memory_observed"
+                    ),
+                    "mock_audio_fallback": False,
+                    "mock_audio_used": False,
+                    "cloud_api_used": False,
+                    "voice_cloning_used": False,
+                    "request_snapshot": request_snapshot,
+                }
+            )
+            crud.mark_job_succeeded(session, job=job, result_json=current)
+            session.commit()
 
     def _real_audio_options(
         self, request_snapshot: dict[str, Any]

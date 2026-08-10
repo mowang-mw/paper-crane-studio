@@ -490,40 +490,51 @@ def create_audio_source_snapshot(
     project_id: str,
     audio_job_id: str,
     source_script_job_id: str,
-    source_image_job_id: str,
+    source_image_job_id: str | None,
     source_script_provider: str,
-    source_image_provider: str,
+    source_image_provider: str | None,
     script: ScriptV1,
     source_images: Sequence[dict[str, Any]],
     source_trace: dict[str, Any],
 ) -> tuple[Path, str]:
     """原子固化 M5-B 的 ScriptV1 与真实关键帧追溯，不调用任何模型。"""
 
-    identifiers = {
+    required_identifiers = {
         "project_id": project_id,
         "audio_job_id": audio_job_id,
         "source_script_job_id": source_script_job_id,
-        "source_image_job_id": source_image_job_id,
         "source_script_provider": source_script_provider,
-        "source_image_provider": source_image_provider,
     }
-    if any(not isinstance(value, str) or not value.strip() for value in identifiers.values()):
-        raise ValueError("音频来源快照的项目、Job 和 Provider 标识不得为空")
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in required_identifiers.values()
+    ):
+        raise ValueError("音频来源快照的项目、Script Job 和 Provider 标识不得为空")
+    if (source_image_job_id is None) != (source_image_provider is None):
+        raise ValueError("Image Job 与 ImageProvider 追溯必须同时提供或同时省略")
     if not isinstance(script, ScriptV1):
         raise TypeError("script 必须是已严格校验的 ScriptV1")
     if not isinstance(source_trace, dict):
         raise TypeError("source_trace 必须是对象")
-    images = _normalize_source_images(
-        script,
-        source_images,
-        source_image_provider=source_image_provider,
+    images = (
+        _normalize_source_images(
+            script,
+            source_images,
+            source_image_provider=str(source_image_provider),
+        )
+        if source_image_job_id is not None
+        else []
     )
+    if source_image_job_id is None and source_images:
+        raise ValueError("没有 Image Job 追溯时不得把图片写入 Audio 来源快照")
     job_root = (settings.project_dir(project_id) / "jobs" / audio_job_id).resolve()
     job_root.mkdir(parents=True, exist_ok=True)
     path = job_root / "audio-source.json"
     payload = {
-        "snapshot_version": "m5.audio-source.v1",
-        **identifiers,
+        "snapshot_version": "m8.audio-source.v1",
+        **required_identifiers,
+        "source_image_job_id": source_image_job_id,
+        "source_image_provider": source_image_provider,
         "validated_script": script.model_dump(mode="json"),
         "source_images": images,
         "source_trace": source_trace,
@@ -595,7 +606,10 @@ def load_audio_source_snapshot(
         )
     payload = read_json(path)
     try:
-        if payload is None or payload.get("snapshot_version") != "m5.audio-source.v1":
+        if payload is None or payload.get("snapshot_version") not in {
+            "m5.audio-source.v1",
+            "m8.audio-source.v1",
+        }:
             raise ValueError("snapshot_version 无效")
         if payload.get("project_id") != project_id:
             raise ValueError("project_id 不匹配")
@@ -609,11 +623,21 @@ def load_audio_source_snapshot(
             if expected is not None and payload.get(key) != expected:
                 raise ValueError(f"{key} 不匹配")
         script = ScriptV1.model_validate(payload["validated_script"])
-        images = _normalize_source_images(
-            script,
-            payload["source_images"],
-            source_image_provider=str(payload["source_image_provider"]),
+        image_job_id = payload.get("source_image_job_id")
+        image_provider = payload.get("source_image_provider")
+        if (image_job_id is None) != (image_provider is None):
+            raise ValueError("Image Job 与 ImageProvider 追溯不一致")
+        images = (
+            _normalize_source_images(
+                script,
+                payload["source_images"],
+                source_image_provider=str(image_provider),
+            )
+            if image_job_id is not None
+            else []
         )
+        if image_job_id is None and payload.get("source_images") not in (None, []):
+            raise ValueError("无 Image Job 的音频快照不得包含图片")
         payload["source_images"] = images
     except (KeyError, TypeError, ValueError) as exc:
         raise RealAudioJobError(

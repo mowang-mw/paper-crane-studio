@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import runpy
 import sys
 import textwrap
 
@@ -29,6 +30,18 @@ from backend.app.services.audio_jobs import (
 
 
 REVISION = "a" * 40
+
+
+def test_qwen_tts_runner_accepts_missing_or_null_image_provenance() -> None:
+    runner = runpy.run_path(
+        str(Path(__file__).parents[2] / "scripts" / "qwen3_tts_job_runner.py")
+    )
+    optional_text = runner["optional_text"]
+    assert optional_text({"source_script_job_id": "script-job"}, "source_image_job_id") is None
+    assert optional_text({"source_image_job_id": None}, "source_image_job_id") is None
+    assert optional_text({"source_image_job_id": "image-job"}, "source_image_job_id") == "image-job"
+    with pytest.raises(ValueError):
+        optional_text({"source_image_job_id": 123}, "source_image_job_id")
 
 
 def _script(shot_count: int = 3) -> ScriptV1:
@@ -82,6 +95,7 @@ def _requests(
     *,
     script: ScriptV1,
     job_id: str,
+    source_image_job_id: str | None = "image-job-1",
 ) -> tuple[AudioGenerationRequest, ...]:
     options = AudioGenerationOptions(
         speaker="Serena",
@@ -97,7 +111,7 @@ def _requests(
             project_id="project-1",
             job_id=job_id,
             source_script_job_id="script-job-1",
-            source_image_job_id="image-job-1",
+            source_image_job_id=source_image_job_id,
             script=script,
             shot=shot,
             output_dir=output_dir,
@@ -148,7 +162,7 @@ for item in request["shots"]:
         "model_revision": request["model_revision"], "model_sha256": request["model_sha256"],
         "project_id": request["project_id"], "job_id": request["job_id"],
         "source_script_job_id": request["source_script_job_id"],
-        "source_image_job_id": request["source_image_job_id"],
+        "source_image_job_id": request.get("source_image_job_id"),
         "shot_id": item["shot_id"], "shot_index": item["shot_index"],
         "text": item["text"], "text_sha256": item["text_sha256"],
         "speaker": request["speaker"], "language": request["language"], "seed": item["seed"],
@@ -246,6 +260,30 @@ def test_provider_runs_one_bounded_child_and_generates_sequential_audio(
     assert report["gpu_memory_observed"]["peak_allocated_bytes"] == 200
     assert (tmp_path / "audio-job" / "tts.stdout.log").is_file()
     assert (tmp_path / "audio-job" / "tts.stderr.log").is_file()
+
+
+def test_provider_runner_generates_audio_without_source_image_job(
+    tmp_path: Path,
+) -> None:
+    script = _script()
+    requests = _requests(
+        tmp_path,
+        script=script,
+        job_id="audio-only-job",
+        source_image_job_id=None,
+    )
+
+    assets = _provider(tmp_path).generate_batch(requests=requests)
+
+    assert len(assets) == len(script.shots)
+    assert all(asset.audio_path.is_file() for asset in assets)
+    runner_request = json.loads(
+        (tmp_path / "audio-only-job" / "audio-generation-request.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert runner_request["source_script_job_id"] == "script-job-1"
+    assert runner_request["source_image_job_id"] is None
 
 
 def test_speaker_contract_defaults_to_serena_and_accepts_vivian() -> None:

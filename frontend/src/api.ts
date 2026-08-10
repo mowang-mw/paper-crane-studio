@@ -8,6 +8,7 @@ import type {
   DesiredShotCount,
   ExternalImagePromptBundle,
   ExternalImageSourceType,
+  ShotPlanning,
   ExportRecord,
   GenerationJob,
   HealthStatus,
@@ -306,6 +307,7 @@ export async function getProject(projectId: string): Promise<ProjectDetail> {
     project?: Project;
     shots?: Shot[];
     recent_jobs?: GenerationJob[];
+    matching_script_job?: GenerationJob | null;
     video_jobs?: GenerationJob[];
     jobs?: GenerationJob[];
     image_assets?: ImageAssetRecord[];
@@ -318,6 +320,7 @@ export async function getProject(projectId: string): Promise<ProjectDetail> {
     project,
     shots: payload.shots ?? [],
     recent_jobs: payload.recent_jobs ?? payload.jobs ?? [],
+    matching_script_job: payload.matching_script_job ?? null,
     video_jobs: payload.video_jobs ?? [],
     image_assets: payload.image_assets ?? [],
     visual_selection: payload.visual_selection ?? {
@@ -375,7 +378,8 @@ export async function renderRealImages(
 
 export async function renderRealAudio(
   projectId: string,
-  sourceImageJobId: string,
+  sourceScriptJobId: string,
+  sourceImageJobId: string | null,
   speaker: AudioSpeaker,
   mediaOptions: MediaPolishOptions,
   sourceVideoJobId: string | null = null,
@@ -385,7 +389,8 @@ export async function renderRealAudio(
     await request<unknown>(`/projects/${encodeURIComponent(projectId)}/render-real-audio`, {
       method: "POST",
       body: JSON.stringify({
-        source_image_job_id: sourceImageJobId,
+        source_script_job_id: sourceScriptJobId,
+        ...(sourceImageJobId ? { source_image_job_id: sourceImageJobId } : {}),
         ...(sourceVideoJobId ? { source_video_job_id: sourceVideoJobId } : {}),
         ...(Object.keys(sourceImageAssetIds).length > 0
           ? { source_image_asset_ids: sourceImageAssetIds }
@@ -449,6 +454,17 @@ export async function getExternalImagePrompt(
 ): Promise<ExternalImagePromptBundle> {
   return request<ExternalImagePromptBundle>(
     `/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/external-image-prompt`,
+  );
+}
+
+export async function updateShotPlanning(
+  projectId: string,
+  shotId: string,
+  values: { keyframe_description: string | null; motion_description: string | null },
+): Promise<ShotPlanning> {
+  return request<ShotPlanning>(
+    `/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/planning`,
+    { method: "PUT", body: JSON.stringify(values) },
   );
 }
 

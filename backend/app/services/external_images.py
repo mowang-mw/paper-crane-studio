@@ -14,6 +14,7 @@ from ..media.ffmpeg import (
 )
 from ..models import Asset, Shot as DatabaseShot
 from ..script_schema import ScriptV1, Shot
+from .shot_planning import effective_shot_plan
 
 
 EXTERNAL_PROMPT_ADAPTER_ID = "external-natural-language-v1"
@@ -52,11 +53,30 @@ def selected_script_shot(script: ScriptV1, shot_id: str) -> Shot:
 
 
 def build_external_image_prompt_bundle(
-    *, project_story: str, script: ScriptV1, shot_id: str
+    *,
+    project_story: str,
+    script: ScriptV1,
+    shot_id: str,
+    database_shot: DatabaseShot | None = None,
 ) -> dict[str, Any]:
     """把已完成的 ScriptV1 单镜头规划确定性适配为自然语言提示词。"""
 
     shot = selected_script_shot(script, shot_id)
+    effective = (
+        effective_shot_plan(shot, database_shot)
+        if database_shot is not None
+        else {
+            "keyframe_description": shot.visual_description,
+            "motion_description": shot.camera,
+            "planning_source": "LLM",
+            "override": {},
+            "original": {
+                "visual_description": shot.visual_description,
+                "camera": shot.camera,
+                "narration": shot.narration,
+            },
+        }
+    )
     characters_by_id = {item.id: item for item in script.characters}
     scene_by_id = {item.id: item for item in script.scenes}
     characters = [characters_by_id[item] for item in shot.character_ids]
@@ -74,6 +94,7 @@ def build_external_image_prompt_bundle(
             "",
             "这是整个故事中已经完成结构化规划的一个指定镜头，只生成当前镜头；"
             "不要重新改编整个故事，也不要增加新的剧情事件。",
+            "请只表现这一镜头开始时的一张静态关键帧；不要在一张图中同时表现多个连续时间阶段。",
             "",
             f"镜头：{shot.title}",
             "角色：",
@@ -83,7 +104,7 @@ def build_external_image_prompt_bundle(
                 f"场景：{scene.name}。{scene.description}；时间：{scene.time}；"
                 f"光线：{scene.lighting}；一致性要求：{scene.consistency_prompt}"
             ),
-            f"当前画面与动作、空间关系：{shot.visual_description}",
+            f"当前静态画面、姿态与空间关系：{effective['keyframe_description']}",
             f"构图与镜头意图：{shot.camera}",
             f"补充视觉规划：{shot.image_prompt}",
             "",
@@ -117,14 +138,18 @@ def build_external_image_prompt_bundle(
                 "lighting": scene.lighting,
                 "consistency_prompt": scene.consistency_prompt,
             },
-            "visual_description": shot.visual_description,
+            "visual_description": effective["keyframe_description"],
+            "original_visual_description": shot.visual_description,
             "camera": shot.camera,
             "image_prompt": shot.image_prompt,
+            "motion_description": effective["motion_description"],
         },
         "lineage": {
             "project_story_present": bool(project_story.strip()),
             "structured_script_schema": script.schema_version,
             "selected_shot_id": shot.id,
+            "planning_source": effective["planning_source"],
+            "production_override": effective["override"],
         },
     }
 
@@ -231,7 +256,64 @@ def validate_image_asset_file(
     probe = inspect_external_image(candidate)
     if sha256_file(candidate) != asset.sha256:
         raise ExternalImageError("图片资产 SHA256 与数据库记录不一致。")
+    if asset.source_type == EXTERNAL_IMAGE_SOURCE_TYPE:
+        metadata = (
+            asset.metadata_json if isinstance(asset.metadata_json, dict) else {}
+        )
+        if asset.provider_id != EXTERNAL_IMAGE_PROVIDER_ID:
+            raise ExternalImageError("外部图片资产 Provider 追溯无效。")
+        if metadata.get("generation_mode") != EXTERNAL_IMAGE_GENERATION_MODE:
+            raise ExternalImageError("外部图片资产导入模式追溯无效。")
+        if metadata.get("external_source_type") not in {
+            "AI_GENERATED",
+            "HUMAN_CREATED",
+            "OTHER",
+        }:
+            raise ExternalImageError("外部图片资产来源类型追溯无效。")
+        try:
+            original_filename = validate_external_filename(
+                str(metadata["original_filename"])
+            )
+            recorded_width = int(metadata["width"])
+            recorded_height = int(metadata["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ExternalImageError("外部图片资产导入追溯不完整。") from exc
+        if not original_filename or (
+            recorded_width,
+            recorded_height,
+        ) != (probe["width"], probe["height"]):
+            raise ExternalImageError("外部图片资产记录尺寸与文件不一致。")
+        if metadata.get("sha256") != asset.sha256:
+            raise ExternalImageError("外部图片资产导入 SHA256 追溯不一致。")
+        if not isinstance(metadata.get("imported_at"), str) or not str(
+            metadata["imported_at"]
+        ).strip():
+            raise ExternalImageError("外部图片资产缺少导入时间追溯。")
+        provider_hint = metadata.get("provider_hint")
+        if provider_hint is not None and (
+            not isinstance(provider_hint, str) or not provider_hint.strip()
+        ):
+            raise ExternalImageError("外部图片资产 provider_hint 追溯无效。")
     return candidate, probe
+
+
+def external_image_provenance(asset: Asset) -> dict[str, Any]:
+    """返回 External Image Bridge 已有字段；不制造内部模型身份。"""
+
+    if (
+        asset.provider_id != EXTERNAL_IMAGE_PROVIDER_ID
+        or asset.source_type != EXTERNAL_IMAGE_SOURCE_TYPE
+    ):
+        return {}
+    metadata = asset.metadata_json if isinstance(asset.metadata_json, dict) else {}
+    return {
+        "generation_mode": metadata.get("generation_mode"),
+        "external_source_type": metadata.get("external_source_type"),
+        "provider_hint": metadata.get("provider_hint"),
+        "original_filename": metadata.get("original_filename"),
+        "imported_at": metadata.get("imported_at"),
+        "exported_prompt": metadata.get("exported_prompt"),
+    }
 
 
 def serialize_image_asset(asset: Asset) -> dict[str, Any]:

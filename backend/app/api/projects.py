@@ -34,6 +34,8 @@ from ..schemas import (
     ProjectDetail,
     ProjectRead,
     ShotRead,
+    ShotPlanningRead,
+    ShotPlanningUpdate,
     SmartMediaRenderRequest,
     VisualSelectionRead,
     VisualSelectionUpdate,
@@ -44,6 +46,7 @@ from ..services.image_jobs import (
     gpu_handoff_error_payload,
     gpu_handoff_status,
     script_from_source_job,
+    matching_script_snapshot,
     write_script_snapshot,
 )
 from ..services.audio_jobs import (
@@ -72,6 +75,7 @@ from ..services.final_media_visuals import (
     validate_video_asset_file,
 )
 from ..services.visual_selection import read_visual_selection, write_visual_selection
+from ..services.shot_planning import effective_shot_plan, update_production_override
 from ..services.best_available_media import (
     BEST_AVAILABLE,
     IMAGE_ONLY,
@@ -370,7 +374,11 @@ def create_demo_project(session: Session = Depends(get_session)) -> ProjectRead:
 
 
 @router.get("/{project_id}", response_model=ProjectDetail)
-def get_project(project_id: str, session: Session = Depends(get_session)) -> ProjectDetail:
+def get_project(
+    project_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> ProjectDetail:
     project = crud.get_project(session, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
@@ -389,6 +397,24 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> Pro
     except (ValueError, ExternalImageError):
         # Projects without a valid ScriptV1 retain the legacy empty selection.
         pass
+    all_jobs = crud.list_jobs(session, project.id)
+    matching_script_job = next(
+        (
+            item
+            for item in sorted(
+                all_jobs,
+                key=lambda value: value.created_at,
+                reverse=True,
+            )
+            if matching_script_snapshot(
+                request.app.state.settings,
+                project=project,
+                source_job=item,
+            )
+            is not None
+        ),
+        None,
+    )
     return ProjectDetail(
         project=ProjectRead.model_validate(project),
         shots=[ShotRead.model_validate(item) for item in database_shots],
@@ -396,6 +422,11 @@ def get_project(project_id: str, session: Session = Depends(get_session)) -> Pro
             job_read_with_media_urls(session, item)
             for item in crud.recent_jobs(session, project.id)
         ],
+        matching_script_job=(
+            job_read_with_media_urls(session, matching_script_job)
+            if matching_script_job is not None
+            else None
+        ),
         video_jobs=[
             job_read_with_media_urls(session, item)
             for item in crud.list_jobs(session, project.id)
@@ -491,11 +522,17 @@ def _best_media_plan(
                 continue
             usable_assets.append(asset)
         assets = usable_assets
+    jobs = crud.list_jobs(session, project.id)
+    compatible_script_job_ids = {
+        job.id
+        for job in jobs
+        if matching_script_snapshot(settings, project=project, source_job=job) is not None
+    }
     plan = resolve_best_available_media(
         script=script,
         database_shots=database_shots,
         assets=assets,
-        jobs=crud.list_jobs(session, project.id),
+        jobs=jobs,
         explicit_image_asset_ids=dict(persisted["source_image_asset_ids"]),
         explicit_video_job_id=(
             str(persisted["source_video_job_id"])
@@ -503,6 +540,7 @@ def _best_media_plan(
             else None
         ),
         preferred_audio_job_id=preferred_audio_job_id,
+        compatible_script_job_ids=compatible_script_job_ids,
         mode=mode,
     )
     validated = BestMediaPlan.model_validate(plan)
@@ -623,6 +661,13 @@ def smart_render_best_media(
         for item in plan.shots
         if item.selected_type == "IMAGE" and item.asset_id
     }
+    selected_images.update(
+        {
+            item.shot_id: str(item.source_image_asset_id)
+            for item in plan.shots
+            if item.selected_type == "VIDEO_SHOT" and item.source_image_asset_id
+        }
+    )
     selected_videos = {
         item.shot_id: str(item.asset_id)
         for item in plan.shots
@@ -681,14 +726,51 @@ def get_external_image_prompt(
         raise HTTPException(status_code=404, detail="项目不存在。")
     try:
         script = ScriptV1.model_validate(project.script_json)
+        script_shot = selected_script_shot(script, shot_id)
+        database_shot = database_shot_for_script_shot(
+            crud.list_shots(session, project.id), script_shot
+        )
         payload = build_external_image_prompt_bundle(
             project_story=project.story,
             script=script,
             shot_id=shot_id,
+            database_shot=database_shot,
         )
     except (ValueError, ExternalImageError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return ExternalImagePromptBundle.model_validate(payload)
+
+
+@router.put(
+    "/{project_id}/shots/{shot_id}/planning",
+    response_model=ShotPlanningRead,
+)
+def update_shot_planning(
+    project_id: str,
+    shot_id: str,
+    payload: ShotPlanningUpdate,
+    session: Session = Depends(get_session),
+) -> ShotPlanningRead:
+    project = crud.get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    try:
+        script = ScriptV1.model_validate(project.script_json)
+        script_shot = selected_script_shot(script, shot_id)
+        database_shot = database_shot_for_script_shot(
+            crud.list_shots(session, project.id), script_shot
+        )
+    except (ValueError, ExternalImageError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    update_production_override(
+        database_shot,
+        keyframe_description=payload.keyframe_description,
+        motion_description=payload.motion_description,
+    )
+    session.commit()
+    return ShotPlanningRead.model_validate(
+        effective_shot_plan(script_shot, database_shot)
+    )
 
 
 @router.post(
@@ -1026,6 +1108,14 @@ def render_project_video(
                     },
                 )
 
+    effective_shot_plans = {}
+    for shot_id in target_shot_ids:
+        script_shot = selected_script_shot(script, shot_id)
+        database_shot = database_shot_for_script_shot(database_shots, script_shot)
+        effective_shot_plans[shot_id] = effective_shot_plan(
+            script_shot, database_shot
+        )
+
     job = crud.create_job(
         session,
         project=project,
@@ -1038,6 +1128,7 @@ def render_project_video(
             "source_image_asset_id": payload.source_image_asset_id,
             "source_image_asset_ids": selected_asset_ids,
             "target_shot_ids": target_shot_ids,
+            "effective_shot_plans": effective_shot_plans,
             "video_provider": payload.video_provider,
             "video_model_id": (
                 "wan2.7-i2v-2026-04-25"
@@ -1070,7 +1161,7 @@ def render_project_with_real_audio(
     request: Request,
     session: Session = Depends(get_session),
 ) -> JobQueued:
-    """复用成功 M4-B ScriptV1 与真实 PNG，创建不调用上游模型的旁白 Job。"""
+    """复用成功 ScriptV1 生成旁白；图片仅作为旧链路的可选追溯。"""
 
     project = crud.get_project(session, project_id)
     if project is None:
@@ -1081,35 +1172,80 @@ def render_project_with_real_audio(
             detail="当前项目仍有任务正在等待或运行，请完成后再生成真实 AI 旁白。",
         )
 
-    source_image_job = crud.get_job(session, payload.source_image_job_id)
-    if (
-        source_image_job is None
-        or source_image_job.project_id != project.id
-        or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
-        or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
-        or source_image_job.status != JobStatus.SUCCEEDED
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="只能复用当前项目中已经成功的 M4-B 真实图像 Job。",
+    source_image_job = None
+    source_result: dict[str, object] = {}
+    source_images: list[dict[str, object]] = []
+    if payload.source_image_job_id is not None:
+        source_image_job = crud.get_job(session, payload.source_image_job_id)
+        if (
+            source_image_job is None
+            or source_image_job.project_id != project.id
+            or source_image_job.job_type != REAL_IMAGE_JOB_TYPE
+            or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
+            or source_image_job.status != JobStatus.SUCCEEDED
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="所选 Image Job 不是当前项目中成功的真实 Animagine Job。",
+            )
+        source_result = dict(source_image_job.result_json or {})
+        raw_images = source_result.get("image_shots")
+        if (
+            source_result.get("image_provider") != REAL_IMAGE_PROVIDER_ID
+            or source_result.get("mock_image_fallback") is not False
+            or not isinstance(raw_images, list)
+            or not 3 <= len(raw_images) <= 5
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="所选 Image Job 没有可验证的完整真实关键帧追溯。",
+            )
+        source_images = [dict(item) for item in raw_images if isinstance(item, dict)]
+
+    source_script_job_id = str(
+        payload.source_script_job_id
+        or source_result.get("source_script_job_id")
+        or (
+            (source_image_job.request_json or {}).get("source_script_job_id")
+            if source_image_job is not None
+            else None
         )
-    source_result = dict(source_image_job.result_json or {})
-    if (
-        source_result.get("image_provider") != REAL_IMAGE_PROVIDER_ID
-        or source_result.get("mock_image_fallback") is not False
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="来源 Job 没有可证明为真实模型生成的完整关键帧。",
+        or ""
+    )
+    settings: Settings = request.app.state.settings
+    source_script_job = (
+        crud.get_job(session, source_script_job_id) if source_script_job_id else None
+    )
+    matched_script = (
+        matching_script_snapshot(
+            settings,
+            project=project,
+            source_job=source_script_job,
         )
-    source_images = source_result.get("image_shots")
-    if not isinstance(source_images, list) or not 3 <= len(source_images) <= 5:
+        if source_script_job is not None
+        else None
+    )
+    if matched_script is None and not source_script_job_id:
+        for candidate in sorted(
+            crud.list_jobs(session, project.id),
+            key=lambda value: value.created_at,
+            reverse=True,
+        ):
+            matched_script = matching_script_snapshot(
+                settings,
+                project=project,
+                source_job=candidate,
+            )
+            if matched_script is not None:
+                source_script_job = candidate
+                source_script_job_id = candidate.id
+                break
+    if source_script_job is None or matched_script is None:
         raise HTTPException(
             status_code=409,
-            detail="来源真实图像 Job 的逐镜头关键帧追溯不完整。",
+            detail="生成真实旁白需要当前项目中成功且与当前剧本对应的 Script Job。",
         )
 
-    settings: Settings = request.app.state.settings
     handoff = audio_gpu_handoff_status(settings)
     if handoff["conflict"]:
         raise HTTPException(
@@ -1139,21 +1275,7 @@ def render_project_with_real_audio(
             },
         )
 
-    try:
-        script, source_trace = script_from_source_job(
-            settings,
-            project=project,
-            source_job=source_image_job,
-        )
-    except RuntimeError as exc:
-        detail = getattr(exc, "generation_error", str(exc))
-        raise HTTPException(status_code=409, detail=detail) from exc
-    script_json = script.model_dump(mode="json")
-    if project.script_json != script_json:
-        raise HTTPException(
-            status_code=409,
-            detail="来源真实图像 Job 已不是项目当前 ScriptV1，拒绝生成旁白。",
-        )
+    script, source_trace = matched_script
 
     database_shots = crud.list_shots(session, project.id)
     persisted_selection = read_visual_selection(
@@ -1191,19 +1313,10 @@ def render_project_with_real_audio(
         ),
     )
 
-    source_script_job_id = str(
-        source_result.get("source_script_job_id")
-        or (source_image_job.request_json or {}).get("source_script_job_id")
-        or ""
-    )
     source_script_provider = str(
-        source_result.get("source_script_provider") or "unknown"
+        (source_script_job.result_json or {}).get("script_provider")
+        or source_script_job.provider_id
     )
-    if not source_script_job_id:
-        raise HTTPException(
-            status_code=409,
-            detail="来源真实图像 Job 缺少原始 Script Job 追溯。",
-        )
 
     job = crud.create_job(
         session,
@@ -1218,9 +1331,11 @@ def render_project_with_real_audio(
             project_id=project.id,
             audio_job_id=job.id,
             source_script_job_id=source_script_job_id,
-            source_image_job_id=source_image_job.id,
+            source_image_job_id=(source_image_job.id if source_image_job else None),
             source_script_provider=source_script_provider,
-            source_image_provider=REAL_IMAGE_PROVIDER_ID,
+            source_image_provider=(
+                REAL_IMAGE_PROVIDER_ID if source_image_job is not None else None
+            ),
             script=script,
             source_images=source_images,
             source_trace=source_trace,
@@ -1238,9 +1353,9 @@ def render_project_with_real_audio(
     source_duration = sum(float(shot.duration_seconds) for shot in script.shots)
     job.request_json = {
         "project_id": project.id,
-        "parent_job_id": source_image_job.id,
+        "parent_job_id": source_image_job.id if source_image_job else source_script_job.id,
         "source_script_job_id": source_script_job_id,
-        "source_image_job_id": source_image_job.id,
+        "source_image_job_id": source_image_job.id if source_image_job else None,
         "source_image_asset_ids": selected_image_asset_ids,
         "source_video_job_id": (
             source_video_job.id if source_video_job is not None else None
@@ -1249,8 +1364,8 @@ def render_project_with_real_audio(
         "script_provider": "reused",
         "source_script_provider": source_script_provider,
         "script_provider_calls_expected": 0,
-        "image_provider": "reused",
-        "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+        "image_provider": "reused" if source_image_job else None,
+        "source_image_provider": REAL_IMAGE_PROVIDER_ID if source_image_job else None,
         "image_provider_calls_expected": 0,
         "video_provider": "reused" if source_video_job is not None else None,
         "source_video_provider": (
@@ -1258,6 +1373,8 @@ def render_project_with_real_audio(
         ),
         "video_provider_calls_expected": 0,
         "source_image_model_id": source_result.get("image_model_id"),
+        "audio_only": source_image_job is None,
+        "auto_media_render": source_image_job is not None,
         "audio_provider": payload.audio_provider,
         "speaker": payload.speaker,
         "language": payload.language,
@@ -1343,18 +1460,15 @@ def rerender_project_media_only(
         or ""
     )
     source_script_job = crud.get_job(session, source_script_job_id)
-    source_image_job = crud.get_job(session, source_image_job_id)
+    source_image_job = (
+        crud.get_job(session, source_image_job_id) if source_image_job_id else None
+    )
     if source_script_job is None:
         raise _rerender_source_error(
             "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 不存在。"
         )
-    if source_image_job is None:
-        raise _rerender_source_error(
-            "SOURCE_IMAGE_JOB_NOT_FOUND", "来源真实图片 Job 不存在。"
-        )
-    if (
-        source_script_job.project_id != project.id
-        or source_image_job.project_id != project.id
+    if source_script_job.project_id != project.id or (
+        source_image_job is not None and source_image_job.project_id != project.id
     ):
         raise _rerender_source_error(
             "SOURCE_JOB_PROJECT_MISMATCH", "剧本、图片和旁白来源必须属于同一个项目。"
@@ -1363,7 +1477,7 @@ def rerender_project_media_only(
         raise _rerender_source_error(
             "SOURCE_SCRIPT_NOT_FOUND", "来源 ScriptV1 Job 尚未成功。"
         )
-    if (
+    if source_image_job is not None and (
         source_image_job.job_type != REAL_IMAGE_JOB_TYPE
         or source_image_job.provider_id != REAL_IMAGE_PROVIDER_ID
         or source_image_job.status != JobStatus.SUCCEEDED
@@ -1407,6 +1521,14 @@ def rerender_project_media_only(
             raise _rerender_source_error(
                 "SOURCE_IMAGE_MISSING", f"显式图片资产不可用：{exc}"
             ) from exc
+
+    if source_image_job is None and set(selected_image_asset_ids) != {
+        shot.id for shot in script.shots
+    }:
+        raise _rerender_source_error(
+            "SOURCE_IMAGE_MISSING",
+            "该旁白 Job 没有旧 Image Job 追溯，成片前必须为每个镜头明确选择关键帧资产。",
+        )
 
     source_video_job = None
     source_video_asset_ids: dict[str, str] = {}
@@ -1491,7 +1613,7 @@ def rerender_project_media_only(
             "project_id": project.id,
             "parent_job_id": source_audio_job.id,
             "source_script_job_id": source_script_job.id,
-            "source_image_job_id": source_image_job.id,
+            "source_image_job_id": source_image_job.id if source_image_job else None,
             "source_audio_job_id": source_audio_job.id,
             "source_video_job_id": (
                 source_video_job.id if source_video_job is not None else None
@@ -1504,7 +1626,9 @@ def rerender_project_media_only(
             "source_script_provider": (
                 audio_result.get("source_script_provider") or source_script_job.provider_id
             ),
-            "source_image_provider": REAL_IMAGE_PROVIDER_ID,
+            "source_image_provider": (
+                REAL_IMAGE_PROVIDER_ID if source_image_job else "selected-assets"
+            ),
             "source_audio_provider": REAL_AUDIO_PROVIDER_ID,
             "video_provider": "reused" if source_video_job is not None else None,
             "source_video_provider": (

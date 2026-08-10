@@ -66,6 +66,30 @@ class ShotRead(ApiModel):
     updated_at: datetime
 
 
+class ShotPlanningUpdate(BaseModel):
+    keyframe_description: str | None = Field(default=None, max_length=2000)
+    motion_description: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("keyframe_description", "motion_description")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class ShotPlanningRead(BaseModel):
+    shot_id: str
+    title: str
+    keyframe_description: str
+    motion_description: str
+    narration: str
+    planning_source: Literal["LLM", "LLM_WITH_HUMAN_OVERRIDE"]
+    override: dict[str, str] = Field(default_factory=dict)
+    original: dict[str, str]
+
+
 class JobRead(ApiModel):
     id: str
     project_id: str
@@ -121,6 +145,7 @@ class ProjectDetail(BaseModel):
     project: ProjectRead
     shots: list[ShotRead]
     recent_jobs: list[JobRead]
+    matching_script_job: JobRead | None = None
     video_jobs: list[JobRead] = Field(default_factory=list)
     latest_export: ExportRead | None
     image_assets: list["ImageAssetRead"] = Field(default_factory=list)
@@ -154,7 +179,8 @@ class RealImageRenderRequest(MediaPolishOptions):
 
 
 class RealAudioRenderRequest(MediaPolishOptions):
-    source_image_job_id: str = Field(min_length=1, max_length=36)
+    source_script_job_id: str | None = Field(default=None, min_length=1, max_length=36)
+    source_image_job_id: str | None = Field(default=None, min_length=1, max_length=36)
     source_video_job_id: str | None = Field(default=None, min_length=1, max_length=36)
     source_image_asset_ids: dict[str, str] = Field(default_factory=dict)
     audio_provider: Literal["qwen3-tts-0.6b-customvoice"] = (

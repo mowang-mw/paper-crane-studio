@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.app.models import Asset, GenerationJob, JobStatus, Shot as DatabaseShot
@@ -93,33 +94,48 @@ def _real_audio(job_id: str = "real-audio-job") -> GenerationJob:
         status=JobStatus.SUCCEEDED,
         progress=100,
         provider_id="qwen3-tts-0.6b-customvoice",
-        request_json={},
+        request_json={"source_script_job_id": "script-job"},
         result_json={
             "mock_audio_fallback": False,
             "audio_source_type": "REAL_LOCAL_MODEL",
             "source_script_job_id": "script-job",
             "source_image_job_id": "legacy-image-job",
             "speaker": "Serena",
-            "audio_shots": [{"shot_id": f"shot{index}"} for index in range(1, 4)],
+            "audio_shots": [
+                {
+                    "shot_id": f"shot{index}",
+                    "status": "SUCCEEDED",
+                    "audio_path": f"audio/shot-{index:02d}.wav",
+                    "audio_sha256": str(index) * 64,
+                    "duration_seconds": 1.0,
+                }
+                for index in range(1, 4)
+            ],
             "timing_plan": {"shots": [{"shot_id": f"shot{index}"} for index in range(1, 4)]},
         },
     )
 
 
-def _mock_audio(job_id: str = "mock-audio-job") -> GenerationJob:
+def _script_job(*, script=None) -> GenerationJob:
+    current = script or _script()
     return GenerationJob(
-        id=job_id,
+        id="script-job",
         project_id=PROJECT_ID,
         job_type="GENERATE_SHORT_VIDEO",
         status=JobStatus.SUCCEEDED,
         progress=100,
-        provider_id="mock",
+        provider_id="llamacpp",
         request_json={},
-        result_json={
-            "source_type": "DETERMINISTIC_FALLBACK",
-            "audio_provider": "mock",
-        },
+        result_json={"script_json": current.model_dump(mode="json")},
     )
+
+
+def _mock_audio(job_id: str = "mock-audio-job") -> GenerationJob:
+    job = _real_audio(job_id)
+    job.provider_id = "mock"
+    job.result_json["mock_audio_fallback"] = True
+    job.result_json["audio_source_type"] = "DETERMINISTIC_FALLBACK"
+    return job
 
 
 def _video_job(
@@ -169,11 +185,15 @@ def _plan(
     preferred_audio: str | None = None,
     mode: str = "BEST_AVAILABLE",
 ) -> dict[str, Any]:
+    job_list = list(jobs or [_legacy_job(), _real_audio()])
+    if not any(job.id == "script-job" for job in job_list):
+        job_list.append(_script_job())
     return resolve_best_available_media(
         script=_script(),
         database_shots=_database_shots(),
         assets=assets or [],
-        jobs=jobs or [_legacy_job(), _real_audio()],
+        jobs=job_list,
+        compatible_script_job_ids={"script-job"},
         explicit_image_asset_ids=explicit_images or {},
         explicit_video_job_id=explicit_video,
         preferred_audio_job_id=preferred_audio,
@@ -291,7 +311,7 @@ def test_external_import_is_non_mock_without_claiming_an_api_provider() -> None:
     assert selected["provider_hint"] == "ChatGPT Images"
 
 
-def test_audio_real_then_mock_priority_ambiguity_and_missing_boundary() -> None:
+def test_audio_real_then_mock_priority_latest_and_missing_boundary() -> None:
     real = _real_audio()
     mock = _mock_audio()
     plan = _plan(jobs=[_legacy_job(), real, mock])
@@ -299,12 +319,64 @@ def test_audio_real_then_mock_priority_ambiguity_and_missing_boundary() -> None:
     only_mock = _plan(jobs=[_legacy_job(), mock])
     assert only_mock["audio"]["job_id"] == mock.id
     assert only_mock["audio"]["is_mock"] is True
-    ambiguous = _plan(jobs=[_legacy_job(), real, _real_audio("real-audio-2")])
-    assert ambiguous["status"] == "AMBIGUOUS"
-    assert any(item["code"] == "AMBIGUOUS_AUDIO" for item in ambiguous["problems"])
+    now = datetime.now(UTC)
+    real.finished_at = now
+    latest = _real_audio("real-audio-2")
+    latest.finished_at = now + timedelta(seconds=1)
+    selected = _plan(jobs=[_legacy_job(), real, latest])
+    assert selected["status"] == "READY"
+    assert selected["audio"]["job_id"] == latest.id
+    assert "最新成功" in selected["audio"]["reason"]
     missing = _plan(jobs=[_legacy_job()])
     assert missing["status"] == "BLOCKED"
     assert any(item["code"] == "NO_AUDIO_JOB" for item in missing["problems"])
+
+
+def test_audio_latest_failed_or_old_lineage_is_ignored() -> None:
+    current = _real_audio("current-audio")
+    current.finished_at = datetime.now(UTC)
+    failed = _real_audio("failed-audio")
+    failed.status = JobStatus.FAILED
+    old = _real_audio("old-audio")
+    old.result_json["source_script_job_id"] = "old-script"
+    plan = _plan(jobs=[_legacy_job(), _script_job(), current, failed, old])
+    assert plan["status"] == "READY"
+    assert plan["audio"]["job_id"] == current.id
+
+
+def test_audio_running_queued_incomplete_and_stable_tie_break_are_ignored() -> None:
+    now = datetime.now(UTC)
+    stable_a = _real_audio("audio-a")
+    stable_a.finished_at = now
+    stable_b = _real_audio("audio-b")
+    stable_b.finished_at = now
+    running = _real_audio("audio-running")
+    running.status = JobStatus.RUNNING
+    running.finished_at = now + timedelta(seconds=5)
+    queued = _real_audio("audio-queued")
+    queued.status = JobStatus.QUEUED
+    queued.finished_at = now + timedelta(seconds=6)
+    incomplete = _real_audio("audio-incomplete")
+    incomplete.result_json["audio_shots"][0]["audio_sha256"] = ""
+    incomplete.finished_at = now + timedelta(seconds=7)
+
+    plan = _plan(
+        jobs=[_legacy_job(), stable_a, stable_b, running, queued, incomplete]
+    )
+    assert plan["status"] == "READY"
+    assert plan["audio"]["job_id"] == "audio-b"
+
+
+def test_preferred_audio_job_id_keeps_explicit_compatible_selection() -> None:
+    older = _real_audio("audio-older")
+    older.finished_at = datetime.now(UTC)
+    newer = _real_audio("audio-newer")
+    newer.finished_at = older.finished_at + timedelta(seconds=1)
+    selected = _plan(
+        jobs=[_legacy_job(), older, newer],
+        preferred_audio=older.id,
+    )
+    assert selected["audio"]["job_id"] == older.id
 
 
 def test_image_only_ignores_real_and_mock_video_assets() -> None:

@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from backend.app import crud
 from backend.app.config import Settings
 from backend.app.database import Database
 from backend.app.models import Asset, JobStatus
@@ -359,6 +360,131 @@ def _allow_audio_worker(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     )
     monkeypatch.setattr("backend.app.worker.GpuMemoryMonitor", _FakeGpuMonitor)
+
+
+def test_real_audio_without_animagine_job_generates_wav_and_timing_only(
+    client: TestClient,
+    settings: Settings,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, script_job_id = _source_job(client, settings, database)
+    override = client.put(
+        f"/api/projects/{project_id}/shots/shot_02/planning",
+        json={
+            "keyframe_description": "少女站在原地，列车已经停靠。",
+            "motion_description": "车门打开，少女保持原地。",
+        },
+    )
+    assert override.status_code == 200, override.text
+    monkeypatch.setattr(
+        "backend.app.api.projects.audio_gpu_handoff_status",
+        lambda _settings: {"conflict": False},
+    )
+    response = client.post(
+        f"/api/projects/{project_id}/render-real-audio",
+        json={
+            "source_script_job_id": script_job_id,
+            "audio_provider": REAL_AUDIO_PROVIDER_ID,
+            "speaker": "Serena",
+            "language": "Chinese",
+        },
+    )
+    assert response.status_code == 202, response.text
+    job_id = response.json()["job_id"]
+    queued = client.get(f"/api/jobs/{job_id}").json()
+    assert queued["request_json"]["source_image_job_id"] is None
+    assert queued["request_json"]["audio_only"] is True
+
+    _allow_audio_worker(monkeypatch)
+    _forbid_upstream_provider_calls(monkeypatch)
+
+    def forbid_media_render(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("audio-only generation must not render final media")
+
+    worker = Worker(
+        settings=settings,
+        database=database,
+        audio_provider_factory=lambda _settings: _FakeRealAudioProvider(),
+        real_audio_renderer=forbid_media_render,
+    )
+    assert worker.run_once() is True
+    payload = client.get(f"/api/jobs/{job_id}").json()
+    assert payload["status"] == "SUCCEEDED", payload
+    result = payload["result_json"]
+    assert result["audio_only"] is True
+    assert result["final_media_available"] is False
+    assert result["source_image_job_id"] is None
+    assert isinstance(result["timing_plan"], dict)
+    assert len(result["audio_shots"]) == 3
+    assert all(item["audio_url"] for item in result["audio_shots"])
+    with database.session() as session:
+        assert not any(
+            job.job_type == "GENERATE_REAL_IMAGE_VIDEO"
+            for job in crud.list_jobs(session, project_id)
+        )
+
+
+def test_matching_script_job_ignores_production_override_but_detects_script_change(
+    client: TestClient,
+    settings: Settings,
+    database: Database,
+) -> None:
+    project_id, script_job_id = _source_job(client, settings, database)
+    saved = client.put(
+        f"/api/projects/{project_id}/shots/shot_02/planning",
+        json={
+            "keyframe_description": "制作层静态首帧校正",
+            "motion_description": "制作层后续运动校正",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    with database.session() as session:
+        project = crud.get_project(session, project_id)
+        assert project is not None
+        for index in range(12):
+            job = crud.create_job(
+                session,
+                project=project,
+                provider_id="test-runtime",
+                job_type=f"RUNTIME_ONLY_{index}",
+            )
+            job.status = JobStatus.SUCCEEDED
+            job.progress = 100
+        session.commit()
+
+    detail = client.get(f"/api/projects/{project_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["matching_script_job"]["id"] == script_job_id
+    assert not any(
+        item["id"] == script_job_id for item in detail.json()["recent_jobs"]
+    )
+
+    with database.session() as session:
+        project = crud.get_project(session, project_id)
+        assert project is not None
+        changed = json.loads(json.dumps(project.script_json, ensure_ascii=False))
+        changed["shots"][1]["narration"] = "这是一段真正变化后的不同旁白。"
+        project.script_json = changed
+        session.commit()
+    changed_detail = client.get(f"/api/projects/{project_id}")
+    assert changed_detail.status_code == 200
+    assert changed_detail.json()["matching_script_job"] is None
+
+
+def test_audio_without_successful_script_job_remains_blocked(
+    client: TestClient,
+) -> None:
+    project = client.post(
+        "/api/projects",
+        json={"title": "无剧本来源", "story": "这是一个尚未生成结构化剧本的测试故事。"},
+    ).json()
+    response = client.post(
+        f"/api/projects/{project['id']}/render-real-audio",
+        json={"speaker": "Serena", "language": "Chinese"},
+    )
+    assert response.status_code == 409
+    assert "成功且与当前剧本对应的 Script Job" in response.text
 
 
 def _forbid_upstream_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -188,6 +188,7 @@ def test_external_prompt_is_deterministic_and_selected_shot_scoped(
     assert first.json() == second.json()
     prompt = first.json()["prompt"]
     assert first.json()["adapter"] == "external-natural-language-v1"
+    assert "静态关键帧" in prompt
     assert "只属于镜头1的动作标记" in prompt
     assert "只属于镜头1的构图标记" in prompt
     assert "只属于镜头2" not in prompt
@@ -199,6 +200,31 @@ def test_external_prompt_is_deterministic_and_selected_shot_scoped(
     assert shot2["source_fields"]["visual_description"] != first.json()[
         "source_fields"
     ]["visual_description"]
+
+
+def test_production_override_separates_keyframe_and_motion_without_rewriting_script(
+    client: TestClient, database: Database
+) -> None:
+    project_id, script = _seed_project(database)
+    keyframe = "人物站在原地，列车已经停靠，车门区域亮起但尚未打开。"
+    motion = "车门缓缓打开，人物保持原地，不向前移动。"
+    updated = client.put(
+        f"/api/projects/{project_id}/shots/shot2/planning",
+        json={"keyframe_description": keyframe, "motion_description": motion},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["planning_source"] == "LLM_WITH_HUMAN_OVERRIDE"
+    prompt = client.get(
+        f"/api/projects/{project_id}/shots/shot2/external-image-prompt"
+    ).json()
+    assert keyframe in prompt["prompt"]
+    assert motion not in prompt["prompt"]
+    assert prompt["source_fields"]["motion_description"] == motion
+    assert prompt["lineage"]["planning_source"] == "LLM_WITH_HUMAN_OVERRIDE"
+    with database.session() as session:
+        project = crud.get_project(session, project_id)
+        assert project is not None
+        assert project.script_json == script.model_dump(mode="json")
 
 
 def test_png_and_jpeg_import_preserve_existing_asset_and_provenance(
