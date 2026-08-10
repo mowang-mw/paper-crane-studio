@@ -66,6 +66,7 @@ import type {
   VideoMode,
   VideoProviderStatus,
 } from "./types";
+import { formatLocalDateTime } from "./local-time.js";
 
 const PAPER_CRANE_STORY =
   "深夜，少女在窗边折出一只纸鹤。纸鹤亮起微光，飞过屋顶、灯火与云层；黎明时，它飞向远方，少女在窗边静静注视。";
@@ -838,9 +839,7 @@ function jobModelId(job: GenerationJob | null): string | null {
 }
 
 function formatCheckedAt(value: string | null | undefined): string {
-  if (!value) return "尚未检查";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
+  return formatLocalDateTime(value);
 }
 
 function providerName(providerId: ScriptProviderId): string {
@@ -2073,17 +2072,30 @@ export default function App() {
 
   const persistVideoSelection = async (videoJobId: string) => {
     if (!selectedId) return;
-    setBusy("visual-selection-video");
+    setBusy(`visual-selection-video-${videoJobId}`);
     setError("");
+    setNotice(null);
     try {
       const persisted = await updateVisualSelection(
         selectedId,
         selectedVideoImageAssets,
-        videoJobId || null,
+        videoJobId,
       );
+      if (persisted.source_video_job_id !== videoJobId) {
+        throw new Error("后端未确认目标动态视频版本，请重新加载后再试。");
+      }
       setSelectedVideoImageAssets(persisted.source_image_asset_ids);
-      setSelectedFinalVideoJobId(persisted.source_video_job_id ?? "");
-      await refreshDetail(selectedId);
+      setSelectedFinalVideoJobId(videoJobId);
+      const refreshed = await refreshDetail(selectedId);
+      if (refreshed.visual_selection.source_video_job_id !== videoJobId) {
+        throw new Error("项目重读结果与刚选择的动态视频版本不一致。");
+      }
+      setNotice({
+        kind: "success",
+        message: `已将 Video Job ${videoJobId.slice(0, 8)} 设为当前动态视频版本。`,
+        action: "composition",
+        actionLabel: "查看成片计划",
+      });
     } catch (cause) {
       setError(`动态视频来源保存失败：${readableError(cause)}`);
       await refreshDetail(selectedId);
@@ -4005,7 +4017,11 @@ export default function App() {
                     const isCurrent = selectedFinalVideoJobId === job.id;
                     const isReal = job.result_json?.video_source_type === "REAL_CLOUD_MODEL";
                     return (
-                      <article className={`video-version-item ${isCurrent ? "is-current" : ""}`} key={job.id}>
+                      <article
+                        className={`video-version-item ${isCurrent ? "is-current" : ""}`}
+                        key={job.id}
+                        aria-current={isCurrent ? "true" : undefined}
+                      >
                         <div>
                           <strong>{isReal ? "Wan 2.7 Cloud" : "Mock Video"}</strong>
                           <span>{isReal ? "REAL" : "MOCK"} · Job {job.id.slice(0, 8)}</span>
@@ -4020,7 +4036,7 @@ export default function App() {
                         </div>
                         <div className="video-version-actions">
                           <span className={`video-version-state ${hasStaleLineage ? "is-stale" : "is-ready"}`}>
-                            {hasStaleLineage ? "STALE" : "READY"}
+                            {hasStaleLineage ? "STALE · 旧关键帧" : "READY · 当前关键帧"}
                           </span>
                           <button
                             className="button button-ghost"
@@ -4029,23 +4045,17 @@ export default function App() {
                             disabled={isCurrent || busy !== null || generationInProgress}
                             onClick={() => void persistVideoSelection(job.id)}
                           >
-                            {isCurrent ? "当前版本" : "设为当前"}
+                            {isCurrent
+                              ? "当前版本"
+                              : busy === `visual-selection-video-${job.id}`
+                                ? "正在切换…"
+                                : "设为当前"}
                           </button>
                         </div>
                       </article>
                     );
                   })}
                 </div>
-                {selectedFinalVideoJobId && (
-                  <button
-                    className="button button-ghost video-version-clear"
-                    type="button"
-                    disabled={busy !== null || generationInProgress}
-                    onClick={() => void persistVideoSelection("")}
-                  >
-                    清除当前动态版本
-                  </button>
-                )}
               </section>
             )}
             <div className="composition-plan-grid">

@@ -409,10 +409,12 @@ def test_video_preferred_same_class_selection_and_stale_lineage() -> None:
         assets=[current, *first_assets],
         jobs=[_legacy_job(), _real_audio(), first_job],
         explicit_images={"shot1": current.id},
+        explicit_video=first_job.id,
     )
     assert _shot(stale)["selected_type"] == "IMAGE"
     assert any(item["code"] == "STALE_VIDEO_LINEAGE" for item in stale["warnings"])
     assert stale["status"] == "BLOCKED"
+    assert all(item["asset_id"] != first_assets[0].id for item in stale["shots"])
 
 
 def test_explicit_partial_video_version_ignores_other_historical_jobs() -> None:

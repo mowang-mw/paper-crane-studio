@@ -133,7 +133,6 @@
 .video-version-state { padding: 4px 6px; border-radius: 3px; font-weight: 900; }
 .video-version-state.is-ready { background: #e6f4eb; color: #26734b; }
 .video-version-state.is-stale { background: #fff2df; color: #965b18; }
-.video-version-clear { margin-top: 10px; min-height: 32px; font-size: 9px; }
 
 @media (max-width: 580px) {
   .demo-status-heading { align-items: flex-start; flex-direction: column; gap: 7px; }

@@ -288,6 +288,18 @@ def test_new_video_version_preserves_history_and_manual_selection(
     refreshed = client.get(f"/api/projects/{project_id}").json()
     assert refreshed["visual_selection"]["source_video_job_id"] == job_ids[0]
     assert {job["id"] for job in refreshed["video_jobs"]} == set(job_ids)
+    switched_plan = client.get(
+        f"/api/projects/{project_id}/best-media-plan",
+        params={"mode": "VIDEO_PREFERRED"},
+    ).json()
+    assert not any(
+        item["code"] == "AMBIGUOUS_VISUAL" for item in switched_plan["problems"]
+    )
+    assert {
+        item["source_job_id"]
+        for item in switched_plan["shots"]
+        if item["selected_type"] == "VIDEO_SHOT"
+    } == {job_ids[0]}
 
 
 def test_video_provider_failure_marks_job_failed_without_success_fallback(
