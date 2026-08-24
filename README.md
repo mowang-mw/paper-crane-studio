@@ -120,4 +120,4 @@ Supported integrations include Qwen3, Qwen3-TTS, Animagine XL 4.0, llama.cpp, Co
 
 ## License
 
-No project license has been selected yet. Until a license is added, treat the repository as source-available for evaluation and do not assume permission to redistribute or deploy it. Third-party models, runtimes, and cloud services remain governed by their own licenses and terms.
+Paper Crane Studio's own source code and documentation are released under the [MIT License](LICENSE). Third-party models, weights, runtimes, binaries, and cloud services are not covered by the project license and are not distributed with this repository; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
