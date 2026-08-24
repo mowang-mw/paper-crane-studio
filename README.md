@@ -1,100 +1,123 @@
-# 纸鹤工坊：本地多模型动漫制作平台
+# Paper Crane Studio
 
-纸鹤工坊是一个可运行、可演示的多模型动漫制作平台原型。它面向“使用大语言模型和开源模型完成动漫生产流程”的当前开发范围，将故事输入、结构化剧本、动漫关键帧、中文旁白和最终成片组织为可追踪的本地工作流，而不是把若干模型调用拼成一次性脚本。
+Paper Crane Studio is a local, staged media pipeline for turning a story into a short animated sequence. It combines structured script generation, keyframe images, narration, optional video generation, and deterministic FFmpeg composition behind one job-oriented API and web UI.
 
-## 已验证的真实链路
+The core flow is:
 
 ```text
-Qwen3-4B（结构化剧本）
-  -> Animagine XL 4.0（动漫关键帧）
-  -> Qwen3-TTS 0.6B CustomVoice / Serena（中文旁白）
-  -> FFmpeg（字幕、镜头运动、混音、Poster、封装）
-  -> MP4 + Manifest
+Story -> ScriptV1 -> Keyframe -> Video / Audio -> Composition -> Final Media
 ```
 
-这条链路已在本机 RTX 4060 8GB 环境中实际运行并产出成片。真实任务失败时会明确失败，不会静默改报为 Mock 成功。Mock Provider 仍被保留，用于离线开发、快速回归和无模型环境演示。
+## Features
 
-> 模型决定生成质量上限，平台决定模型能否被稳定、可追溯、可组合地用于生产流程。
+- Project and story management with a versioned `ScriptV1` schema.
+- Provider contracts with safe Mock implementations for offline development.
+- Optional Qwen3 text generation through a local llama.cpp server.
+- Optional Animagine XL 4.0 keyframes through ComfyUI.
+- Optional Qwen3-TTS narration in a dedicated Python environment.
+- Optional Cloud Wan 2.7 image-to-video jobs through DashScope.
+- External Image Bridge for manually importing images created outside this repository.
+- Single-Worker staged execution, job snapshots, retries, manifests, and media validation.
+- FFmpeg composition with subtitles, camera motion, audio ducking, and final MP4 output.
 
-## 核心能力
+## Architecture
 
-- 项目与故事管理，以及面向演示的项目搜索、真实成片筛选、排序和分页。
-- Provider 抽象：Script、Image、Audio 均有 Mock/真实实现和统一状态展示。
-- SQLite Job 队列、单 Worker 顺序执行、请求快照、失败信息和重试。
-- `ScriptV1` 结构化剧本，以及角色、场景和逐镜头数据。
-- Animagine XL 4.0 真实关键帧和逐镜头 Qwen3-TTS WAV 旁白。
-- FFmpeg 中文字幕、`static` / `gentle_zoom` / `cinematic_pan` 镜头运动。
-- 用户自有背景音上传、循环/裁剪、淡入淡出和旁白 ducking。
-- 1280x720 Poster、MP4 与 Manifest 公共下载入口。
-- `MEDIA_RERENDER`：复用现有 ScriptV1、PNG 和 WAV，仅重新运行 FFmpeg；三类模型 Provider 调用数均为 0。
-- Manifest 记录来源 Job、Provider、模型、素材哈希、时序和复用关系。
+The FastAPI backend owns projects, jobs, provider contracts, media metadata, and the SQLite database. A separate Worker polls the job queue and executes one stage at a time. The React frontend talks to the backend over the `/api` prefix. Model runtimes remain separate processes or environments and are only needed when a real provider is selected.
 
-## 快速启动
+## Pipeline
 
-### 环境前提
+```text
+Web UI / API client
+        -> FastAPI backend
+        -> SQLite job queue
+        -> single Worker
+        -> Script provider (Mock or Qwen3/llama.cpp)
+        -> Image provider (Mock or Animagine XL/ComfyUI)
+        -> Audio provider (Mock or Qwen3-TTS)
+        -> Video provider (Mock or Cloud Wan 2.7)
+        -> FFmpeg composition
+        -> media files and a traceable manifest
+```
 
-已验证环境见 [ENVIRONMENT.md](ENVIRONMENT.md)：Windows、Conda 环境 `anime-platform`、Python 3.11、Node.js 24、npm 11、FFmpeg 8.0。首次使用需按仓库既有依赖文件安装 Python 与前端依赖；模型权重不纳入 Git。
+The Worker is staged and single-process. Providers are not advertised as concurrently resident; this makes local GPU hand-off explicit and keeps the Mock path usable on a clean checkout.
 
-打开三个 PowerShell 终端，均从项目根目录运行：
+## Quick Start (Mock mode)
+
+Requirements: Python 3.11+, Node.js 20.19+, npm, and `ffmpeg` plus `ffprobe` on `PATH`. Conda is recommended for the backend and Worker.
 
 ```powershell
+conda create -n anime-platform python=3.11
 conda activate anime-platform
-.\scripts\run_backend.ps1
+python -m pip install -r backend/requirements.txt
+Copy-Item .env.example .env
+Set-Location frontend
+npm install
+Set-Location ..
 ```
+
+Start all three local services in separate PowerShell windows:
 
 ```powershell
-conda activate anime-platform
-.\scripts\run_worker.ps1
+.\scripts\run_demo.ps1
 ```
+
+Or start them individually:
 
 ```powershell
-.\scripts\run_frontend.ps1
+.\scripts\run_backend.ps1       # FastAPI at http://127.0.0.1:8000
+.\scripts\run_worker.ps1        # queue worker
+.\scripts\run_frontend.ps1      # Vite at http://127.0.0.1:5173
 ```
 
-浏览器打开 `http://127.0.0.1:5173`。后端默认地址为 `http://127.0.0.1:8000/api`。
+The launcher starts Backend, Worker, and Frontend only. It does not start llama.cpp, ComfyUI, Qwen3-TTS, or Cloud Wan. Mock providers let the basic workflow run without model weights or cloud credentials. The scripts read process environment variables; they do not automatically parse `.env`, so import any non-default settings into the PowerShell session before starting a provider. Use `.\scripts\stop_demo.ps1` to stop processes created by the launcher.
 
-查看已有演示项目、播放现有 WAV/MP4、下载 Manifest，或执行“仅重新合成成片”，都不需要启动 Qwen 或 ComfyUI，也不会触发 Qwen3-TTS 推理子进程。只有重新生成对应真实素材时才需要准备相应模型运行时：剧本阶段启动 llama.cpp，图片阶段启动 ComfyUI；TTS 阶段由运行在 Python 3.11 环境的 Worker 受控调用独立 Python 3.12 环境中的 Qwen3-TTS 子进程。不要在 8GB 显存上同时常驻所有模型。
+## Optional Real Providers
 
-### 推荐演示项目
+Set the provider variables in a local `.env` file; leave the other providers on `mock` when they are not installed.
 
-- 项目：`深夜少女`
-- Project ID：`36d4bdd5-0e88-4509-a2f5-eba7727fd38b`
-- 直达地址：`http://127.0.0.1:5173/?project=36d4bdd5-0e88-4509-a2f5-eba7727fd38b`
+- **Text:** set `SCRIPT_PROVIDER=llamacpp`, download a compatible Qwen3-4B GGUF, and start `.\scripts\run_llm_server.ps1`.
+- **Image:** set `IMAGE_PROVIDER=comfyui-animagine-xl-4`, install ComfyUI in a separate environment, place the Animagine XL 4.0 checkpoint in a local model directory, and start ComfyUI on `127.0.0.1:8188`.
+- **Audio:** set `AUDIO_PROVIDER=qwen3-tts-0.6b-customvoice`, create the dedicated Qwen3-TTS environment, and make the model available locally.
+- **Video:** choose the Cloud Wan provider for a job and configure the DashScope variables. Cloud calls are opt-in and may incur charges.
 
-页面顶部会根据项目现有数据展示剧本、真实图片、真实旁白和最终成片状态；左侧也可通过搜索或“有真实成片”筛选找到该项目。
+Model weights and third-party runtimes are intentionally not distributed in this repository. Download them from their official sources and review their licenses and service terms.
 
-## 8GB 显存运行方式
+## Model / Runtime Setup
 
-本项目采用阶段式 GPU 资源交接，而非让所有模型同时驻留：
+See [docs/setup-windows.md](docs/setup-windows.md) for Python, Node.js, Conda, FFmpeg, CUDA, and provider-specific setup notes. The repository contains provider adapters and scripts, not model weights or a full ComfyUI/llama.cpp checkout.
 
-1. 启动 llama.cpp / Qwen3-4B，生成并保存 ScriptV1，然后停止服务、释放显存。
-2. 运行 ComfyUI / Animagine XL 4.0，保存关键帧，然后结束该阶段、释放显存。
-3. Worker 调用独立 Python 3.12 环境中的 Qwen3-TTS 子进程生成 WAV，完成后释放显存。
-4. FFmpeg 在已有素材上完成媒体合成。
+## External Image Bridge
 
-这种调度使真实多模型链路能在 8GB 显存设备上演示；当前采用 Q4 量化的 4B 文本模型、0.6B TTS，并在受限显存下运行单帧图像工作流，因此演示配置存在质量与速度上限。详细流程见 [系统架构](docs/architecture.md)。
+External Image Bridge is a manual import path. A user supplies an image file produced by an external tool, records its source metadata, and attaches it to a project or shot. The bridge does not call the OpenAI Image API. ChatGPT Images is only one possible external source; the imported file and its reuse rights remain the user's responsibility.
 
-## 模型可替换性
+## Project Structure
 
-平台通过 Provider 契约、Job 请求快照和统一媒体输入输出，把模型运行时与工作流解耦。替换模型时仍需实现相应 Provider 契约、保留可追溯元数据，并验证输出结构；这不等于任意模型可以零代码无缝接入。
+```text
+backend/      FastAPI application, providers, Worker, media services, and tests
+docs/         Architecture, schemas, setup, limitations, and provider notes
+fixtures/     Small deterministic inputs used by tests and Mock mode
+frontend/     React + Vite web client
+scripts/      PowerShell launchers and optional provider runners
+```
 
-- 当前 Provider 与验证状态：[模型与 Provider](docs/model-providers.md)
-- 8GB、本地工作站和云端扩展方案：[模型升级指南](docs/model-upgrade-guide.md)
+Runtime directories such as `data/`, `models/`, `delivery/`, local environments, logs, and generated media are ignored and should stay outside source control.
 
-## 当前边界
+## Configuration
 
-当前版本定位为单机、单用户、单 Worker 的当前开发范围演示原型，使用静态动漫关键帧配合 FFmpeg 镜头运动，不包含角色级连续动作视频生成、专业非线性时间线或多用户协作。角色一致性和连续视频属于后续平台能力建设，不会仅靠替换更大模型自动解决。完整说明见 [已知限制](docs/limitations.md)。
+Copy `.env.example` to `.env` and change only the providers you intend to run. The example file contains no credentials. In particular, `DASHSCOPE_API_KEY` and `DASHSCOPE_WORKSPACE_ID` are blank placeholders. Never commit `.env` or a real key. `ANIME_PLATFORM_DATA_DIR` controls the local SQLite database and generated runtime data.
 
-## 演示与验收
+## Known Limitations
 
-- [三分钟演示指南](docs/demo-guide.md)
-- [验收标准](docs/acceptance-criteria.md)
-- [M6 媒体打磨记录](docs/m6-media-polish.md)
+- The current runtime is local, single-user, and single-Worker.
+- Real providers require their own runtimes, model downloads, GPU capacity, and license review.
+- Cloud Wan requires a DashScope account and network access; availability, pricing, and quotas are controlled by the service.
+- FFmpeg is required for final media composition and validation.
+- This project does not provide a production multi-user deployment, distributed queue, or continuous video generation model.
 
-## 文档索引
+## Third-party Components
 
-- [系统架构](docs/architecture.md)
-- [数据模型](docs/data-model.md)
-- [ScriptV1 规范](docs/script-v1-schema.md)
-- [需求说明](docs/requirements.md)
-- [模型评估](docs/model-evaluation.md)
+Supported integrations include Qwen3, Qwen3-TTS, Animagine XL 4.0, llama.cpp, ComfyUI, FFmpeg, and Wan/DashScope. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and license-review guidance.
+
+## License
+
+No project license has been selected yet. Until a license is added, treat the repository as source-available for evaluation and do not assume permission to redistribute or deploy it. Third-party models, runtimes, and cloud services remain governed by their own licenses and terms.
