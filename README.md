@@ -118,6 +118,12 @@ Copy `.env.example` to `.env` and change only the providers you intend to run. T
 
 Supported integrations include Qwen3, Qwen3-TTS, Animagine XL 4.0, llama.cpp, ComfyUI, FFmpeg, and Wan/DashScope. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and license-review guidance.
 
+## Authors
+
+- Zihan Wang ([@mowang-mw](https://github.com/mowang-mw))
+- Lei Zhao
+- Huaizhong Lin
+
 ## License
 
 Paper Crane Studio's own source code and documentation are released under the [MIT License](LICENSE). Third-party models, weights, runtimes, binaries, and cloud services are not covered by the project license and are not distributed with this repository; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
